@@ -35,6 +35,8 @@ class Moderation:
         if is_admin:
             return True, ""
         config = self.settings.get("moderation") or {}
+        if config.get("enabled") is False:
+            return True, ""
         now = time.time()
         limit = max(0, int(config.get("daily_limit", 5)))
         interval = max(0, int(config.get("min_interval_sec", 20)))
