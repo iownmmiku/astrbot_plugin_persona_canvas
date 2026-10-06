@@ -43,7 +43,7 @@ class WebUI:
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "PersonaStudio"
+            server_version = "PersonaCanvas"
             sys_version = ""
 
             def log_message(self, *_args):
@@ -163,7 +163,7 @@ class WebUI:
 
         self.server = Server((self.host, self.port), Handler)
         self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, name="persona-studio-webui", daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, name="persona-canvas-webui", daemon=True)
         self.thread.start()
 
     async def close(self):

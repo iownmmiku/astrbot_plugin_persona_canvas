@@ -5,13 +5,15 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+OLD_PLUGIN_NAME = "astrbot_plugin_persona_studio"
 DEFAULT_PERSONA = {
     "id": "default",
     "name": "默认人设",
@@ -54,9 +56,18 @@ def _data_dir() -> Path:
     try:
         from astrbot.api.star import StarTools
 
-        return Path(StarTools.get_data_dir("astrbot_plugin_persona_studio"))
+        return Path(StarTools.get_data_dir("astrbot_plugin_persona_canvas"))
     except Exception:
         return Path(__file__).resolve().parent / "data"
+
+
+def _legacy_data_dir() -> Path | None:
+    try:
+        from astrbot.api.star import StarTools
+
+        return Path(StarTools.get_data_dir(OLD_PLUGIN_NAME))
+    except Exception:
+        return Path(__file__).resolve().parent.parent / OLD_PLUGIN_NAME / "data"
 
 
 def _merge(base: dict[str, Any], incoming: Any) -> dict[str, Any]:
@@ -81,6 +92,7 @@ class Storage:
         self.assets = self.root / "assets"
         self.root.mkdir(parents=True, exist_ok=True)
         self.assets.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_data()
         self.personas_path = self.root / "personas.json"
         self.settings_path = self.root / "settings.json"
         self.targets_path = self.root / "targets.json"
@@ -91,6 +103,33 @@ class Storage:
         self.targets = self._load(self.targets_path, {"version": SCHEMA_VERSION, "items": []})
         self.runtime = self._load(self.runtime_path, {"version": SCHEMA_VERSION, "morning": {}})
         self._normalise()
+
+    def _migrate_legacy_data(self) -> None:
+        """Copy old Persona Studio data without deleting the legacy directory."""
+        marker = self.root / ".migrated_from_persona_studio"
+        if marker.exists():
+            return
+        data_files = ("personas.json", "settings.json", "targets.json", "history.jsonl", "runtime.json", "webui_token.txt")
+        if any((self.root / name).exists() for name in data_files):
+            return
+        legacy = _legacy_data_dir()
+        if not legacy or legacy.resolve() == self.root.resolve() or not legacy.is_dir():
+            return
+        copied: list[str] = []
+        for name in ("personas.json", "settings.json", "targets.json", "history.jsonl", "runtime.json", "webui_token.txt"):
+            source = legacy / name
+            target = self.root / name
+            if source.is_file():
+                shutil.copy2(source, target)
+                copied.append(name)
+        source_assets = legacy / "assets"
+        if source_assets.is_dir():
+            self.assets.mkdir(parents=True, exist_ok=True)
+            for source in source_assets.iterdir():
+                if source.is_file():
+                    shutil.copy2(source, self.assets / source.name)
+            copied.append("assets")
+        marker.write_text(json.dumps({"migrated_from": str(legacy), "copied": copied, "at": time.time()}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
     def _load(path: Path, default: dict[str, Any]) -> dict[str, Any]:

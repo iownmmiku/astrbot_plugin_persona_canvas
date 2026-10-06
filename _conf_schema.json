@@ -1,7 +1,7 @@
 {
   "enable_webui": {
     "type": "bool",
-    "description": "启用人设影像工作室 WebUI",
+    "description": "启用随想画卷（Persona Canvas）WebUI",
     "default": true
   },
   "webui_host": {

@@ -22,7 +22,7 @@ from .providers.base import ProviderError, provider_from_config
 from .storage import Storage
 from .webui_server import WebUI
 
-PLUGIN_NAME = "astrbot_plugin_persona_studio"
+PLUGIN_NAME = "astrbot_plugin_persona_canvas"
 
 
 def _text_from_event(event: AstrMessageEvent) -> str:
@@ -39,8 +39,8 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return False
 
 
-@register(PLUGIN_NAME, "you", "人设驱动生图与主动消息工作室", "0.1.0")
-class PersonaStudioPlugin(Star):
+@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.2.0")
+class PersonaCanvasPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.context = context
@@ -64,13 +64,13 @@ class PersonaStudioPlugin(Star):
             self.webui = WebUI(self, host=str(self.config.get("webui_host", "127.0.0.1")), port=int(self.config.get("webui_port", 3018)), token=token)
             try:
                 self.webui.start()
-                logger.info("[人设影像] WebUI 已启动：%s", self.webui.url)
+                logger.info("[随想画卷] WebUI 已启动：%s", self.webui.url)
             except Exception as exc:
-                logger.error("[人设影像] WebUI 启动失败：%s", exc)
+                logger.error("[随想画卷] WebUI 启动失败：%s", exc)
                 self.webui = None
         self.active = ActiveScheduler(self)
         if self.storage.settings.get("active", {}).get("enabled") or self.storage.settings.get("good_morning", {}).get("enabled"):
-            self._spawn(self.active.run(), "persona-studio-active")
+            self._spawn(self.active.run(), "persona-canvas-active")
 
     async def terminate(self):
         for task in list(self._tasks):
@@ -127,12 +127,12 @@ class PersonaStudioPlugin(Star):
     @filter.command("生图控制台", alias={"人设控制台"})
     async def command_webui(self, event: AstrMessageEvent):
         if not _is_admin(event):
-            yield event.plain_result("只有管理员可以打开人设影像控制台。")
+            yield event.plain_result("只有管理员可以打开随想画卷控制台。")
             return
         if not self.webui:
             yield event.plain_result("WebUI 未启动，请在插件配置中开启后重载插件。")
             return
-        yield event.plain_result(f"人设影像控制台：{self.webui.url}\n访问令牌：{self.webui.token}")
+        yield event.plain_result(f"随想画卷控制台：{self.webui.url}\n访问令牌：{self.webui.token}")
 
     @filter.command("生图")
     async def command_generate(self, event: AstrMessageEvent, text: str = ""):
@@ -226,7 +226,7 @@ class PersonaStudioPlugin(Star):
         result = copy.deepcopy(base)
         for key, value in patch.items():
             if isinstance(result.get(key), dict) and isinstance(value, dict):
-                result[key] = PersonaStudioPlugin._merge_settings(result[key], value)
+                result[key] = PersonaCanvasPlugin._merge_settings(result[key], value)
             else:
                 result[key] = value
         return result
@@ -251,6 +251,6 @@ class PersonaStudioPlugin(Star):
         elif action == "toggle" and target:
             target["enabled"] = not bool(target.get("enabled", False))
         elif action == "test" and target:
-            await self.context.send_message(umo, MessageChain().message("这是人设影像工作室的测试消息。"))
+            await self.context.send_message(umo, MessageChain().message("这是随想画卷的测试消息。"))
         self.storage.save_targets()
         return {"items": copy.deepcopy(self.storage.targets.get("items", []))}

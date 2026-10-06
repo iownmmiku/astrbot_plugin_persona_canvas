@@ -1,12 +1,12 @@
-name: astrbot_plugin_persona_studio
-display_name: 人设影像工作室
-short_desc: 人格驱动生图、参考图编辑与主动私聊消息
+name: astrbot_plugin_persona_canvas
+display_name: 随想画卷
+short_desc: Persona Canvas：随想画卷，人格驱动生图、参考图编辑与主动私聊消息
 long_desc: >-
   通过自然语言调用 GPT、Gemini、NovelAI 或自定义生图服务，管理人设正负面提示词、
   服装姿势状态、参考图、主动私聊消息和每日早安照片。复杂设置通过内置 WebUI 管理。
 author: you
-version: 0.1.0
-repo: https://github.com/
+version: 0.2.0
+repo: https://github.com/iownmmiku/astrbot_plugin_persona_canvas
 astrbot_version: ">=4.17,<5"
 support_platforms:
   - aiocqhttp

@@ -38,7 +38,7 @@ class ActiveScheduler:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("[人设影像] 主动消息检查失败：%s", exc)
+                logger.warning("[随想画卷] 主动消息检查失败：%s", exc)
             interval = max(15, int(self.plugin.storage.settings.get("active", {}).get("check_interval_sec", 30)))
             await asyncio.sleep(interval)
 
@@ -112,4 +112,4 @@ class ActiveScheduler:
             path = self.plugin.storage.save_asset(data, ext)
             await self.plugin.context.send_message(target["umo"], MessageChain().message("早安，今天也要好好休息和吃饭。").file_image(str(path)))
         except Exception as exc:
-            logger.warning("[人设影像] 早安消息失败：%s", exc)
+            logger.warning("[随想画卷] 早安消息失败：%s", exc)

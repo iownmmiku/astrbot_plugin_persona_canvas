@@ -1,10 +1,12 @@
-# 人设影像工作室
+# 随想画卷（Persona Canvas）
 
 AstrBot 插件：用自然语言调用 GPT/OpenAI、Gemini、NovelAI 或自定义生图接口，管理可持续的人设状态，并通过 WebUI 配置主动私聊消息与每日早安照片。
 
+> `v0.2.0` 将插件从“人设影像工作室”更名为“随想画卷（Persona Canvas）”。旧版数据会在首次启动时复制迁移，不会删除旧目录。
+
 > 当前版本是可运行的首版原型。不同 Gemini、NovelAI 中转服务的参数和图片返回格式可能不同，正式使用前请在 WebUI 中先执行小图测试。
 
-## 功能
+- `v0.2.0`：改名为“随想画卷（Persona Canvas）”，并加入旧版数据目录的兼容迁移。
 
 - **自然语言生图**
   - “给我拍一张你的自拍”使用当前人设。
@@ -39,10 +41,10 @@ AstrBot 插件：用自然语言调用 GPT/OpenAI、Gemini、NovelAI 或自定�
 
 ### 方式一：下载发行版
 
-从 GitHub Releases 下载 `astrbot_plugin_persona_studio-v*.zip`，解压后将其中的 `astrbot_plugin_persona_studio` 目录复制到：
+从 GitHub Releases 下载 `astrbot_plugin_persona_canvas-v*.zip`，解压后将其中的 `astrbot_plugin_persona_canvas` 目录复制到：
 
 ```text
-AstrBot/data/plugins/astrbot_plugin_persona_studio/
+AstrBot/data/plugins/astrbot_plugin_persona_canvas/
 ```
 
 然后在 AstrBot WebUI 中启用插件并重载。
@@ -50,10 +52,10 @@ AstrBot/data/plugins/astrbot_plugin_persona_studio/
 ### 方式二：克隆仓库
 
 ```bash
-git clone https://github.com/iownmmiku/astrbot_plugin_persona_studio.git
+git clone https://github.com/iownmmiku/astrbot_plugin_persona_canvas.git
 ```
 
-将仓库目录放入 `AstrBot/data/plugins/`，目录名保持为 `astrbot_plugin_persona_studio`。
+将仓库目录放入 `AstrBot/data/plugins/`，目录名保持为 `astrbot_plugin_persona_canvas`。
 
 插件依赖 AstrBot 已提供的 Python 环境和 `aiohttp`，不需要 Node.js 或 npm 构建 WebUI。
 
