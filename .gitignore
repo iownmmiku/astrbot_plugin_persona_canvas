@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+data/
+*.jsonl
+webui_token.txt

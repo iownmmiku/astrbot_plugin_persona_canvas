@@ -1,0 +1,33 @@
+{
+  "enable_webui": {
+    "type": "bool",
+    "description": "启用人设影像工作室 WebUI",
+    "default": true
+  },
+  "webui_host": {
+    "type": "string",
+    "description": "WebUI 监听地址；公网部署请使用反向代理和 HTTPS",
+    "default": "127.0.0.1"
+  },
+  "webui_port": {
+    "type": "int",
+    "description": "WebUI 监听端口",
+    "default": 3018
+  },
+  "webui_token": {
+    "type": "string",
+    "description": "WebUI 访问令牌；留空时自动生成并保存到插件数据目录",
+    "default": "",
+    "secret": true
+  },
+  "auto_route": {
+    "type": "bool",
+    "description": "监听自然语言并自动判断是否触发生图",
+    "default": true
+  },
+  "admin_only_webui": {
+    "type": "bool",
+    "description": "WebUI 仅允许 AstrBot 管理员使用",
+    "default": true
+  }
+}
