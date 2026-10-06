@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>随想画卷 · Persona Canvas</title><link rel="stylesheet" href="./app.css"><script src="./app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">✦</span><div>随想画卷<small>PERSONA CANVAS</small></div></div>
+    <nav>
+      <button class="nav active" data-page="overview">总览</button>
+      <button class="nav" data-page="persona">人设工作台</button>
+      <button class="nav" data-page="providers">模型接口</button>
+      <button class="nav" data-page="generate">生图工作台</button>
+      <button class="nav" data-page="active">主动消息</button>
+      <button class="nav" data-page="history">生成历史</button>
+    </nav>
+    <div class="sidebar-foot"><span class="dot" id="status-dot"></span><span id="status-label">等待连接</span></div>
+  </aside>
+  <main>
+    <header><div><span class="eyebrow">CONTROL ROOM</span><h1 id="page-title">总览</h1></div><button class="button outline" id="refresh">刷新</button></header>
+    <div id="notice" class="notice" hidden></div>
+    <section data-panel="overview">
+      <div class="hero"><div><span class="eyebrow">CURRENT PERSONA</span><h2 id="overview-name">—</h2><p id="overview-description">—</p><div class="chips"><span id="overview-provider">模型 —</span><span id="overview-reference">参考图 —</span></div></div><div class="hero-mark">✦</div></div>
+      <div class="grid three"><article class="card"><span class="label">人设状态</span><strong id="overview-state">—</strong><p>服装、姿势与场景动态状态</p></article><article class="card"><span class="label">主动目标</span><strong id="overview-targets">0</strong><p>已保存的私聊目标</p></article><article class="card"><span class="label">生成记录</span><strong id="overview-history">0</strong><p>最近成功或失败的请求</p></article></div>
+      <article class="card"><div class="card-head"><h3>立即试拍</h3><span>自然语言输入</span></div><form id="quick-form"><textarea id="quick-input" rows="3" placeholder="例如：给我拍一张你的自拍，穿白色连衣裙，坐在窗边"></textarea><button class="button" type="submit">生成图片</button></form><div id="quick-result" class="result"></div></article>
+    </section>
+    <section data-panel="persona" hidden><article class="card"><div class="card-head"><h3>人设档案</h3><button class="button small" id="new-persona">新建</button></div><div id="persona-list" class="list"></div><div class="form-grid"><label>名称<input id="p-name"></label><label>简介<textarea id="p-description" rows="2"></textarea></label><label>固定正面提示词<textarea id="p-positive" rows="4"></textarea></label><label>负面提示词<textarea id="p-negative" rows="4"></textarea></label><label>画风提示词<textarea id="p-style" rows="3"></textarea></label><label>当前服装<input id="p-outfit"></label><label>当前姿势<input id="p-pose"></label><label>当前表情<input id="p-expression"></label><label>当前场景<input id="p-scene"></label><label>早安随机服装（每行一项）<textarea id="p-pool" rows="4"></textarea></label></div><div class="actions"><button class="button" id="save-persona">保存人设</button><button class="button outline" id="reset-state">重置动态状态</button></div><pre id="prompt-preview" class="prompt"></pre></article></section>
+    <section data-panel="providers" hidden><article class="card"><div class="card-head"><h3>模型接口</h3><button class="button small" id="new-provider">新增接口</button></div><div id="provider-list" class="list"></div><div class="form-grid"><label>名称<input id="v-name"></label><label>类型<select id="v-kind"><option value="openai">GPT / OpenAI</option><option value="gemini">Gemini</option><option value="novelai">NovelAI</option></select></label><label>接口地址<input id="v-endpoint" placeholder="https://api.example.com"></label><label>模型<input id="v-model"></label><label>API Key<input id="v-key" type="password" autocomplete="off"></label><label>认证头<input id="v-header" value="Authorization"></label><label>认证前缀<input id="v-prefix" value="Bearer "></label><label class="check"><input id="v-edit" type="checkbox"> 支持图生图</label><label class="check"><input id="v-negative" type="checkbox" checked> 支持负面提示词</label></div><button class="button" id="save-provider">保存接口</button></article></section>
+    <section data-panel="generate" hidden><article class="card"><div class="card-head"><h3>生图工作台</h3><span>查看当前组合后的提示词</span></div><div class="form-grid"><label>模式<select id="g-mode"><option value="persona">人格拍摄</option><option value="scene">普通场景</option></select></label><label>补充提示词<textarea id="g-prompt" rows="4" placeholder="输入服装、动作或场景"></textarea></label><label>宽度<input id="g-width" type="number" value="832"></label><label>高度<input id="g-height" type="number" value="1216"></label><label>Provider<input id="g-provider" value="default"></label></div><button class="button" id="generate-button">生成</button><div id="generate-result" class="result"></div></article></section>
+    <section data-panel="active" hidden><article class="card"><div class="card-head"><h3>主动消息</h3><span>保存完整 UMO，不只保存 QQ 号</span></div><div class="form-grid"><label class="check"><input id="a-enabled" type="checkbox"> 开启普通主动消息</label><label>检查间隔（秒）<input id="a-interval" type="number" value="30"></label><label>默认最小间隔（秒）<input id="a-gap" type="number" value="3600"></label><label>连续未回复几次后静默<input id="a-silence" type="number" value="3"></label></div><button class="button" id="save-active">保存设置</button><h4>目标会话</h4><div id="target-list" class="list"></div><p class="muted">在 QQ 私聊中发送消息后，该会话会出现在这里；管理员可启用、测试或移除目标。</p></article></section>
+    <section data-panel="history" hidden><article class="card"><div class="card-head"><h3>生成历史</h3><button class="button outline" id="reload-history">刷新</button></div><div id="history-list" class="history"></div></article></section>
+  </main>
+</body>
+</html>
