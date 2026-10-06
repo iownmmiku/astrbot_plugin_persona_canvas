@@ -18,6 +18,7 @@ from astrbot.api.star import Context, Star, register
 from .active import ActiveScheduler
 from .intent import Intent, heuristic_intent, parse_intent, prompt_bundle
 from .moderation import Moderation
+from .page_api import CanvasPageApi, image_data_url
 from .providers.base import ProviderError, provider_from_config
 from .storage import Storage
 from .webui_server import WebUI
@@ -39,18 +40,56 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return False
 
 
-@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.2.0")
+@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.3.0")
 class PersonaCanvasPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.context = context
         self.config = config or {}
         self.storage = Storage()
+        self._apply_plugin_config()
         self.moderation = Moderation(self.storage.settings)
         self.webui: WebUI | None = None
         self._tasks: set[asyncio.Task] = set()
         self._generation_lock = asyncio.Lock()
         self.active: ActiveScheduler | None = None
+        self.page_api = CanvasPageApi(self)
+
+    def _apply_plugin_config(self) -> None:
+        """Merge the AstrBot config form into persisted runtime defaults."""
+        cfg = self.config
+        settings = self.storage.settings
+        settings["moderation"] = self._merge_settings(settings.get("moderation", {}), {
+            "enabled": bool(cfg.get("moderation_enabled", True)),
+            "daily_limit": max(0, int(cfg.get("moderation_daily_limit", 5))),
+            "min_interval_sec": max(0, int(cfg.get("moderation_min_interval_sec", 20))),
+            "max_concurrency": max(1, int(cfg.get("moderation_max_concurrency", 1))),
+        })
+        settings["generation"] = self._merge_settings(settings.get("generation", {}), {
+            "width": max(64, int(cfg.get("generation_width", 832))),
+            "height": max(64, int(cfg.get("generation_height", 1216))),
+            "steps": max(1, int(cfg.get("generation_steps", 28))),
+            "scale": max(0.0, float(cfg.get("generation_scale", 5.0))),
+            "sampler": str(cfg.get("generation_sampler", "k_euler_ancestral")),
+            "seed": int(cfg.get("generation_seed", -1)),
+            "max_history": max(1, int(cfg.get("generation_max_history", 100))),
+        })
+        settings["active"] = self._merge_settings(settings.get("active", {}), {
+            "enabled": bool(cfg.get("active_enabled", False)),
+            "check_interval_sec": max(15, int(cfg.get("active_check_interval_sec", 30))),
+            "default_start": str(cfg.get("active_start", "09:00")),
+            "default_end": str(cfg.get("active_end", "22:00")),
+            "min_gap_sec": max(60, int(cfg.get("active_min_gap_sec", 3600))),
+            "silence_after": max(1, int(cfg.get("active_silence_after", 3))),
+            "silence_hours": max(1, int(cfg.get("active_silence_hours", 24))),
+        })
+        settings["good_morning"] = self._merge_settings(settings.get("good_morning", {}), {
+            "enabled": bool(cfg.get("good_morning_enabled", False)),
+            "start": str(cfg.get("good_morning_start", "07:00")),
+            "end": str(cfg.get("good_morning_end", "10:00")),
+            "timezone": str(cfg.get("good_morning_timezone", "Asia/Shanghai")),
+        })
+        self.storage.save_settings()
 
     def _spawn(self, coroutine, name: str) -> asyncio.Task:
         task = asyncio.create_task(coroutine, name=name)
@@ -59,6 +98,7 @@ class PersonaCanvasPlugin(Star):
         return task
 
     async def initialize(self):
+        self.page_api.register_routes()
         if bool(self.config.get("enable_webui", True)):
             token = self.storage.webui_token(str(self.config.get("webui_token", "")))
             self.webui = WebUI(self, host=str(self.config.get("webui_host", "127.0.0.1")), port=int(self.config.get("webui_port", 3018)), token=token)
@@ -176,7 +216,20 @@ class PersonaCanvasPlugin(Star):
 
     # ---------- WebUI API ----------
     async def web_state(self):
-        return {"persona": copy.deepcopy(self.storage.persona()), "settings": copy.deepcopy(self.storage.settings), "targets": copy.deepcopy(self.storage.targets.get("items", [])), "history": self.storage.recent_history(100)}
+        safe_settings = copy.deepcopy(self.storage.settings)
+        providers = safe_settings.get("providers", {})
+        for item in providers.values():
+            if isinstance(item, dict):
+                item.pop("api_key", None)
+        return {"persona": copy.deepcopy(self.storage.persona()), "settings": safe_settings, "targets": copy.deepcopy(self.storage.targets.get("items", [])), "history": self._history_with_assets(100)}
+
+    def _history_with_assets(self, limit: int = 100) -> list[dict]:
+        items = self.storage.recent_history(limit)
+        for item in items:
+            image = str(item.get("image") or "")
+            if image.startswith("/assets/"):
+                item["image"] = image_data_url(self, image.rsplit("/", 1)[-1])
+        return items
 
     async def web_personas(self):
         return {"items": copy.deepcopy(self.storage.personas.get("items", []))}
@@ -193,7 +246,7 @@ class PersonaCanvasPlugin(Star):
         return {"items": copy.deepcopy(self.storage.targets.get("items", []))}
 
     async def web_history(self):
-        return {"items": self.storage.recent_history(100)}
+        return {"items": self._history_with_assets(100)}
 
     async def web_save_persona(self, body: dict):
         item = self.storage.upsert_persona(body)
@@ -235,12 +288,24 @@ class PersonaCanvasPlugin(Star):
         text = str(body.get("text") or body.get("prompt") or "").strip()
         intent = heuristic_intent(text, False)
         if body.get("mode") == "scene":
-            intent = Intent(mode="scene", scene_prompt=text, raw=text)
+            intent = Intent(mode="scene", scene_prompt=text, raw=text, provider=str(body.get("provider") or "default"))
         elif body.get("mode") == "persona":
-            intent = Intent(mode="persona_edit", use_persona=True, prompt_delta=text, raw=text)
-        data, ext, caption = await self._generate(intent, user_key="webui", is_admin=True)
+            intent = Intent(mode="persona_edit", use_persona=True, prompt_delta=text, raw=text, provider=str(body.get("provider") or "default"))
+        options = copy.deepcopy(self.storage.settings.get("generation", {}))
+        for key in ("width", "height", "steps", "scale", "seed"):
+            if body.get(key) is not None:
+                try:
+                    options[key] = int(body[key]) if key != "scale" else float(body[key])
+                except (TypeError, ValueError):
+                    pass
+        original = self.storage.settings.get("generation", {})
+        self.storage.settings["generation"] = options
+        try:
+            data, ext, caption = await self._generate(intent, user_key="webui", is_admin=True)
+        finally:
+            self.storage.settings["generation"] = original
         asset = self.storage.save_asset(data, ext)
-        return {"image": f"/assets/{asset.name}", "caption": caption}
+        return {"image": image_data_url(self, asset.name), "caption": caption}
 
     async def web_target_action(self, body: dict):
         action, umo = str(body.get("action", "")), str(body.get("umo", ""))
