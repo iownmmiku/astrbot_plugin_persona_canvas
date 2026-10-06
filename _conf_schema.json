@@ -2,32 +2,157 @@
   "enable_webui": {
     "type": "bool",
     "description": "启用随想画卷（Persona Canvas）WebUI",
+    "hint": "推荐开启。AstrBot 插件卡片中的“打开插件界面”依赖官方 Plugin Page；旧版独立 WebUI 也会使用此开关。",
     "default": true
   },
   "webui_host": {
     "type": "string",
-    "description": "WebUI 监听地址；公网部署请使用反向代理和 HTTPS",
+    "description": "兼容 WebUI 监听地址",
+    "hint": "官方插件页面不使用此端口；只有旧版独立 WebUI 使用。默认仅本机可访问。",
     "default": "127.0.0.1"
   },
   "webui_port": {
     "type": "int",
-    "description": "WebUI 监听端口",
+    "description": "兼容 WebUI 监听端口",
     "default": 3018
   },
   "webui_token": {
     "type": "string",
-    "description": "WebUI 访问令牌；留空时自动生成并保存到插件数据目录",
+    "description": "兼容 WebUI 访问令牌",
+    "hint": "留空时自动生成并保存到插件数据目录；AstrBot 官方插件页面不需要单独令牌。",
     "default": "",
     "secret": true
+  },
+  "admin_only_webui": {
+    "type": "bool",
+    "description": "兼容 WebUI 仅允许 AstrBot 管理员使用",
+    "hint": "官方插件页面由 AstrBot Dashboard 登录权限保护；此项只影响旧版独立 WebUI 的使用说明。",
+    "default": true
   },
   "auto_route": {
     "type": "bool",
     "description": "监听自然语言并自动判断是否触发生图",
+    "hint": "关闭后仍可通过 /生图 指令和 WebUI 手动生成。普通聊天不会触发生图。",
     "default": true
   },
-  "admin_only_webui": {
+  "moderation_enabled": {
     "type": "bool",
-    "description": "WebUI 仅允许 AstrBot 管理员使用",
+    "description": "启用普通用户生图审核与限流",
+    "hint": "管理员仍受硬性安全规则约束；关闭后普通用户不再受本插件的次数和间隔限制。",
     "default": true
+  },
+  "moderation_daily_limit": {
+    "type": "int",
+    "description": "普通用户每日生图次数",
+    "hint": "0 表示不限制。",
+    "default": 5
+  },
+  "moderation_min_interval_sec": {
+    "type": "int",
+    "description": "普通用户生图最小间隔（秒）",
+    "hint": "0 表示不限制。",
+    "default": 20
+  },
+  "moderation_max_concurrency": {
+    "type": "int",
+    "description": "每个普通用户最大并发生成数",
+    "default": 1
+  },
+  "generation_width": {
+    "type": "int",
+    "description": "默认图片宽度",
+    "hint": "建议使用模型支持的尺寸；NovelAI 通常要求尺寸为 64 的倍数。",
+    "default": 832
+  },
+  "generation_height": {
+    "type": "int",
+    "description": "默认图片高度",
+    "default": 1216
+  },
+  "generation_steps": {
+    "type": "int",
+    "description": "默认采样步数",
+    "default": 28
+  },
+  "generation_scale": {
+    "type": "float",
+    "description": "默认提示词引导值",
+    "default": 5.0
+  },
+  "generation_sampler": {
+    "type": "string",
+    "description": "默认采样器",
+    "default": "k_euler_ancestral"
+  },
+  "generation_seed": {
+    "type": "int",
+    "description": "默认随机种子",
+    "hint": "-1 表示每次随机生成。",
+    "default": -1
+  },
+  "generation_max_history": {
+    "type": "int",
+    "description": "最多保留的生成历史条数",
+    "default": 100
+  },
+  "active_enabled": {
+    "type": "bool",
+    "description": "启用普通主动消息",
+    "default": false
+  },
+  "active_check_interval_sec": {
+    "type": "int",
+    "description": "主动消息检查间隔（秒）",
+    "hint": "实际不会低于 15 秒。",
+    "default": 30
+  },
+  "active_start": {
+    "type": "string",
+    "description": "普通主动消息开始时间",
+    "hint": "使用本机时区，格式 HH:MM。",
+    "default": "09:00"
+  },
+  "active_end": {
+    "type": "string",
+    "description": "普通主动消息结束时间",
+    "hint": "使用本机时区，格式 HH:MM。",
+    "default": "22:00"
+  },
+  "active_min_gap_sec": {
+    "type": "int",
+    "description": "普通主动消息距上次主动消息的最小间隔（秒）",
+    "default": 3600
+  },
+  "active_silence_after": {
+    "type": "int",
+    "description": "连续未回复几次后进入静默",
+    "default": 3
+  },
+  "active_silence_hours": {
+    "type": "int",
+    "description": "主动消息静默时长（小时）",
+    "default": 24
+  },
+  "good_morning_enabled": {
+    "type": "bool",
+    "description": "启用每日早安照片",
+    "hint": "需要至少一个已启用的主动消息目标，并且需要配置可用的生图 Provider。",
+    "default": false
+  },
+  "good_morning_start": {
+    "type": "string",
+    "description": "早安照片时间段开始",
+    "default": "07:00"
+  },
+  "good_morning_end": {
+    "type": "string",
+    "description": "早安照片时间段结束",
+    "default": "10:00"
+  },
+  "good_morning_timezone": {
+    "type": "string",
+    "description": "早安照片使用的时区",
+    "hint": "例如 Asia/Shanghai、Asia/Tokyo、America/Los_Angeles。",
+    "default": "Asia/Shanghai"
   }
 }
