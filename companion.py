@@ -4,7 +4,7 @@ import copy
 import re
 import secrets
 import time
-from .intent import state_patch
+from .intent import confirmation_text, message_text, state_patch
 
 REQUIREMENT_KEYS = ("outfit", "camera", "pose", "expression", "scene", "avoid", "notes")
 
@@ -14,11 +14,10 @@ def requirements(value):
     return {key: value[key].strip()[:1000] for key in REQUIREMENT_KEYS if isinstance(value.get(key), str) and value[key].strip()}
 
 def request_text(text):
-    return re.sub(r"^/?(?:生图|拍照)\s*", "", str(text).strip())
+    return re.sub(r"^/?(?:生图|拍照)\s*", "", message_text(text))
 
 def is_confirmation(text):
-    clean = re.sub(r"[。！!，,\s]", "", request_text(text))
-    return bool(re.fullmatch(r"好的?[啊呀]?|可以|行|嗯|同意|就这样|按你说的|就按你说的拍|好就按你说的拍", clean))
+    return confirmation_text(request_text(text))
 
 def cancel_request(text):
     clean = re.sub(r'```[\s\S]*?```|[“「『"][\s\S]*?[”」』"]', "", request_text(text)).strip()

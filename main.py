@@ -17,7 +17,7 @@ from astrbot.api.star import Context, Star, register
 from .active import ActiveScheduler
 from .dialogue import Dialogue, field, maybe_await
 from .companion import apply_state, cancel_request, infer_requirements, is_confirmation, pending_request, requirements, valid_pending
-from .intent import Intent, photo_request, prompt_bundle, state_patch, state_request
+from .intent import Intent, message_text, photo_request, prompt_bundle, state_patch, state_request
 from .moderation import Moderation
 from .page_api import CanvasPageApi, image_data_url
 from .providers.base import ProviderCapabilities, ProviderError, provider_from_config
@@ -25,11 +25,11 @@ from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 
 def _text(event):
-    return str(getattr(event, "message_str", "") or "").strip()
+    return message_text(getattr(event, "message_str", ""))
 
 
 def _admin(event):

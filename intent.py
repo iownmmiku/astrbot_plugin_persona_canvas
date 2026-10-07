@@ -8,6 +8,23 @@ from typing import Any
 
 STATE_KEYS = ("outfit", "pose", "expression", "scene")
 
+# These acknowledgements grant no permission on their own. Request eligibility
+# uses them only while the matching photo/state conditions are still pending.
+CONFIRMATION_ACK = r"(?:好的?[啊呀]?|可以(?:的|啊|呀)?|行(?:的|啊|呀)?|嗯{1,3}|同意(?:你的条件|这些条件|以上条件|了)?|就这样|按你说的|就按你说的|按你说的来|没问题|(?:我)?(?:听懂|明白|懂|知道)(?:了|啦)|(?:我)?保证)"
+PHOTO_CONFIRMATION = rf"(?:{CONFIRMATION_ACK}|我要看|我想看|我想看看|想看|想看看|给我看|让我看|让我看看|发吧|发给我吧|来吧|拍吧|拍一张吧|可以拍|可以发|就按你说的拍|就这样拍|好就按你说的拍)"
+
+def message_text(text: str) -> str:
+    """Remove leading platform At/CQ metadata, never quoted or inline text."""
+    value = str(text or "").strip()
+    return re.sub(r"^(?:(?:\[At:(?:\d+|all)\]|\[CQ:(?:at|reply),[^\]\r\n]+\])\s*)+", "", value, flags=re.I).strip()
+
+def confirmation_text(text: str, *, kind: str = "photo") -> bool:
+    # Do not strip quotations/code: quoted consent is not the user's consent.
+    clean = re.sub(r"\s", "", message_text(text)).strip("。！!，,、")
+    pattern = PHOTO_CONFIRMATION if kind == "photo" else CONFIRMATION_ACK
+    clauses = re.split(r"[。！!，,、]+", clean)
+    return bool(clean) and all(re.fullmatch(pattern, clause) for clause in clauses)
+
 @dataclass
 class Intent:
     mode: str = "none"
@@ -39,9 +56,12 @@ def state_patch(value: Any) -> dict[str, str]:
     return {key: str(value[key]).strip()[:600] for key in STATE_KEYS if key in value and isinstance(value[key], str)}
 
 def photo_request(text: str, pending: dict | None = None) -> bool:
-    text = str(text).strip()
+    text = message_text(text)
     if not text:
         return False
+    pending_photo = bool(pending and pending.get("request_kind") == "photo" and float(pending.get("expires_at", 0)) > time.time())
+    if pending_photo and confirmation_text(text):
+        return True
     clean = re.sub(r'```[\s\S]*?```|[“「『"][\s\S]*?[”」』"]', "", text).strip()
     if re.search(r"(?:讲解|讲讲|解释|教程|教学|科普|原理|过程|习惯|为什么|如何使用|怎么使用)", clean):
         return False
@@ -73,22 +93,23 @@ def photo_request(text: str, pending: dict | None = None) -> bool:
         return bool(pending and (pending.get("last_image") or pending.get("request")))
     if re.fullmatch(r"(?:请|再|那就|你)?拍(?:近|远)一?[点些](?:吧|好吗)?[。！!，,\s]*", clean):
         return True
-    if pending and pending.get("request_kind") == "photo" and float(pending.get("expires_at", 0)) > time.time():
-        if re.fullmatch(r"(?:那|那就|请)?(?:镜头|构图)(?:再)?(?:近|远)一?[点些](?:吧|好吗)?[。！!，,\s]*", clean):
+    if pending_photo:
+        # A changed camera request is eligible for negotiation, not consent;
+        # _prepare_request keeps the old conditions and requires confirmation.
+        if re.fullmatch(rf"(?:{PHOTO_CONFIRMATION}[，,\s]*(?:但是|不过|但)?[，,\s]*)?(?:那|那就|请)?(?:镜头|构图)(?:再|改|改成|换成)?(?:近|远)一?[点些](?:吧|好吗)?[。！!，,\s]*", text):
             return True
-        return bool(re.fullmatch(r"(?:好[的啊呀]?|可以|行|嗯|同意|就这样|按你说的|就按你说的拍|好，就按你说的拍)[。！!，,\s]*", clean))
     return False
 
 def state_request(text: str, pending: dict | None = None) -> bool:
+    text = message_text(text)
+    if pending and pending.get("request_kind") == "state" and float(pending.get("expires_at", 0)) > time.time() and confirmation_text(text, kind="state"):
+        return True
     clean = re.sub(r'```[\s\S]*?```|[“「『"][\s\S]*?[”」』"]', "", text).strip()
     if re.search(r"(?:假如|假设|想象|比如|引用|讨论|她说|他说|我说|我正|我坐|我站|我穿|昨天|刚才).{0,20}(?:换|穿|坐|站|摆)", clean) or clean.startswith(("我坐", "我站", "我穿")):
         return False
     text = clean
     if re.search(r"(?:不要|别|不想|不用).{0,12}(?:换|穿|摆|坐|站)", text):
         return False
-    if pending and pending.get("request_kind") == "state" and float(pending.get("expires_at", 0)) > time.time():
-        if re.fullmatch(r"(?:好[的啊呀]?|可以|行|嗯|同意|就这样|按你说的)[。！!，,\s]*", text.strip()):
-            return True
     return bool(re.search(r"(?:换成|换上|穿上|换衣|换个姿势|摆个|坐在|站在|笑一个)", text))
 
 def validate_intent(value: dict | None, raw: str = "") -> Intent:
