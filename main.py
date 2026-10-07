@@ -48,7 +48,7 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return False
 
 
-@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.4.4")
+@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.4.5")
 class PersonaCanvasPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -246,8 +246,14 @@ class PersonaCanvasPlugin(Star):
             intent = Intent(mode="persona_selfie", use_persona=True, prompt_delta=prompt, raw=prompt)
         try:
             data, ext, caption = await self._generate(intent, user_key=event.unified_msg_origin, is_admin=_is_admin(event))
-            yield event.image_result(str(self.storage.save_asset(data, ext)))
+            path = self.storage.save_asset(data, ext)
+            logger.info(f"[随想画卷] 正在发送图片: {path} (会话: {event.unified_msg_origin})")
+            event.stop_event()
+            if caption and caption != "生成完成":
+                yield event.plain_result(caption)
+            yield event.image_result(str(path))
         except Exception as exc:
+            event.stop_event()
             yield event.plain_result(f"生图失败：{exc}")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -265,13 +271,14 @@ class PersonaCanvasPlugin(Star):
         try:
             data, ext, caption = await self._generate(intent, user_key=event.unified_msg_origin, is_admin=_is_admin(event))
             path = self.storage.save_asset(data, ext)
-            chain = MessageChain()
+            logger.info(f"[随想画卷] 正在发送图片: {path} (会话: {event.unified_msg_origin})")
+            event.stop_event()
             if caption and caption != "生成完成":
-                chain.message(caption)
-            chain.file_image(str(path))
-            await event.send(chain)
+                yield event.plain_result(caption)
+            yield event.image_result(str(path))
         except Exception as exc:
-            await event.send(MessageChain().message(f"生图失败：{exc}"))
+            event.stop_event()
+            yield event.plain_result(f"生图失败：{exc}")
 
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL
