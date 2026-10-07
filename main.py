@@ -48,7 +48,7 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return False
 
 
-@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.4.3")
+@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.4.4")
 class PersonaCanvasPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -219,7 +219,11 @@ class PersonaCanvasPlugin(Star):
 
     async def _reply_image(self, event: AstrMessageEvent, data: bytes, extension: str, caption: str):
         path = self.storage.save_asset(data, extension)
-        return event.chain_result([MessageChain().message(caption), MessageChain().file_image(str(path))])
+        chain = MessageChain()
+        if caption and caption != "生成完成":
+            chain.message(caption)
+        chain.file_image(str(path))
+        return chain
 
     @filter.command("生图控制台", alias={"人设控制台"})
     async def command_webui(self, event: AstrMessageEvent):
@@ -259,10 +263,15 @@ class PersonaCanvasPlugin(Star):
         if not intent.is_generation:
             return
         try:
-            data, ext, _ = await self._generate(intent, user_key=event.unified_msg_origin, is_admin=_is_admin(event))
-            await event.send(event.chain_result([MessageChain().message("生成完成"), MessageChain().file_image(str(self.storage.save_asset(data, ext)))]))
+            data, ext, caption = await self._generate(intent, user_key=event.unified_msg_origin, is_admin=_is_admin(event))
+            path = self.storage.save_asset(data, ext)
+            chain = MessageChain()
+            if caption and caption != "生成完成":
+                chain.message(caption)
+            chain.file_image(str(path))
+            await event.send(chain)
         except Exception as exc:
-            await event.send(event.plain_result(f"生图失败：{exc}"))
+            await event.send(MessageChain().message(f"生图失败：{exc}"))
 
     @filter.platform_adapter_type(
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL
