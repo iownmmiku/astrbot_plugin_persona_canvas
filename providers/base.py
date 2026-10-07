@@ -104,6 +104,15 @@ class ImageProvider:
         except Exception as exc:
             raise ProviderError(f"生图请求失败：{exc}") from exc
 
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
+        options = options or {}
+        kind = str(self.config.get("kind", "openai")).lower()
+        if kind == "novelai":
+            return await self._novelai(prompt, negative_prompt, options, reference)
+        if kind == "gemini":
+            return await self._gemini(prompt, negative_prompt, options, reference)
+        return await self._openai(prompt, negative_prompt, options, reference)
+
     async def _request(self, method: str, url: str, body: dict[str, Any] | None = None) -> tuple[bytes, str, int]:
         try:
             import aiohttp
