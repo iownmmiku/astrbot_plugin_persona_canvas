@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import hmac
 import json
-import secrets
+import mimetypes
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+from .page_api import MAX_UPLOAD_BYTES, asset_path, dispatch_api, public_error
 
 
 class ApiError(Exception):
@@ -18,6 +21,7 @@ class ApiError(Exception):
 
 
 class WebUI:
+    """Opt-in legacy transport; serves exactly the same UI as Plugin Pages."""
     ASSETS = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/app.css": ("app.css", "text/css; charset=utf-8"),
@@ -30,8 +34,8 @@ class WebUI:
         self.plugin = plugin
         self.host, self.port, self.token = host, port, token
         self.loop = asyncio.get_running_loop()
-        self.server: ThreadingHTTPServer | None = None
-        self.thread: threading.Thread | None = None
+        self.server = None
+        self.thread = None
         self.closing = False
 
     @property
@@ -49,7 +53,7 @@ class WebUI:
             def log_message(self, *_args):
                 pass
 
-            def reply(self, status: int, body: object, mime: str = "application/json; charset=utf-8"):
+            def reply(self, status: int, body, mime: str = "application/json; charset=utf-8"):
                 if not isinstance(body, bytes):
                     body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 self.send_response(status)
@@ -57,7 +61,8 @@ class WebUI:
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
                 self.end_headers()
                 try:
                     self.wfile.write(body)
@@ -65,8 +70,7 @@ class WebUI:
                     pass
 
             def authorized(self) -> bool:
-                value = self.headers.get("Authorization", "")
-                return hmac.compare_digest(value, f"Bearer {owner.token}")
+                return hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {owner.token}")
 
             def same_origin(self) -> bool:
                 origin = self.headers.get("Origin")
@@ -82,7 +86,7 @@ class WebUI:
                     raise ApiError(503, "控制台正在关闭")
                 future = asyncio.run_coroutine_threadsafe(coroutine, owner.loop)
                 try:
-                    return future.result(timeout=30)
+                    return future.result(timeout=180)
                 except concurrent.futures.TimeoutError:
                     future.cancel()
                     raise ApiError(504, "请求超时") from None
@@ -92,35 +96,24 @@ class WebUI:
                     path = urlsplit(self.path).path
                     if path in owner.ASSETS:
                         name, mime = owner.ASSETS[path]
-                        self.reply(200, (Path(__file__).parent / "webui" / name).read_bytes(), mime)
-                        return
-                    if path.startswith("/assets/"):
-                        name = unquote(path.removeprefix("/assets/"))
-                        if "/" in name or "\\" in name or not name or name.startswith("."):
-                            raise ApiError(404, "资源不存在")
-                        asset = owner.plugin.storage.assets / name
-                        if not asset.is_file() or asset.stat().st_size > 64 * 1024 * 1024:
-                            raise ApiError(404, "资源不存在")
-                        mime = "image/png" if asset.suffix.lower() == ".png" else "image/jpeg" if asset.suffix.lower() in {".jpg", ".jpeg"} else "image/webp"
-                        self.reply(200, asset.read_bytes(), mime)
+                        self.reply(200, (Path(__file__).parent / "pages" / "canvas" / name).read_bytes(), mime)
                         return
                     if not self.authorized():
                         raise ApiError(401, "请输入有效的访问令牌")
-                    routes = {
-                        "/api/state": owner.plugin.web_state,
-                        "/api/personas": owner.plugin.web_personas,
-                        "/api/providers": owner.plugin.web_providers,
-                        "/api/targets": owner.plugin.web_targets,
-                        "/api/history": owner.plugin.web_history,
-                    }
-                    callback = routes.get(path)
-                    if callback is None:
+                    if path.startswith("/assets/") or path.startswith("/api/page/assets/"):
+                        name = unquote(path.rsplit("/", 1)[-1])
+                        asset = asset_path(owner.plugin, name)
+                        self.reply(200, asset.read_bytes(), mimetypes.guess_type(asset.name)[0] or "application/octet-stream")
+                        return
+                    if not path.startswith("/api/"):
                         raise ApiError(404, "页面不存在")
-                    self.reply(200, self.dispatch(callback()))
+                    self.reply(200, self.dispatch(dispatch_api(owner.plugin, "GET", path.removeprefix("/api/"))))
                 except ApiError as exc:
-                    self.reply(exc.status, {"error": str(exc)})
-                except Exception:
-                    self.reply(500, {"error": "读取失败，请查看 AstrBot 日志"})
+                    self.reply(exc.status, {"status": "error", "message": str(exc)})
+                except LookupError as exc:
+                    self.reply(404, {"status": "error", "message": str(exc)})
+                except Exception as exc:
+                    self.reply(400, {"status": "error", "message": public_error(owner.plugin, exc)})
 
             def do_POST(self):
                 try:
@@ -129,11 +122,13 @@ class WebUI:
                     if not self.same_origin():
                         raise ApiError(403, "只允许从控制台页面执行操作")
                     path = urlsplit(self.path).path
+                    if not path.startswith("/api/"):
+                        raise ApiError(404, "接口不存在")
                     try:
                         size = int(self.headers.get("Content-Length", "0"))
                     except ValueError:
                         raise ApiError(400, "请求长度无效") from None
-                    if not 0 < size <= 2 * 1024 * 1024:
+                    if not 0 < size <= 24 * 1024 * 1024:
                         raise ApiError(413, "请求内容为空或过大")
                     try:
                         body = json.loads(self.rfile.read(size))
@@ -141,21 +136,21 @@ class WebUI:
                         raise ApiError(400, "JSON 格式无效") from None
                     if not isinstance(body, dict):
                         raise ApiError(400, "请求必须是对象")
-                    routes = {
-                        "/api/personas": owner.plugin.web_save_persona,
-                        "/api/providers": owner.plugin.web_save_provider,
-                        "/api/settings": owner.plugin.web_save_settings,
-                        "/api/generate": owner.plugin.web_generate,
-                        "/api/targets": owner.plugin.web_target_action,
-                    }
-                    callback = routes.get(path)
-                    if callback is None:
-                        raise ApiError(404, "接口不存在")
-                    self.reply(200, self.dispatch(callback(body)))
+                    suffix = path.removeprefix("/api/").removeprefix("page/")
+                    if suffix == "reference/upload":
+                        data = base64.b64decode(str(body.get("data") or ""), validate=True)
+                        if len(data) > MAX_UPLOAD_BYTES:
+                            raise ApiError(413, "参考图不能超过 16 MB")
+                        result = self.dispatch(owner.plugin.web_upload_reference(data, str(body.get("name") or "reference.png"), str(body.get("persona_id") or "")))
+                    else:
+                        result = self.dispatch(dispatch_api(owner.plugin, "POST", suffix, body))
+                    self.reply(200, result)
                 except ApiError as exc:
-                    self.reply(exc.status, {"error": str(exc)})
-                except Exception:
-                    self.reply(500, {"error": "操作失败，请查看 AstrBot 日志"})
+                    self.reply(exc.status, {"status": "error", "message": str(exc)})
+                except LookupError as exc:
+                    self.reply(404, {"status": "error", "message": str(exc)})
+                except Exception as exc:
+                    self.reply(400, {"status": "error", "message": public_error(owner.plugin, exc)})
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True

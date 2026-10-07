@@ -1,57 +1,46 @@
 from __future__ import annotations
-
 import re
 import time
-from collections import defaultdict
-from typing import Any
-
-
-# These are intentionally conservative local checks. They prevent obvious unsafe
-# requests even when the optional LLM classifier is unavailable.
-HARD_BLOCKS = (
-    r"未成年.{0,12}(色情|裸|性|淫|自慰)",
-    r"(儿童|小孩|幼女|幼童).{0,12}(裸|色情|性行为)",
-    r"(偷拍|强奸|非自愿).{0,12}(裸|色情|性)",
-    r"(制作|生成).{0,12}(炸弹|毒品|病毒)",
-)
-
 
 class Moderation:
-    def __init__(self, settings: dict[str, Any]):
-        self.settings = settings
-        self.calls: dict[str, list[float]] = defaultdict(list)
-        self.inflight: dict[str, int] = defaultdict(int)
+    def __init__(self, settings, storage=None):
+        self.settings, self.storage = settings, storage
+        self._local = {}
 
-    def hard_block(self, text: str) -> str | None:
-        for pattern in HARD_BLOCKS:
-            if re.search(pattern, text, re.I):
-                return "这类内容不能生成。"
-        return None
+    def check_content(self, text):
+        if re.search(r"未成年.{0,8}(?:色情|裸体|性行为)|儿童.{0,8}(?:色情|裸体|性行为)", text):
+            raise ValueError("该请求不允许生成")
 
-    def allow(self, key: str, text: str, *, is_admin: bool = False) -> tuple[bool, str]:
-        blocked = self.hard_block(text)
-        if blocked:
-            return False, blocked
-        if is_admin:
+    def allow(self, key, text, *, is_admin=False):
+        try:
+            self.check_content(text)
+        except ValueError as exc:
+            return False, str(exc)
+        limits = self.settings.get("moderation", {})
+        if self.storage:
+            return self.storage.reserve_quota(key, limits, is_admin=is_admin)
+        if is_admin or not limits.get("enabled", True):
             return True, ""
-        config = self.settings.get("moderation") or {}
-        if config.get("enabled") is False:
-            return True, ""
-        now = time.time()
-        limit = max(0, int(config.get("daily_limit", 5)))
-        interval = max(0, int(config.get("min_interval_sec", 20)))
-        max_concurrency = max(1, int(config.get("max_concurrency", 1)))
-        history = [at for at in self.calls[key] if now - at < 86400]
-        self.calls[key] = history
-        if limit and len(history) >= limit:
-            return False, "今天的生图次数已用完，请明天再试。"
-        if history and interval and now - history[-1] < interval:
-            return False, f"请求太频繁，请 {int(interval - (now - history[-1])) + 1} 秒后再试。"
-        if self.inflight[key] >= max_concurrency:
-            return False, "上一张图片还在生成，请稍候。"
-        self.calls[key].append(now)
-        self.inflight[key] += 1
+        record = self._local.setdefault(key, {"day": time.strftime("%Y-%m-%d"), "count": 0, "running": 0, "last": 0})
+        day = time.strftime("%Y-%m-%d")
+        if day != record["day"]:
+            record.update(day=day, count=0)
+        if record["running"] >= int(limits.get("max_concurrency", 1)):
+            return False, "已有图片正在生成"
+        limit = int(limits.get("daily_limit", 5))
+        if limit and record["count"] + record["running"] >= limit:
+            return False, "今天的生图次数已用完"
+        if time.time() - record["last"] < int(limits.get("min_interval_sec", 20)):
+            return False, "请稍后再拍摄"
+        record["running"] += 1
         return True, ""
 
-    def finish(self, key: str) -> None:
-        self.inflight[key] = max(0, self.inflight[key] - 1)
+    def finish(self, key, *, success=True):
+        if self.storage:
+            self.storage.finish_quota(key, success=success)
+        elif key in self._local:
+            record = self._local[key]
+            record["running"] = max(0, record["running"] - 1)
+            if success:
+                record["count"] += 1
+                record["last"] = time.time()
