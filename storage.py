@@ -44,6 +44,7 @@ DEFAULT_PROVIDER = {
 DEFAULT_SETTINGS = {
     "current_persona": "default",
     "default_provider": "default",
+    "llm": {"provider_id": "", "model": "", "fallback_to_current": True, "timeout_sec": 45},
     "providers": {"default": DEFAULT_PROVIDER},
     "moderation": {"enabled": True, "daily_limit": 5, "min_interval_sec": 20, "max_concurrency": 1},
     "active": {"enabled": False, "check_interval_sec": 30, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "silence_after": 3, "silence_hours": 24},

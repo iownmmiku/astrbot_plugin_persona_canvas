@@ -78,14 +78,15 @@ class ActiveScheduler:
             target["silent_until"] = now + max(3600, int(settings.get("silence_hours", 24)) * 3600)
             self.plugin.storage.save_targets()
             return
-        provider = await self.plugin._text_provider()
         message = "好久没聊了，最近过得怎么样？"
-        if provider:
-            try:
-                response = await provider.text_chat(prompt="请结合近期上下文写一句自然、简短、不施压的破冰消息。只输出消息本身。", contexts=[], system_prompt=str(self.plugin.storage.persona().get("description", "")))
-                message = (getattr(response, "completion_text", "") or message).strip()[:300]
-            except Exception:
-                pass
+        try:
+            message = (await self.plugin._llm_chat(
+                "请结合近期上下文写一句自然、简短、不施压的破冰消息。只输出消息本身。",
+                system_prompt=str(self.plugin.storage.persona().get("description", "")),
+                umo=target.get("umo"),
+            ))[:300]
+        except Exception:
+            pass
         await self.plugin.context.send_message(target["umo"], MessageChain().message(message))
         target["last_active"] = now
         target["unanswered"] = int(target.get("unanswered", 0)) + 1

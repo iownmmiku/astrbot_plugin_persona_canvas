@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,7 +95,7 @@ def heuristic_intent(text: str, has_reference: bool = False) -> Intent:
     return Intent(raw=raw)
 
 
-async def parse_intent(provider: Any, text: str, has_reference: bool = False) -> Intent:
+async def parse_intent(provider: Any, text: str, has_reference: bool = False, *, model: str = "", timeout: int = 45) -> Intent:
     fallback = heuristic_intent(text, has_reference)
     if provider is None:
         return fallback
@@ -107,11 +108,10 @@ async def parse_intent(provider: Any, text: str, has_reference: bool = False) ->
         "普通聊天必须返回 mode=none。"
     )
     try:
-        response = await provider.text_chat(
-            prompt=text,
-            contexts=[],
-            system_prompt=system,
-        )
+        kwargs = {"prompt": text, "contexts": [], "system_prompt": system}
+        if model:
+            kwargs["model"] = model
+        response = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=max(5, timeout))
         parsed = _parse_json(getattr(response, "completion_text", ""))
         result = validate_intent(parsed, text)
         return result if result.is_generation or result.mode == "none" and parsed else fallback

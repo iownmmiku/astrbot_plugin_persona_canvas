@@ -129,11 +129,60 @@ class PersonaCanvasPlugin(Star):
             raise ProviderError("没有配置可用的生图接口")
         return provider_from_config(key, config)
 
-    async def _text_provider(self):
-        try:
-            return self.context.get_using_provider()
-        except Exception:
-            return None
+    async def _text_provider(self, umo: str | None = None):
+        llm = self.storage.settings.get("llm", {})
+        provider_id = str(llm.get("provider_id") or "").strip()
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if provider is None:
+                raise ProviderError(f"找不到已配置的 LLM Provider：{provider_id}")
+            return provider
+        if bool(llm.get("fallback_to_current", True)):
+            provider = await self.context.get_using_provider_async(umo)
+            if provider is not None:
+                return provider
+        return None
+
+    async def _llm_chat(self, prompt: str, system_prompt: str = "", contexts: list | None = None, umo: str | None = None) -> str:
+        provider = await self._text_provider(umo)
+        if provider is None:
+            raise ProviderError("没有可用的 LLM Provider，请在随想画卷页面选择模型")
+        llm = self.storage.settings.get("llm", {})
+        kwargs = {"prompt": prompt, "contexts": contexts or [], "system_prompt": system_prompt}
+        if str(llm.get("model") or "").strip():
+            kwargs["model"] = str(llm["model"]).strip()
+        timeout = max(5, min(300, int(llm.get("timeout_sec", 45))))
+        response = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=timeout)
+        text = (getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            raise ProviderError("LLM 没有返回有效文本")
+        return text
+
+    async def _llm_providers(self):
+        items = []
+        for provider in self.context.get_all_providers():
+            meta = provider.meta()
+            item = {"id": str(meta.id), "model": str(meta.model or ""), "type": str(meta.type), "provider_type": getattr(meta.provider_type, "value", str(meta.provider_type)), "models": [], "error": ""}
+            try:
+                item["models"] = await asyncio.wait_for(provider.get_models(), timeout=20)
+            except Exception as exc:
+                item["error"] = str(exc)[:300]
+            items.append(item)
+        return {"items": items, "selected": copy.deepcopy(self.storage.settings.get("llm", {}))}
+
+    async def _test_llm(self, body: dict):
+        provider_id = str(body.get("provider_id") or self.storage.settings.get("llm", {}).get("provider_id") or "").strip()
+        provider = self.context.get_provider_by_id(provider_id) if provider_id else await self.context.get_using_provider_async(None)
+        if provider is None:
+            raise ProviderError("没有找到要测试的 LLM Provider")
+        model = str(body.get("model") or self.storage.settings.get("llm", {}).get("model") or "").strip()
+        started = time.monotonic()
+        kwargs = {"prompt": "Reply with PONG only.", "contexts": [], "system_prompt": "You are a connectivity test."}
+        if model:
+            kwargs["model"] = model
+        response = await asyncio.wait_for(provider.text_chat(**kwargs), timeout=30)
+        meta = provider.meta()
+        return {"ok": True, "provider_id": str(meta.id), "model": model or str(meta.model or ""), "text": (response.completion_text or "").strip()[:200], "elapsed_ms": int((time.monotonic() - started) * 1000)}
 
     async def _generate(self, intent: Intent, *, user_key: str, is_admin: bool = False, reference: bytes | None = None) -> tuple[bytes, str, str]:
         allowed, reason = self.moderation.allow(user_key, intent.raw or intent.scene_prompt, is_admin=is_admin)
@@ -196,8 +245,9 @@ class PersonaCanvasPlugin(Star):
         text = _text_from_event(event)
         if not text or text.startswith("/"):
             return
-        provider = await self._text_provider()
-        intent = await parse_intent(provider, text, False)
+        provider = await self._text_provider(event.unified_msg_origin)
+        llm = self.storage.settings.get("llm", {})
+        intent = await parse_intent(provider, text, False, model=str(llm.get("model") or ""), timeout=int(llm.get("timeout_sec", 45)))
         if not intent.is_generation:
             return
         try:

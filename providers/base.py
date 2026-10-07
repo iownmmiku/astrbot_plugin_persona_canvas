@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,14 +104,79 @@ class ImageProvider:
         except Exception as exc:
             raise ProviderError(f"生图请求失败：{exc}") from exc
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
-        options = options or {}
+    async def _request(self, method: str, url: str, body: dict[str, Any] | None = None) -> tuple[bytes, str, int]:
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise ProviderError("AstrBot 环境缺少 aiohttp") from exc
+        timeout = aiohttp.ClientTimeout(total=max(5, min(120, int(self.config.get("timeout", 30)))))
+        headers = self._headers()
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(method, url, headers=headers, json=body, allow_redirects=False) as response:
+                    raw = await response.content.read(8 * 1024 * 1024 + 1)
+                    if len(raw) > 8 * 1024 * 1024:
+                        raise ProviderError("模型接口响应超过 8 MB")
+                    if response.status >= 400:
+                        brief = raw[:400].decode("utf-8", "replace")
+                        raise ProviderError(f"HTTP {response.status}：{brief}")
+                    return raw, response.headers.get("Content-Type", ""), response.status
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"模型接口请求失败：{exc}") from exc
+
+    async def list_models(self) -> dict[str, Any]:
         kind = str(self.config.get("kind", "openai")).lower()
+        endpoint = str(self.config.get("endpoint") or "").rstrip("/")
         if kind == "novelai":
-            return await self._novelai(prompt, negative_prompt, options, reference)
+            current = str(self.config.get("model") or "nai-diffusion-4-5-full")
+            choices = list(dict.fromkeys([current, "nai-diffusion-4-5-full", "nai-diffusion-4-5-curated", "nai-diffusion-4-5-full-inpainting", "nai-diffusion-4-5-curated-inpainting", "nai-diffusion-4-full", "nai-diffusion-3"]))
+            return {"models": choices, "automatic": False, "note": "NovelAI 各代理接口没有统一的模型列表端点；列表为常见模型建议。"}
+        if not endpoint:
+            raise ProviderError("请先填写接口地址")
         if kind == "gemini":
-            return await self._gemini(prompt, negative_prompt, options, reference)
-        return await self._openai(prompt, negative_prompt, options, reference)
+            url = endpoint if endpoint.endswith("/models") else f"{endpoint}/models"
+        else:
+            url = self._endpoint_path(endpoint, "/v1/models")
+        raw, _, _ = await self._request("GET", url)
+        payload = json.loads(raw.decode("utf-8"))
+        if kind == "gemini":
+            models = payload.get("models", [])
+            values = [str(item.get("name", "")).removeprefix("models/") for item in models if isinstance(item, dict) and (not item.get("supportedGenerationMethods") or "generateContent" in item.get("supportedGenerationMethods", []))]
+        else:
+            values = [str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")]
+        return {"models": sorted(set(value for value in values if value)), "automatic": True, "note": ""}
+
+    async def test_connection(self) -> dict[str, Any]:
+        started = time.monotonic()
+        kind = str(self.config.get("kind", "openai")).lower()
+        endpoint = str(self.config.get("endpoint") or "").rstrip("/")
+        if not endpoint:
+            raise ProviderError("请先填写接口地址")
+        if kind == "novelai":
+            url = f"{endpoint}/ai/generate-image"
+            method = "OPTIONS"
+        elif kind == "gemini":
+            url = endpoint if endpoint.endswith("/models") else f"{endpoint}/models"
+            method = "GET"
+        else:
+            url = self._endpoint_path(endpoint, "/v1/models")
+            method = "GET"
+        try:
+            raw, _, status = await self._request(method, url)
+            if method == "GET":
+                json.loads(raw.decode("utf-8"))
+            return {"ok": True, "provider": self.name, "model": self.config.get("model", ""), "status_code": status, "elapsed_ms": int((time.monotonic() - started) * 1000), "message": "接口连接成功"}
+        except Exception as exc:
+            return {"ok": False, "provider": self.name, "model": self.config.get("model", ""), "elapsed_ms": int((time.monotonic() - started) * 1000), "message": str(exc)[:500]}
+
+    async def test_generation(self, prompt: str = "simple blue flower on white background") -> tuple[GeneratedImage, int]:
+        options = {"width": 512, "height": 512, "steps": 4, "scale": 3.0, "sampler": "k_euler_ancestral", "seed": -1}
+        started = time.monotonic()
+        result = await self.generate(prompt, "", options=options)
+        return result, int((time.monotonic() - started) * 1000)
+
 
     @staticmethod
     def _endpoint_path(endpoint: str, suffix: str) -> str:

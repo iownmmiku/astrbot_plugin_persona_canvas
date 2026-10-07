@@ -29,6 +29,11 @@ class CanvasPageApi:
             ("targets", self.targets, ["GET", "POST"]),
             ("history", self.history, ["GET"]),
             ("assets/<name>", self.asset, ["GET"]),
+            ("llm/providers", self.llm_providers, ["GET"]),
+            ("llm/test", self.llm_test, ["POST"]),
+            ("llm/save", self.llm_save, ["POST"]),
+            ("image/models", self.image_models, ["POST"]),
+            ("image/test", self.image_test, ["POST"]),
         ]
         for suffix, handler, methods in routes:
             register(f"{PAGE_PREFIX}/{suffix}", handler, methods, f"Persona Canvas page: {suffix}")
@@ -67,6 +72,56 @@ class CanvasPageApi:
 
     async def history(self):
         return await self.plugin.web_history()
+
+    async def llm_providers(self):
+        try:
+            return await self.plugin._llm_providers()
+        except Exception as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def llm_test(self):
+        body = await request.json(default={})
+        try:
+            return await self.plugin._test_llm(body if isinstance(body, dict) else {})
+        except Exception as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def llm_save(self):
+        body = await request.json(default={})
+        if not isinstance(body, dict):
+            return error_response("LLM 设置格式无效", status_code=400)
+        settings = self.plugin.storage.settings.setdefault("llm", {})
+        for key in ("provider_id", "model", "fallback_to_current", "timeout_sec"):
+            if key in body:
+                settings[key] = body[key]
+        settings["timeout_sec"] = max(5, min(300, int(settings.get("timeout_sec", 45))))
+        self.plugin.storage.save_settings()
+        return {"settings": settings}
+
+    async def image_models(self):
+        body = await request.json(default={})
+        name = str(body.get("name") or "") if isinstance(body, dict) else ""
+        try:
+            provider = self.plugin._provider(name)
+            result = await provider.list_models()
+            return {"provider": name, **result}
+        except Exception as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def image_test(self):
+        body = await request.json(default={})
+        if not isinstance(body, dict):
+            return error_response("测试参数无效", status_code=400)
+        name = str(body.get("name") or "")
+        provider = self.plugin._provider(name)
+        if not body.get("generate_image"):
+            return await provider.test_connection()
+        try:
+            result, elapsed = await provider.test_generation(str(body.get("prompt") or "simple blue flower on white background"))
+            data_url = f"data:image/{'jpeg' if result.extension == 'jpg' else result.extension};base64,{base64.b64encode(result.data).decode('ascii')}"
+            return {"ok": True, "provider": name, "model": result.model, "extension": result.extension, "elapsed_ms": elapsed, "image": data_url}
+        except Exception as exc:
+            return {"ok": False, "provider": name, "model": provider.config.get("model", ""), "message": str(exc)[:500]}
 
     async def asset(self):
         name = str(request.path_params.get("name") or "")
