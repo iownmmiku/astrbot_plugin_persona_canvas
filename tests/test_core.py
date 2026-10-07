@@ -59,3 +59,11 @@ def test_image_provider_generate_attribute():
     assert hasattr(provider, "list_models")
     assert hasattr(provider, "test_connection")
     assert hasattr(provider, "test_generation")
+
+
+def test_message_chain_validity():
+    import sys
+    sys.path.insert(0, str(ROOT))
+    # Test that MessageChain builder creates flat component lists without nested MessageChains
+    chain_script = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "chain_result([MessageChain()" not in chain_script, "Cannot wrap MessageChain inside chain_result list!"
