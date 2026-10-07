@@ -2,7 +2,7 @@
 
 AstrBot 插件：用自然语言调用 GPT/OpenAI、Gemini、NovelAI 或自定义生图接口，管理可持续的人设状态，并通过 WebUI 配置主动私聊消息与每日早安照片。
 
-> `v0.3.0` 新增 AstrBot 官方插件页面。启用插件后，AstrBot 插件卡片会显示“打开插件界面”，无需再单独输入随想画卷 WebUI 令牌。旧版独立 `3018` WebUI 仍保留作为兼容入口。
+> `v0.4.0` 新增独立 LLM 选择、AstrBot Provider/模型自动获取、绘画 Provider 模型获取、连接测试和最小测试图生成功能。
 
 > 当前版本是可运行的首版原型。不同 Gemini、NovelAI 中转服务的参数和图片返回格式可能不同，正式使用前请在 WebUI 中先执行小图测试。
 
@@ -75,7 +75,16 @@ git clone https://github.com/iownmmiku/astrbot_plugin_persona_canvas.git
 
 如果 `webui_token` 留空，令牌会自动保存到插件数据目录的 `webui_token.txt`。令牌不会写入日志；请不要把它提交到 Git 或公开截图中。
 
-## AstrBot 配置页
+### 独立 LLM 与绘画模型测试
+
+在官方“打开插件界面”的“模型接口”页中：
+
+- “独立 LLM”区域会自动读取 AstrBot 已加载的聊天 Provider 和可用模型。
+- 可单独选择用于意图解析、状态修改和主动消息的 LLM，不会修改 AstrBot 全局模型。
+- 可测试 LLM 连接，并设置无独立选择时是否回退到当前聊天模型。
+- 绘画 Provider 支持获取模型列表、测试连接和生成一张最小测试图。
+- NovelAI 代理通常没有统一模型列表接口，页面会显示常见模型建议；最终是否可用仍以测试图结果为准。
+
 
 插件配置页现在提供完整的运行参数，包括：
 
