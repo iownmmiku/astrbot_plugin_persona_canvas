@@ -5,11 +5,19 @@ import base64
 import copy
 import os
 import random
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+# Purge cached submodules on reload so new Python code on disk is always used
+_pkg = __name__.rpartition(".")[0]
+if _pkg:
+    for _m in list(sys.modules.keys()):
+        if _m.startswith(_pkg + ".") and _m != __name__:
+            del sys.modules[_m]
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -40,7 +48,7 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return False
 
 
-@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.3.0")
+@register(PLUGIN_NAME, "you", "随想画卷（Persona Canvas）：人设驱动生图与主动消息", "0.4.3")
 class PersonaCanvasPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)

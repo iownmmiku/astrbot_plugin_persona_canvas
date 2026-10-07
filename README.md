@@ -2,7 +2,7 @@
 
 AstrBot 插件：用自然语言调用 GPT/OpenAI、Gemini、NovelAI 或自定义生图接口，管理可持续的人设状态，并通过 WebUI 配置主动私聊消息与每日早安照片。
 
-> `v0.4.0` 新增独立 LLM 选择、AstrBot Provider/模型自动获取、绘画 Provider 模型获取、连接测试和最小测试图生成功能。
+> `v0.4.3` 修复 `ImageProvider` 的 `generate` 方法，强化子模块热重载与跨平台 ZIP 路径标准，解决生图报错问题。
 
 > 当前版本是可运行的首版原型。不同 Gemini、NovelAI 中转服务的参数和图片返回格式可能不同，正式使用前请在 WebUI 中先执行小图测试。
 

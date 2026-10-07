@@ -46,3 +46,16 @@ def test_moderation():
     moderator.finish("u")
     assert not moderator.allow("u", "普通图片")[0]
     assert not moderator.allow("admin", "未成年色情", is_admin=True)[0]
+
+
+def test_image_provider_generate_attribute():
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from providers.base import ImageProvider, provider_from_config
+
+    provider = provider_from_config("test", {"kind": "openai", "endpoint": "http://127.0.0.1", "model": "dall-e-3"})
+    assert hasattr(provider, "generate"), "ImageProvider 必须提供 generate 方法"
+    assert callable(getattr(provider, "generate", None))
+    assert hasattr(provider, "list_models")
+    assert hasattr(provider, "test_connection")
+    assert hasattr(provider, "test_generation")
