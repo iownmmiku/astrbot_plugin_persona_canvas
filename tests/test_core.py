@@ -155,6 +155,16 @@ class Event:
         self.sent.append(chain)
 
 class RequestTests(unittest.TestCase):
+    def test_short_view_requests_are_eligible(self):
+        for text in ("看看自拍", "看下你的自拍", "看一下你的照片吧", "看看你今天的自拍", "想看看自拍", "能让我看看自拍吗？", "可以看一眼你的自拍吗？"):
+            with self.subTest(text=text):
+                self.assertTrue(photo_request(text))
+
+    def test_selfie_mentions_are_not_view_requests(self):
+        for text in ("自拍", "你喜欢自拍吗？", "你喜欢看看自拍吗？", "我在看看自拍", "看看自拍是什么", "看看自拍的技巧", "不要看看自拍", "她说“看看自拍”", "“看看自拍”", "```看看自拍```", "假如看看自拍会怎样", "讨论看看自拍"):
+            with self.subTest(text=text):
+                self.assertFalse(photo_request(text))
+
     def test_no_accidental_generation(self):
         for text in ("我不想自拍", "你穿泳装会害羞吗？", "今天在大海边散步很舒服", "你平时喜欢什么姿势？", "比如‘拍一张你的照片’", "讨论给我拍一张照片", "昨天我拍了一张照片", "不要给我发照片了"):
             with self.subTest(text=text):
@@ -233,6 +243,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(repeated["ok"])
         await asyncio.gather(*list(self.plugin._tasks))
         self.assertEqual(len(self.image_provider.calls), 1)
+
+    async def test_private_short_selfie_native_tool_queues_and_sends_image(self):
+        event = Event("看看自拍")
+        event.is_at_or_wake_command = False
+        result = json.loads(await self.plugin.tool_photo(event, "portrait, white dress", caption="给你看看。"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "queued")
+        self.assertFalse(result["image_sent"])
+        await asyncio.gather(*list(self.plugin._tasks))
+        self.assertEqual(len(self.image_provider.calls), 1)
+        self.assertEqual(self.store.job(result["job_id"])["status"], "sent")
+        self.assertEqual([kind for kind, _ in event.sent[0].chain], ["text", "image"])
+
+    async def test_short_selfie_compatibility_respects_refusal_and_consent(self):
+        self.store.settings["integration"]["mode"] = "compatibility"
+        refusal = Event("看看自拍")
+        refusal.is_at_or_wake_command = False
+        await self.consume(self.plugin.natural_route(refusal))
+        self.assertEqual(len(self.context.llm.calls), 1)
+        self.assertFalse(self.image_provider.calls)
+        self.assertFalse(self.store.recent_jobs())
+        self.context.llm.next = {"decision": "photo", "reply": "好呀，给你拍一张。", "prompt": "portrait, white dress"}
+        agreed = Event("看下你的自拍")
+        agreed.is_at_or_wake_command = False
+        await self.consume(self.plugin.natural_route(agreed))
+        self.assertEqual(len(self.context.llm.calls), 2)
+        self.assertEqual(len(self.image_provider.calls), 1)
+        self.assertEqual(self.store.recent_jobs()[0]["status"], "sent")
 
     async def test_native_delivery_failure_stays_uncertain_and_replay_does_not_generate(self):
         event = Event("给我拍一张你的自拍")

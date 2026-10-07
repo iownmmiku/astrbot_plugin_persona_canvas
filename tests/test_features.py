@@ -137,6 +137,33 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostic["items"][0]["status"], "refuse")
         self.assertFalse(self.image_provider.calls)
 
+    async def test_native_text_without_tool_is_diagnosed_and_cannot_generate(self):
+        event = Event("看看自拍")
+        await self.plugin.remember_conditions(event, types.SimpleNamespace(completion_text="给你看我的自拍，今天穿了白裙。"))
+        diagnostic = await self.plugin.web_diagnostics()
+        item = diagnostic["items"][0]
+        self.assertEqual(item["status"], "no_tool")
+        self.assertEqual(item["trace"][-1]["stage"], "tool")
+        self.assertFalse(self.store.recent_jobs())
+        self.assertFalse(self.image_provider.calls)
+
+    async def test_pending_tool_call_or_stream_chunk_is_not_missing_tool(self):
+        event = Event("看看自拍")
+        for response in (types.SimpleNamespace(completion_text="可以，给你拍。", tools_call_name=["persona_canvas_photo"]), types.SimpleNamespace(completion_text="给你", is_chunk=True)):
+            await self.plugin.remember_conditions(event, response)
+        self.assertFalse(self.store.recent_actions())
+        self.assertFalse(self.store.recent_jobs())
+
+    async def test_rejected_native_photo_is_visible_in_diagnostics(self):
+        result = json.loads(await self.plugin.tool_photo(Event("你喜欢自拍吗？"), "portrait"))
+        self.assertFalse(result["ok"])
+        diagnostic = await self.plugin.web_diagnostics()
+        item = diagnostic["items"][0]
+        self.assertEqual(item["status"], "blocked")
+        self.assertEqual(item["trace"][0]["stage"], "request")
+        self.assertIn("明确", item["error"])
+        self.assertFalse(self.image_provider.calls)
+
     async def test_missing_override_fallback_does_not_pass_override_model(self):
         self.store.settings["llm"].update(provider_id="removed", model="override-only-model", fallback_to_current=True)
         env = await self.plugin.dialogue.environment(Event().unified_msg_origin)

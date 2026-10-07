@@ -15,8 +15,8 @@ const finished = job => ["succeeded", "success", "done", "completed", "sent"].in
 const failed = job => ["failed", "error", "interrupted", "cancelled", "uncertain"].includes(job.status);
 const fullImages = new Map(), imageRequests = new Set();
 const referenceImages = new Map();
-const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系" };
-const stageNames = { request: "请求检查", role: "角色判断", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
+const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截" };
+const stageNames = { request: "请求检查", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
 const activeJob = job => !finished(job) && !failed(job);
 const jobId = job => String(job.id || job.job_id || "");

@@ -51,6 +51,16 @@ def photo_request(text: str, pending: dict | None = None) -> bool:
         return False
     if re.search(r"(?:假如|假设|想象一下|比如|举例|引用|讨论).{0,30}(?:拍|画|照片|图片)", clean):
         return False
+    # Short requests to see a picture are explicit too. Match the whole request
+    # so mentions, narration and questions about photography remain ordinary chat.
+    if re.fullmatch(
+        r"(?:请|麻烦)?\s*(?:(?:我)?(?:能不能|可以|能)\s*)?(?:让我|给我|我想|想)?\s*"
+        r"(?:看看|看一?下|看一眼)\s*"
+        r"(?:(?:你(?:的)?|您(?:的)?|一张|几张|张|最新的|最近的|今天的|新的|刚拍的)\s*){0,3}"
+        r"(?:自拍(?:照)?|照片|图片)(?:吧|呗|嘛|吗|啊|呀|好吗|可以吗|行吗|好不好)?[。！？!?,，\s]*",
+        clean,
+    ):
+        return True
     if re.search(r"(?:给我|帮我|发我|让我看看|我想看|我想要).{0,30}(?:拍|画|生成|照片|自拍|图片)", clean):
         return True
     if re.search(r"(?:能不能|可以|能|愿意).{0,12}(?:拍|画|生成|发).{0,12}(?:张|幅|照片|图片|自拍|图)", clean):
@@ -112,6 +122,8 @@ DECISION_RULES = """
 提及照片、讨论、假设、引用、否定都不是拍摄指令；普通聊天不要调用生图工具。
 提出条件并询问用户是否同意时，本轮不能拍照；等用户明确回应后再决定。
 只有你愿意且用户明确要照片/画图或已确认拍摄条件时才调用 persona_canvas_photo。
+“看看自拍”“看下你的照片”也是明确的图片请求，可以答应、拒绝或提条件。愿意实际给用户看照片时必须调用拍摄工具，不能用文字动作描写或描述一张虚构照片代替发图。
+没有调用工具或工具不可用时，不得声称已拍摄、已发送或用户已经看到图片；可以如实说明目前无法完成。只有工具确认正在生成时才说正在拍，实际发送状态以记录为准。
 固定长相不可被临时衣服/场景覆盖；害羞、姿势和镜头选择要落实进照片描述。
 单独换装可以调用 persona_canvas_state，不会自动拍照。图片编辑必须提供实际参考图。
 提拍摄条件时使用 persona_canvas_conditions 记录具体衣服、镜头和禁止内容。待确认要求被修改后重新询问，不得直接拍。

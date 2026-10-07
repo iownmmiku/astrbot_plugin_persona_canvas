@@ -25,7 +25,7 @@ from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 
 def _text(event):
@@ -280,10 +280,16 @@ class PersonaCanvasPlugin(Star):
             except Exception as exc:
                 _extra(event, "reference_error", self._error(exc), set_value=True)
         req.system_prompt = (getattr(req, "system_prompt", "") or "") + "\n" + self.dialogue.visual_prompt(env)
+        if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event) and self._eligible(_text(event), env):
+            req.system_prompt += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"
 
     @filter.on_llm_response()
     async def remember_conditions(self, event: AstrMessageEvent, response):
         if not self.storage.settings["integration"].get("enabled", True) or _extra(event, "photo_attempted") or _extra(event, "conditions_recorded"):
+            return
+        # A tool-call response is not the final reply: AstrBot executes it next.
+        # Stream chunks likewise cannot establish that no tool will be called.
+        if getattr(response, "tools_call_name", None) or getattr(response, "is_chunk", False):
             return
         env = await self._env(event)
         text = str(getattr(response, "completion_text", "") or "")
@@ -291,7 +297,11 @@ class PersonaCanvasPlugin(Star):
         pending = session.get("pending") or {}
         if self._eligible(_text(event), env) or state_request(_text(event), pending):
             status = "refuse" if re.search(r"不想拍|不愿意拍|不拍了|不能拍|拒绝", text) else "ask" if re.search(r"可以吗|行吗|好吗|好不好|要不要|愿意吗", text) else "chat"
-            self.storage.record_action({"kind": "decision", "source": "native", "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "request": _text(event), "reply": text[:2000], "status": status, "trace": [{"stage": "role", "status": status, "detail": "角色回复，未调用拍照工具；标签依据回复文本归纳"}]})
+            trace = [{"stage": "request", "status": "ok"}, {"stage": "role", "status": status, "detail": "标签依据回复文本归纳，不代表已执行拍摄"}]
+            if status == "chat" and self._eligible(_text(event), env):
+                status = "no_tool"
+                trace.append({"stage": "tool", "status": status, "detail": "本轮有明确图片请求，但未调用拍照工具，未创建生成任务。请检查 AstrBot 工具开关、人格工具限制与模型工具调用能力；仅凭文字回复无法确认具体原因。"})
+            self.storage.record_action({"kind": "decision", "source": "native", "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "request": _text(event), "reply": text[:2000], "status": status, "trace": trace})
         if pending and not self._eligible(_text(event), env) and not state_request(_text(event), pending):
             session["pending"] = {}
             session = self.storage.save_session(env["key"], session)
@@ -375,10 +385,14 @@ class PersonaCanvasPlugin(Star):
         self._track_current()
         env = await self._env(event)
         self._prepare_request(env, _text(event))
+        def rejected(reason, stage):
+            self.storage.record_action({"kind": "decision", "source": "native_tool", "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "request": _text(event), "status": "blocked", "error": reason, "trace": [{"stage": stage, "status": "blocked", "detail": reason}]})
+            return json.dumps({"ok": False, "reason": reason}, ensure_ascii=False)
         if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or not self._eligible(_text(event), env):
-            return json.dumps({"ok": False, "reason": "没有明确的拍摄请求或条件尚未确认，请继续正常聊天"}, ensure_ascii=False)
+            reason = "聊天接入已停用" if not self.storage.settings["integration"].get("enabled", True) else "群聊没有明确唤醒机器人" if not _addressed(event) else "没有明确的拍摄请求或条件尚未确认，请继续正常聊天"
+            return rejected(reason, "request")
         if _extra(event, "conditions_recorded") or env.get("changed_request"):
-            return json.dumps({"ok": False, "reason": "要求改变或正在询问条件，本轮不能拍摄，请先重新确认条件"}, ensure_ascii=False)
+            return rejected("要求改变或正在询问条件，本轮不能拍摄，请先重新确认条件", "conditions")
         if not self._claim_photo(event):
             return json.dumps({"ok": False, "reason": "本轮已经执行过拍摄，请不要重复调用"}, ensure_ascii=False)
         patch = {k: v for k, v in {"outfit": outfit, "pose": pose, "expression": expression, "scene": scene}.items() if v}

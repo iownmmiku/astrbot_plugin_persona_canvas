@@ -36,7 +36,7 @@ class InstallationArchiveTests(unittest.TestCase):
             self.assertEqual((installed / "main.py").read_bytes(), (ROOT / "main.py").read_bytes())
             self.assertTrue((installed / "pages/canvas/index.html").is_file())
             self.assertTrue((installed / "providers/base.py").is_file())
-            self.assertIn("version: 0.5.1", (installed / "metadata.yaml").read_text(encoding="utf-8"))
+            self.assertEqual((installed / "metadata.yaml").read_bytes(), (ROOT / "metadata.yaml").read_bytes())
             self.assertTrue((installed / "companion.py").is_file())
             self.assertFalse((installed / "data").exists())
             self.assertFalse((installed / ".git").exists())
