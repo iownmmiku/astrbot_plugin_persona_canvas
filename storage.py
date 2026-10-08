@@ -17,7 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OLD_PLUGIN_NAME = "astrbot_plugin_persona_studio"
 DEFAULT_PERSONA = {
     "id": "default", "name": "默认人设", "description": "",
@@ -189,6 +189,8 @@ class Storage:
             CREATE INDEX IF NOT EXISTS actions_session ON actions(session_key,at DESC);
             CREATE TABLE IF NOT EXISTS budget_usage (kind TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(kind,day));
             CREATE TABLE IF NOT EXISTS budget_reservations (id TEXT PRIMARY KEY, kind TEXT NOT NULL, day TEXT NOT NULL, expires_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS asset_leases (id TEXT PRIMARY KEY, name TEXT NOT NULL, expires_at REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS asset_lease_expiry ON asset_leases(expires_at);
         """)
 
     def _backup_database(self, version: int) -> None:
@@ -431,6 +433,16 @@ class Storage:
     def _write_session(self, value: dict[str, Any]) -> None:
         self._db.execute("INSERT INTO sessions(umo,updated_at,payload) VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET updated_at=excluded.updated_at,payload=excluded.payload", (value["umo"], value["updated_at"], _json(value)))
 
+    def read_session(self, umo: str) -> dict[str, Any] | None:
+        """Read the current snapshot without creating or switching a persona."""
+        umo = _safe_text(umo, 1000)
+        if not umo:
+            raise StorageError("会话标识不能为空")
+        with self._lock:
+            self._check_open()
+            row = self._db.execute("SELECT payload FROM sessions WHERE umo=?", (umo,)).fetchone()
+            return _decoded(row["payload"], "session") if row else None
+
     def session(self, umo: str, persona_id: str | None = None) -> dict[str, Any]:
         umo = _safe_text(umo, 1000)
         if not umo:
@@ -488,6 +500,54 @@ class Storage:
         with self._lock:
             self._check_open()
             return [_decoded(row["payload"], "session") for row in self._db.execute("SELECT payload FROM sessions ORDER BY updated_at DESC")]
+
+    def claim_photo_request(self, session_key: str, persona_id: str, request_id: str, job_id: str) -> dict[str, Any]:
+        """Claim an agreed request once; failures retain the original job claim."""
+        return self._claim_photo_request(session_key, persona_id, request_id, job_id)
+
+    def rebind_photo_request(self, session_key: str, persona_id: str, request_id: str, old_job_id: str, new_job_id: str) -> dict[str, Any]:
+        """Explicitly retry an existing failure without reopening normal consent."""
+        if not old_job_id or old_job_id == new_job_id:
+            raise StorageConflictError("重试任务必须对应原来的失败拍摄")
+        return self._claim_photo_request(session_key, persona_id, request_id, new_job_id, old_job_id=old_job_id)
+
+    def _claim_photo_request(self, session_key: str, persona_id: str, request_id: str, job_id: str, *, old_job_id: str = "") -> dict[str, Any]:
+        if not all(isinstance(item, str) and item for item in (session_key, persona_id, request_id, job_id)):
+            raise StorageConflictError("拍摄确认标识不能为空")
+        with self._lock:
+            self._check_open()
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                session = self.read_session(session_key)
+                pending = (session or {}).get("pending") or {}
+                if not session or session.get("persona_id") != persona_id or not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo":
+                    raise StorageConflictError("拍摄条件已经更新，请重新确认当前条件")
+                if not old_job_id and self._timestamp(pending.get("expires_at")) <= time.time():
+                    raise StorageConflictError("拍摄条件已经过期，请重新确认")
+                execution_job_id = str(pending.get("execution_job_id") or "")
+                if old_job_id:
+                    if execution_job_id == job_id:
+                        self._db.commit()
+                        return {"claimed": False, "job_id": job_id, "session": session}
+                    old = self.job(old_job_id)
+                    if execution_job_id != old_job_id or not old or old.get("status") not in {"failed", "cancelled"} or old.get("cancel_requested"):
+                        raise StorageConflictError("原拍摄不能重试；撤回或条件变化后需要重新判断")
+                elif execution_job_id:
+                    self._db.commit()
+                    return {"claimed": False, "job_id": execution_job_id, "session": session}
+                job = self.job(job_id)
+                if not job or job.get("status") != "queued" or job.get("session_key") != session_key or job.get("persona_id") != persona_id:
+                    raise StorageConflictError("拍摄任务与当前确认条件不一致")
+                pending["execution_job_id"] = job_id
+                session["pending"] = pending
+                session["revision"] = int(session.get("revision", 0)) + 1
+                session["updated_at"] = time.time()
+                self._write_session(session)
+                self._db.commit()
+                return {"claimed": True, "job_id": job_id, "session": copy.deepcopy(session)}
+            except Exception:
+                self._db.rollback()
+                raise
 
     @staticmethod
     def _validate_status(value: dict[str, Any], statuses: frozenset[str]) -> None:
@@ -736,8 +796,9 @@ class Storage:
         Images referenced by any surviving record remain on disk.
         """
         limit = max(0, int(limit))
-        with self._lock:
+        with self._lock, self._db:
             self._check_open()
+            self._db.execute("BEGIN IMMEDIATE")
             rows = self._db.execute("SELECT id,payload FROM history ORDER BY id DESC LIMIT -1 OFFSET ?", (limit,)).fetchall()
             deleted = [_decoded(row["payload"], "history") for row in rows]
             now = time.time()
@@ -749,6 +810,10 @@ class Storage:
                     value = _decoded(row["payload"], "delivery")
                     if value.get("job_id"):
                         protected_jobs.add(str(value["job_id"]))
+            for row in self._db.execute("SELECT payload FROM sessions"):
+                pending = _decoded(row["payload"], "session").get("pending") or {}
+                if isinstance(pending, dict) and pending.get("execution_job_id") and self._timestamp(pending.get("expires_at")) > now:
+                    protected_jobs.add(str(pending["execution_job_id"]))
             finished = self._db.execute("SELECT id,status,updated_at,payload FROM jobs WHERE status IN ('succeeded','failed','sent','uncertain','cancelled') ORDER BY updated_at DESC,rowid DESC").fetchall()
             eligible_finished = []
             for row in finished:
@@ -761,29 +826,12 @@ class Storage:
             pruned_jobs = eligible_finished[limit:]
             deleted.extend(_decoded(row["payload"], "job") for row in pruned_jobs)
             deleted.extend(_decoded(row["payload"], "delivery") for row in delivery_rows)
-            with self._db:
-                self._db.executemany("DELETE FROM history WHERE id=?", [(row["id"],) for row in rows])
-                self._db.executemany("DELETE FROM jobs WHERE id=?", [(row["id"],) for row in pruned_jobs])
-                self._db.executemany("DELETE FROM deliveries WHERE key=?", [(row["key"],) for row in delivery_rows])
-            keep, candidates = set(), set()
-            def gather(value: Any, target: set[str]) -> None:
-                if isinstance(value, dict):
-                    for item in value.values():
-                        gather(item, target)
-                elif isinstance(value, list):
-                    for item in value:
-                        gather(item, target)
-                elif isinstance(value, str):
-                    name = value.replace("\\", "/").rsplit("/", 1)[-1]
-                    if name and "." in name:
-                        target.add(name)
+            self._db.executemany("DELETE FROM history WHERE id=?", [(row["id"],) for row in rows])
+            self._db.executemany("DELETE FROM jobs WHERE id=?", [(row["id"],) for row in pruned_jobs])
+            self._db.executemany("DELETE FROM deliveries WHERE key=?", [(row["key"],) for row in delivery_rows])
+            keep, candidates = self._asset_references(now), set()
             for item in deleted:
-                gather(item, candidates)
-            for item in (self.personas, self.settings, self.targets, self.runtime):
-                gather(item, keep)
-            for table in ("history", "sessions", "jobs", "deliveries", "actions"):
-                for row in self._db.execute(f"SELECT payload FROM {table}"):
-                    gather(_decoded(row["payload"], table), keep)
+                self._gather_asset_names(item, candidates)
             removed = 0
             for name in candidates - keep:
                 try:
@@ -792,6 +840,68 @@ class Storage:
                 except (StorageError, OSError):
                     continue
             return {"history_deleted": len(rows), "jobs_deleted": len(pruned_jobs), "deliveries_deleted": len(delivery_rows), "assets_deleted": removed}
+
+    @staticmethod
+    def _gather_asset_names(value: Any, target: set[str]) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                Storage._gather_asset_names(item, target)
+        elif isinstance(value, list):
+            for item in value:
+                Storage._gather_asset_names(item, target)
+        elif isinstance(value, str):
+            name = value.replace("\\", "/").rsplit("/", 1)[-1]
+            if name and "." in name:
+                target.add(name)
+
+    def _asset_references(self, now: float) -> set[str]:
+        keep: set[str] = set()
+        # Read committed documents, including updates from another connection.
+        for table in ("documents", "history", "sessions", "jobs", "deliveries", "actions"):
+            for row in self._db.execute(f"SELECT payload FROM {table}"):
+                self._gather_asset_names(_decoded(row["payload"], table), keep)
+        keep.update(row["name"] for row in self._db.execute("SELECT name FROM asset_leases WHERE expires_at>?", (now,)))
+        return keep
+
+    def lease_asset(self, name: str, ttl: int = 3600) -> str:
+        """Protect a prepared reference until its owning job records the asset."""
+        ttl = max(1, min(86400, int(ttl)))
+        with self._lock, self._db:
+            self._check_open()
+            self._db.execute("BEGIN IMMEDIATE")
+            self.asset(name)
+            token = secrets.token_hex(12)
+            self._db.execute("INSERT INTO asset_leases(id,name,expires_at) VALUES(?,?,?)", (token, name, time.time() + ttl))
+            return token
+
+    def release_asset(self, token: str | None) -> None:
+        if not token:
+            return
+        with self._lock, self._db:
+            self._check_open()
+            self._db.execute("DELETE FROM asset_leases WHERE id=?", (str(token),))
+
+    def cleanup_assets(self, grace_sec: int = 3600) -> dict[str, int]:
+        """Remove only unreferenced assets older than the upload grace period."""
+        grace_sec = max(0, int(grace_sec))
+        with self._lock, self._db:
+            self._check_open()
+            self._db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            expired = self._db.execute("DELETE FROM asset_leases WHERE expires_at<=?", (now,)).rowcount
+            keep = self._asset_references(now)
+            removed = 0
+            for path in self.assets.iterdir():
+                if path.name in keep or path.name.startswith(".") or path.is_symlink():
+                    continue
+                try:
+                    if not path.is_file() or path.stat().st_mtime > now - grace_sec:
+                        continue
+                    self.asset(path.name).unlink()
+                    removed += 1
+                except (StorageError, OSError):
+                    continue
+            return {"assets_deleted": removed, "leases_expired": expired}
 
     def asset(self, name: str) -> Path:
         if not isinstance(name, str) or not name or len(name) > 255 or name.startswith(".") or any(char in name for char in ("/", "\\", ":", "\x00")) or Path(name).name != name:
@@ -815,8 +925,12 @@ class Storage:
             raise StorageError("图片内容为空或超过 64 MB")
         path = self.assets / f"{hashlib.sha256(data).hexdigest()[:24]}.{suffix}"
         with self._lock:
+            self._check_open()
             if path.exists():
-                return self.asset(path.name)
+                existing = self.asset(path.name)
+                # Reusing an old image is still a fresh upload draft.
+                os.utime(existing, None)
+                return existing
             fd, temporary = tempfile.mkstemp(prefix=".asset-", dir=str(self.assets))
             try:
                 with os.fdopen(fd, "wb") as handle:

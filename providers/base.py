@@ -49,7 +49,8 @@ class ProviderCapabilities:
     dimensions: str = "由模型决定"
     sampler: bool = False
     identity_reference: str = "不保证角色身份一致性"
-    negative_prompt_mode: str = "写入自然语言避免约束，不是独立负面通道"
+    negative_mode: str = "disabled"
+    negative_prompt_mode: str = "未发送负面提示词"
     automated_generation: bool = True
     max_reference_images: int = 1
 
@@ -76,6 +77,18 @@ def _path_set(value: dict, path: str, item: Any) -> None:
             raise ProviderError("自定义字段路径相互冲突")
         value = node
     value[parts[-1]] = item
+
+
+def _validate_field_paths(fields: list[tuple[str, Any]]) -> None:
+    """Reject ambiguous request mappings before one value replaces another."""
+    seen: list[tuple[str, str]] = []
+    for label, path in fields:
+        if not isinstance(path, str) or not path.strip() or any(not part for part in path.split(".")):
+            raise ProviderError(f"自定义字段路径无效：{label}")
+        for previous_label, previous_path in seen:
+            if path == previous_path or path.startswith(previous_path + ".") or previous_path.startswith(path + "."):
+                raise ProviderError(f"请求字段映射冲突：{previous_label} 与 {label}（{previous_path} / {path}）")
+        seen.append((label, path))
 
 
 def _image_info(data: bytes) -> tuple[str, str, tuple[int, int]]:
@@ -164,7 +177,67 @@ class ImageProvider:
     def __init__(self, name: str, config: dict[str, Any]):
         self.name = str(name)
         self.config = copy.deepcopy(config)
+        self.last_request: dict[str, Any] = {}
         self.capabilities = ProviderCapabilities(image_to_image=bool(config.get("supports_image_edit", False)))
+        kind = getattr(self, "provider_kind", str(config.get("kind") or "openai").lower().strip())
+        mode = str(config.get("negative_mode") or ("field" if kind == "custom" and config.get("negative_prompt") else "disabled")).strip().lower()
+        if mode not in {"disabled", "natural_language", "field"}:
+            raise ProviderError("negative_mode 必须为 disabled、natural_language 或 field")
+        if kind == "novelai":
+            mode = "field"
+        if kind == "gemini" and mode == "field":
+            raise ProviderError("Gemini 原生接口不支持独立负面字段，请使用 disabled 或显式 natural_language")
+        self.capabilities.negative_mode = mode
+        self.capabilities.negative_prompt = mode == "field"
+        self.capabilities.negative_prompt_mode = {
+            "disabled": "未发送负面提示词",
+            "natural_language": "显式自然语言避免约束，写入正面描述（非独立负面通道）",
+            "field": "独立负面字段：" + str(config.get("negative_prompt_field") or "negative_prompt"),
+        }[mode]
+
+    def validate_config(self) -> None:
+        """Validate configuration without issuing a network or image request."""
+        _integer(self.config.get("timeout", 180), "超时", 5, 600)
+        extra = self.config.get("extra_body") or {}
+        if not isinstance(extra, dict):
+            raise ProviderError("extra_body 必须为 JSON 对象")
+        try:
+            json.dumps(extra, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ProviderError("extra_body 必须为有效 JSON 对象") from exc
+        if self.config.get("endpoint"):
+            for route in ("generation_path", "edit_path", "models_path", "connection_path"):
+                self._url(route, "")
+
+    def _record_request(self, prompt: Any, negative: Any, model: str, options: dict, reference: Any, *, negative_field: str = "", notes: list[str] | None = None) -> None:
+        """Keep only inspectable request values, never headers or image payloads."""
+        allowed = {"width", "height", "size", "steps", "scale", "sampler", "seed", "strength", "noise", "quality", "background", "output_format", "input_fidelity", "aspect_ratio", "image_size", "params_version", "extra_noise_seed"}
+        secret = str(self.config.get("api_key") or "")
+        def safe(value):
+            if isinstance(value, str):
+                return value.replace(secret, "[REDACTED]") if secret else value
+            if value is None or isinstance(value, (bool, int)) or isinstance(value, float) and math.isfinite(value):
+                return value
+            return None
+        mode = self.capabilities.negative_mode
+        self.last_request = {
+            "prompt": safe(str(prompt)),
+            "negative_prompt": safe(str(negative or "")) if negative_field else "",
+            "negative_mode": mode,
+            "negative_prompt_field": safe(negative_field),
+            "negative_source": "plugin" if mode == "field" else "extra_body" if negative_field else "none",
+            "model": safe(model),
+            "options": {key: safe(value) for key, value in options.items() if key in allowed and isinstance(value, (str, int, float, bool, type(None)))},
+            "reference_count": len(reference) if isinstance(reference, list) else int(reference is not None),
+            "provider_timeout_sec": _integer(self.config.get("timeout", 180), "超时", 5, 600),
+        }
+        details = list(notes or [])
+        if mode == "natural_language":
+            details.append("负面约束已编入正面描述，插件未自动传入独立负面字段")
+        if negative_field and mode != "field":
+            details.append("独立负面字段来自手动 extra_body 配置；插件未自动传入人设负面词")
+        if details:
+            self.last_request["notes"] = [safe(str(item)) for item in details]
 
     def _safe_error(self, message: Any) -> str:
         value = str(message)
@@ -291,6 +364,8 @@ class ImageProvider:
         return result
 
     def _prepare(self, prompt: str, negative: str, reference: bytes | None, options: dict | None) -> tuple[str, dict]:
+        self.last_request = {}
+        self.validate_config()
         if not isinstance(prompt, str) or not prompt.strip():
             raise ProviderError("生图描述不能为空")
         if reference is not None:
@@ -319,7 +394,7 @@ class ImageProvider:
             supported = self.capabilities.seed if key == "seed" else self.capabilities.sampler
             if key in options["_explicit"] and key in options and not supported:
                 raise ProviderError(f"当前接口不支持参数：{key}")
-        if negative and not self.capabilities.negative_prompt:
+        if negative and self.capabilities.negative_mode == "natural_language":
             prompt = f"{prompt.strip()}\n\nAvoid these visual elements and defects: {str(negative).strip()}"
         return prompt.strip(), options
 
@@ -470,6 +545,7 @@ class ImageProvider:
 
 
 class OpenAIProvider(ImageProvider):
+    provider_kind = "openai"
     supported_options = {"width", "height", "size", "quality", "background", "output_format", "input_fidelity"}
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
@@ -479,6 +555,12 @@ class OpenAIProvider(ImageProvider):
             self.capabilities.max_reference_images = 16
         if str(config.get("model", "")).lower() == "dall-e-3":
             self.capabilities.image_to_image = False
+
+    def validate_config(self) -> None:
+        super().validate_config()
+        if self.capabilities.negative_mode == "field":
+            field = self.config.get("negative_prompt_field") or "negative_prompt"
+            _validate_field_paths([("negative_prompt", field)] + [(key, key) for key in ("model", "prompt", "image", "image[]", "mask", "n", "stream", "size", "quality", "background", "output_format", "input_fidelity", "response_format")])
 
     def _size(self, model: str, options: dict) -> str:
         requested_size = options.get("size")
@@ -524,9 +606,22 @@ class OpenAIProvider(ImageProvider):
                 if key in {"background", "output_format"} and not gpt_image:
                     raise ProviderError(f"此模型不支持参数：{key}")
                 body[key] = options[key]
-        body = self._merge_extra(body, {"model", "prompt", "image", "image[]", "mask", "n", "stream"})
+        protected = {"model", "prompt", "image", "image[]", "mask", "n", "stream"}
+        negative_field = ""
+        if self.capabilities.negative_mode == "field":
+            negative_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
+            _path_set(body, negative_field, str(negative_prompt or ""))
+            protected.add(negative_field)
+        body = self._merge_extra(body, protected)
         if gpt_image and "response_format" in body:
             raise ProviderError("GPT Image 不支持 response_format，请从 extra_body 删除它")
+        actual_options = {key: body[key] for key in ("size", "quality", "background", "output_format", "input_fidelity") if key in body}
+        size = re.fullmatch(r"(\d+)x(\d+)", str(body.get("size", "")))
+        if size:
+            actual_options.update(width=int(size[1]), height=int(size[2]))
+        candidate_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
+        if not negative_field and _path_get(body, candidate_field) is not None:
+            negative_field = candidate_field
         if reference is not None:
             refs = reference if isinstance(reference, list) else [reference]
             for data in refs:
@@ -536,13 +631,16 @@ class OpenAIProvider(ImageProvider):
                 if model == "dall-e-2" and (extension != "png" or size[0] != size[1] or len(data) >= 4 * 1024 * 1024):
                     raise ProviderError("旧 DALL·E 2 编辑需要小于 4 MB 的正方形 PNG")
             files = {"image[]": refs} if len(refs) > 1 else {"image": refs[0]}
+            self._record_request(body["prompt"], _path_get(body, negative_field) if negative_field else "", body["model"], actual_options, reference, negative_field=negative_field)
             raw, mime = await self._post(self._url("edit_path", "/v1/images/edits"), body, files=files)
         else:
+            self._record_request(body["prompt"], _path_get(body, negative_field) if negative_field else "", body["model"], actual_options, reference, negative_field=negative_field)
             raw, mime = await self._post(self._url("generation_path", "/v1/images/generations"), body)
         return await self._decode_response(raw, mime, model)
 
 
 class GeminiProvider(ImageProvider):
+    provider_kind = "gemini"
     supported_options = {"width", "height", "size", "aspect_ratio", "image_size"}
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
@@ -588,6 +686,15 @@ class GeminiProvider(ImageProvider):
         body = self._merge_extra({"contents": [{"role": "user", "parts": parts}], "generationConfig": config}, {"contents", "generationConfig.responseModalities"})
         if len(json.dumps(body).encode("utf-8")) > 20 * 1024 * 1024:
             raise ProviderError("Gemini 图文请求超过 20 MB，请减小参考图大小")
+        actual_options = {}
+        for key, path in (("aspect_ratio", "generationConfig.imageConfig.aspectRatio"), ("image_size", "generationConfig.imageConfig.imageSize")):
+            value = _path_get(body, path)
+            if value is not None:
+                actual_options[key] = value
+        negative_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
+        if _path_get(body, negative_field) is None:
+            negative_field = ""
+        self._record_request(prompt, _path_get(body, negative_field) if negative_field else "", model, actual_options, reference, negative_field=negative_field)
         raw, _ = await self._post(self._url("generation_path", f"/models/{quote(model, safe='-._')}:generateContent"), body)
         payload = self._json(raw)
         candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
@@ -620,10 +727,11 @@ class GeminiProvider(ImageProvider):
 
 
 class NovelAIProvider(ImageProvider):
+    provider_kind = "novelai"
     supported_options = {"width", "height", "steps", "scale", "sampler", "seed", "strength", "noise"}
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
-        self.capabilities = ProviderCapabilities(image_to_image=bool(config.get("supports_image_edit")), negative_prompt=True, seed=True, sampler=True, dimensions="宽高为 64 的倍数，支持范围取决于模型和账户", identity_reference="当前仅提供 img2img；未实现 Character Reference 或 Vibe Transfer", negative_prompt_mode="原生 negative_prompt / v4_negative_prompt", automated_generation=False)
+        self.capabilities = ProviderCapabilities(image_to_image=bool(config.get("supports_image_edit")), negative_prompt=True, negative_mode="field", seed=True, sampler=True, dimensions="宽高为 64 的倍数，支持范围取决于模型和账户", identity_reference="当前仅提供 img2img；未实现 Character Reference 或 Vibe Transfer", negative_prompt_mode="原生 negative_prompt / v4_negative_prompt", automated_generation=False)
 
     async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
@@ -652,6 +760,7 @@ class NovelAIProvider(ImageProvider):
             _image_info(buffer.getvalue())
             params.update(image=base64.b64encode(buffer.getvalue()).decode("ascii"), strength=_number(options.get("strength", self.config.get("strength", 0.6)), "图生图强度", 0, 1), noise=_number(options.get("noise", self.config.get("noise", 0)), "图生图噪声", 0, 1), extra_noise_seed=seed)
         body = self._merge_extra({"input": prompt, "model": model, "action": "img2img" if reference is not None else "generate", "parameters": params}, protected)
+        self._record_request(body["input"], body["parameters"]["negative_prompt"], body["model"], body["parameters"], reference, negative_field="parameters.negative_prompt", notes=["同时发送 v4_negative_prompt.caption.base_caption"] if "v4_negative_prompt" in body["parameters"] else None)
         raw, mime = await self._post(self._url("generation_path", "/ai/generate-image"), body)
         return await self._decode_response(raw, mime, model)
 
@@ -668,15 +777,30 @@ class NovelAIProvider(ImageProvider):
 
 
 class CustomProvider(ImageProvider):
+    provider_kind = "custom"
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
-        self.capabilities.negative_prompt = bool(config.get("negative_prompt", False))
         self.capabilities.seed = bool(config.get("supports_seed", False))
         self.capabilities.sampler = bool(config.get("supports_sampler", False))
         self.capabilities.dimensions = "通过 option_fields 映射自定义宽高字段"
         self.capabilities.negative_prompt_mode = "自定义独立负面字段" if self.capabilities.negative_prompt else self.capabilities.negative_prompt_mode
         fields = config.get("option_fields", {"width": "width", "height": "height", "seed": "seed", "steps": "steps", "scale": "scale", "sampler": "sampler"})
         self.supported_options = set(fields) if isinstance(fields, dict) else set()
+
+    def validate_config(self) -> None:
+        super().validate_config()
+        fields = self.config.get("option_fields", {"width": "width", "height": "height", "seed": "seed", "steps": "steps", "scale": "scale", "sampler": "sampler"})
+        if not isinstance(fields, dict):
+            raise ProviderError("option_fields 必须为参数到请求字段的 JSON 映射")
+        paths = [("prompt", self.config.get("prompt_field") or "prompt"), ("model", self.config.get("model_field") or "model"), ("reference", self.config.get("reference_field") or "image")]
+        if self.capabilities.negative_mode == "field":
+            paths.append(("negative_prompt", self.config.get("negative_prompt_field") or "negative_prompt"))
+        if self.config.get("reference_mime_field"):
+            paths.append(("reference_mime", self.config["reference_mime_field"]))
+        paths.extend((f"option_fields.{key}", path) for key, path in fields.items() if path is not None and path != "")
+        _validate_field_paths(paths)
+        if str(self.config.get("reference_format") or "data_url") not in {"base64", "data_url"}:
+            raise ProviderError("reference_format 仅支持 base64 或 data_url")
 
     async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
@@ -738,6 +862,11 @@ class CustomProvider(ImageProvider):
                 field = str(self.config["reference_mime_field"])
                 _path_set(body, field, mime)
         body = self._merge_extra(body, protected | {"stream"})
+        actual_options = {key: _path_get(body, str(field)) for key, field in fields.items() if field and _path_get(body, str(field)) is not None}
+        negative_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
+        if _path_get(body, negative_field) is None:
+            negative_field = ""
+        self._record_request(_path_get(body, prompt_field), _path_get(body, negative_field) if negative_field else "", str(_path_get(body, model_field)), actual_options, reference, negative_field=negative_field)
         raw, mime = await self._post(self._url("edit_path" if reference is not None else "generation_path", ""), body)
         return await self._decode_response(raw, mime, model)
 

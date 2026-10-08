@@ -39,7 +39,8 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.plugin._tasks))
         call = self.image_provider.calls[0]
         self.assertIn('"camera": "wide shot"', call["positive"])
-        self.assertIn('"avoid": "close-up"', call["positive"])
+        self.assertNotIn("close-up", call["positive"])
+        self.assertIn("close-up", call["negative"])
         self.assertEqual(self.store.recent_jobs()[0]["state_patch"]["outfit"], "white dress")
 
     async def test_changed_camera_requires_new_confirmation_and_keeps_other_conditions(self):

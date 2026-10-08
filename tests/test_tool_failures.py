@@ -95,7 +95,8 @@ class GroupConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(job["requirements"]["camera"], "wide shot")
                 self.assertEqual(job["requirements"]["avoid"], "close-up")
                 self.assertIn("wide shot", self.image_provider.calls[-1]["positive"])
-                self.assertIn("close-up", self.image_provider.calls[-1]["positive"])
+                self.assertNotIn("close-up", self.image_provider.calls[-1]["positive"])
+                self.assertIn("close-up", self.image_provider.calls[-1]["negative"])
                 self.assertFalse(self.store.session(env["key"])["pending"])
 
     async def test_cq_reply_and_at_headers_preserve_pending_confirmation(self):

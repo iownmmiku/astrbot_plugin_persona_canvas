@@ -53,7 +53,8 @@ class SemanticToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "sent")
         self.assertEqual(job["state_patch"]["outfit"], "white dress")
         self.assertEqual(job["requirements"]["camera"], "wide shot")
-        self.assertIn('"avoid": "close-up"', self.image_provider.calls[0]["positive"])
+        self.assertNotIn("close-up", self.image_provider.calls[0]["positive"])
+        self.assertIn("close-up", self.image_provider.calls[0]["negative"])
         self.assertFalse(self.store.session(key)["pending"])
 
     async def test_semantic_conditions_do_not_generate_in_the_asking_turn(self):
@@ -132,12 +133,12 @@ class SemanticToolTests(unittest.IsolatedAsyncioTestCase):
         event = Event("约定我接受，但换上泳装")
         key, pending = await self.seed_pending(event)
         await self.request_hook(event)
-        result = json.loads(await self.plugin.tool_photo(event, "swimsuit", request_summary="用户确认了条件", confirmed_request_id=pending["request_id"]))
-        self.assertFalse(result["ok"])
         changed = json.loads(await self.plugin.tool_conditions(event, "泳装也只能远景，好吗？", outfit="swimsuit", request_summary="用户更换服装，需要重新询问"))
         self.assertTrue(changed["ok"])
         self.assertNotEqual(changed["request_id"], pending["request_id"])
         self.assertEqual(self.store.session(key)["pending"]["requirements"]["avoid"], "close-up")
+        result = json.loads(await self.plugin.tool_photo(event, "swimsuit", request_summary="用户修改了条件，尚在询问", confirmed_request_id=changed["request_id"]))
+        self.assertFalse(result["ok"])
         self.assertFalse(self.image_provider.calls)
 
     async def test_semantic_state_confirmation_only_updates_agreed_state(self):

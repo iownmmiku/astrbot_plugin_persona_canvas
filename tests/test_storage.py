@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -332,6 +334,187 @@ class StorageTests(unittest.TestCase):
             self.assertIsNone(store.delivery("old-terminal"))
             self.assertEqual("sending", store.delivery("old-sending")["status"])
             self.assertFalse(old_asset.exists())
+
+    def test_read_session_does_not_create_switch_or_write_current_state(self):
+        store = self.store()
+        self.assertIsNone(store.read_session("missing"))
+        self.assertEqual([], store.list_sessions())
+        persona = store.upsert_persona({"name": "second"})
+        session = store.session("conversation", persona["id"])
+        session["state"]["outfit"] = "current outfit"
+        session["pending"] = {"request": "current conditions"}
+        saved = store.save_session("conversation", session)
+        snapshot = store.read_session("conversation")
+        self.assertEqual(saved, snapshot)
+        snapshot["state"]["outfit"] = "caller mutation"
+        self.assertEqual(saved, store.read_session("conversation"))
+        # A reader also preserves residual data without requiring that a persona
+        # still exist; only explicit session switching may recreate that data.
+        saved["persona_id"] = "deleted-persona"
+        with store._db:
+            store._write_session(saved)
+        self.assertEqual(saved, store.read_session("conversation"))
+
+    @staticmethod
+    def pending_photo(store, key="conversation", request_id="conditions-1"):
+        session = store.session(key, "default")
+        session["pending"] = {"session_key": key, "persona_id": "default", "request_id": request_id, "request_kind": "photo", "expires_at": time.time() + 1800, "requirements": {"outfit": "white sailor uniform"}}
+        return store.save_session(key, session)
+
+    @staticmethod
+    def photo_job(store, key="conversation", **patch):
+        return store.create_job({"status": "queued", "session_key": key, "persona_id": "default", **patch})
+
+    def test_photo_confirmation_claim_is_atomic_durable_and_kept_on_failure(self):
+        first = self.store()
+        before = self.pending_photo(first)
+        second = self.store()
+        jobs = [self.photo_job(first), self.photo_job(second)]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(store.claim_photo_request, "conversation", "default", "conditions-1", job["id"]) for store, job in zip((first, second), jobs)]
+            results = [future.result() for future in futures]
+        self.assertEqual(1, sum(result["claimed"] for result in results))
+        winner = next(result["job_id"] for result in results if result["claimed"])
+        self.assertEqual({winner}, {result["job_id"] for result in results})
+        self.assertEqual(before["revision"] + 1, first.read_session("conversation")["revision"])
+        first.update_job(winner, {"status": "failed"})
+        first.cleanup_history(0)
+        self.assertEqual("failed", first.job(winner)["status"])
+        restarted = self.store()
+        candidate = self.photo_job(restarted)
+        duplicate = restarted.claim_photo_request("conversation", "default", "conditions-1", candidate["id"])
+        self.assertFalse(duplicate["claimed"])
+        self.assertEqual(winner, duplicate["job_id"])
+        self.assertEqual("white sailor uniform", duplicate["session"]["pending"]["requirements"]["outfit"])
+
+    def test_photo_confirmation_rejects_scope_expiry_kind_and_unbound_jobs(self):
+        store = self.store()
+        original = self.pending_photo(store)
+        candidate = self.photo_job(store)
+        for patch in ({"request_id": "other"}, {"session_key": "elsewhere"}, {"persona_id": "other"}, {"request_kind": "state"}, {"expires_at": time.time() - 1}):
+            with self.subTest(patch=patch):
+                session = store.read_session("conversation")
+                session["pending"] = {**original["pending"], **patch}
+                saved = store.save_session("conversation", session)
+                with self.assertRaises(StorageConflictError):
+                    store.claim_photo_request("conversation", "default", "conditions-1", candidate["id"])
+                self.assertEqual(saved, store.read_session("conversation"))
+        self.pending_photo(store)
+        for job in ("missing", self.photo_job(store, key="other")["id"]):
+            with self.subTest(job=job), self.assertRaises(StorageConflictError):
+                store.claim_photo_request("conversation", "default", "conditions-1", job)
+
+    def test_explicit_retry_rebinds_failed_claim_but_cannot_reopen_withdrawal(self):
+        store = self.store()
+        self.pending_photo(store)
+        old = self.photo_job(store)
+        store.claim_photo_request("conversation", "default", "conditions-1", old["id"])
+        store.update_job(old["id"], {"status": "failed"})
+        session = store.read_session("conversation")
+        session["pending"]["expires_at"] = time.time() - 1
+        store.save_session("conversation", session)
+        retry = self.photo_job(store)
+        result = store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], retry["id"])
+        self.assertTrue(result["claimed"])
+        self.assertEqual(retry["id"], result["session"]["pending"]["execution_job_id"])
+        self.assertFalse(store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], retry["id"])["claimed"])
+        store.update_job(retry["id"], {"status": "cancelled", "cancel_requested": True})
+        another = self.photo_job(store)
+        with self.assertRaises(StorageConflictError):
+            store.rebind_photo_request("conversation", "default", "conditions-1", retry["id"], another["id"])
+        self.pending_photo(store, request_id="new-conditions")
+        with self.assertRaises(StorageConflictError):
+            store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], another["id"])
+
+    def test_asset_lease_protects_reference_while_history_owner_is_pruned(self):
+        store = self.store()
+        asset = store.save_asset(b"current-reference-from-old-photo")
+        store.create_job({"status": "failed", "asset": asset.name})
+        store.append_history({"image": "/assets/" + asset.name})
+        token = store.lease_asset(asset.name)
+        removed = store.cleanup_history(0)
+        self.assertEqual(1, removed["jobs_deleted"])
+        self.assertEqual(0, removed["assets_deleted"])
+        self.assertTrue(asset.exists())
+        store.release_asset(token)
+        self.assertEqual(1, store.cleanup_assets(0)["assets_deleted"])
+        self.assertFalse(asset.exists())
+
+    def test_independent_asset_leases_survive_restart_and_expire(self):
+        first = self.store()
+        asset = first.save_asset(b"parallel-reference")
+        now = time.time()
+        with patch("storage.time.time", return_value=now):
+            lease1 = first.lease_asset(asset.name, ttl=60)
+            first.lease_asset(asset.name, ttl=60)
+        first.release_asset(lease1)
+        first.release_asset(lease1)
+        second = self.store()
+        with patch("storage.time.time", return_value=now + 30):
+            self.assertEqual(0, second.cleanup_assets(0)["assets_deleted"])
+        with patch("storage.time.time", return_value=now + 61):
+            result = second.cleanup_assets(0)
+        self.assertEqual(1, result["leases_expired"])
+        self.assertEqual(1, result["assets_deleted"])
+
+    def test_orphan_cleanup_keeps_drafts_all_record_references_and_upload_files(self):
+        store = self.store()
+        now = time.time()
+        referenced = [store.save_asset(f"record-{index}".encode()) for index in range(6)]
+        store.upsert_persona({"id": "default", "reference_asset": referenced[0].name})
+        session = store.session("conversation")
+        session["last_image"] = referenced[1].name
+        store.save_session("conversation", session)
+        store.create_job({"status": "queued", "reference_assets": [referenced[2].name]})
+        store.append_history({"image": "/assets/" + referenced[3].name})
+        store.reserve_delivery("pending-delivery")
+        store.update_delivery("pending-delivery", {"asset": referenced[4].name})
+        store.record_action({"kind": "photo", "asset": referenced[5].name})
+        orphan = store.save_asset(b"old-unrecorded-chat-image")
+        for path in [*referenced, orphan]:
+            os.utime(path, (now - 7200, now - 7200))
+        draft = store.save_asset(b"fresh-upload-draft")
+        partial = store.assets / ".asset-upload"
+        partial.write_bytes(b"incomplete")
+        other = store.assets / "notes.txt"
+        other.write_text("not an image", encoding="utf-8")
+        result = store.cleanup_assets(3600)
+        self.assertEqual(1, result["assets_deleted"])
+        self.assertFalse(orphan.exists())
+        self.assertTrue(all(path.exists() for path in [*referenced, draft, partial, other]))
+
+    def test_orphan_cleanup_observes_reference_updates_from_another_connection(self):
+        first = self.store()
+        asset = first.save_asset(b"reference-written-elsewhere")
+        second = self.store()
+        second.upsert_persona({"id": "default", "reference_asset": asset.name})
+        self.assertEqual(0, first.cleanup_assets(0)["assets_deleted"])
+        self.assertTrue(asset.exists())
+
+    def test_reuploading_existing_asset_restarts_its_draft_grace_period(self):
+        store = self.store()
+        asset = store.save_asset(b"reused-draft")
+        old = time.time() - 7200
+        os.utime(asset, (old, old))
+        self.assertEqual(asset, store.save_asset(b"reused-draft"))
+        self.assertEqual(0, store.cleanup_assets(3600)["assets_deleted"])
+
+    def test_v4_upgrade_preserves_records_and_adds_persistent_asset_leases(self):
+        first = self.store()
+        asset = first.save_asset(b"v4-reference")
+        session = first.session("legacy")
+        session["last_image"] = asset.name
+        first.save_session("legacy", session)
+        first.close()
+        connection = self.connection()
+        with connection:
+            connection.execute("DROP TABLE asset_leases")
+            connection.execute("PRAGMA user_version=4")
+        connection.close()
+        upgraded = self.store()
+        self.assertEqual(asset.name, upgraded.read_session("legacy")["last_image"])
+        self.assertTrue(upgraded.lease_asset(asset.name))
+        self.assertEqual(1, len(list((self.directory / "migration_backups").glob("sqlite-v4-*"))))
 
 
 if __name__ == "__main__":

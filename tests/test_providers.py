@@ -62,7 +62,7 @@ class ProviderContracts(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value[:20]), self.assertRaises(ProviderError):
                 _image_bytes(value)
 
-    async def test_gpt_native_request_adapts_defaults_and_keeps_negative(self):
+    async def test_gpt_native_request_adapts_defaults_without_implicit_negative(self):
         item = provider(extra_body={"quality": "low", "output_format": "webp"})
         result = await item.generate("a blue flower", "watermark", options={"width": 832, "height": 1216, "steps": 28, "scale": 5, "seed": -1})
         args = item._post.call_args.args
@@ -71,7 +71,9 @@ class ProviderContracts(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response_format", body)
         self.assertEqual(body["size"], "1024x1536")
         self.assertEqual(body["quality"], "low")
-        self.assertIn("watermark", body["prompt"])
+        self.assertNotIn("watermark", body["prompt"])
+        self.assertNotIn("negative_prompt", body)
+        self.assertEqual(item.capabilities.negative_mode, "disabled")
         self.assertEqual((result.data, result.extension, result.provider, result.model), (PNG, "png", "drawing", "gpt-image-1.5"))
         self.assertFalse(item.capabilities.negative_prompt)
 
@@ -139,7 +141,7 @@ class ProviderContracts(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(item._post.call_args.args[0].endswith("/models/gemini-image:generateContent"))
         self.assertEqual(body["contents"][0]["parts"][1]["inlineData"]["mimeType"], "image/jpeg")
         self.assertEqual(body["generationConfig"]["imageConfig"]["aspectRatio"], "3:4")
-        self.assertIn("logo", body["contents"][0]["parts"][0]["text"])
+        self.assertNotIn("logo", body["contents"][0]["parts"][0]["text"])
         self.assertEqual(result.extension, "jpg")
         self.assertEqual(item._headers()["x-goog-api-key"], "secret")
         with self.assertRaises(ProviderError):

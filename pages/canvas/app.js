@@ -18,6 +18,8 @@ const referenceImages = new Map();
 const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截" };
 const stageNames = { request: "请求检查", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
+const negativeModes = { disabled: "不发送负面词", natural_language: "自然语言约束", field: "独立负面字段" };
+const referenceSources = { persona: "角色参考图库", persona_gallery: "角色参考图库", explicit: "指定参考图", explicit_reference: "指定参考图", attachment: "聊天附件", message_attachment: "聊天附件", last_image: "上一张图片", none: "无参考图" };
 const activeJob = job => !finished(job) && !failed(job);
 const jobId = job => String(job.id || job.job_id || "");
 const value = id => $(id).value.trim();
@@ -143,6 +145,21 @@ function actionDetail(item) {
   if (!conditions.length && !item.trace?.length) detail.append(node("p", "muted", "这条早期记录没有保存执行过程。"));
   return detail;
 }
+function requestDetail(item) {
+  const request = item.request_summary;
+  if (!request || typeof request !== "object" || Array.isArray(request) || !Object.keys(request).length) return null;
+  const preparedOnly = Boolean(request.notes);
+  const detail = node("details", "request-detail"); detail.append(node("summary", "", preparedOnly ? "查看请求准备摘要" : "查看最终请求摘要"));
+  if (request.notes) detail.append(node("p", "request-note", Array.isArray(request.notes) ? request.notes.join("\n") : String(request.notes)));
+  const mode = request.negative_mode || "disabled";
+  const rows = [["绘图模型", request.model || "接口默认"], ["负面处理", negativeModes[mode] || mode], ["负面字段", request.negative_prompt_field || "未使用独立字段"], ["参考图", `${request.reference_count ?? 0} 张 · ${referenceSources[request.reference_source] || request.reference_source || "未记录来源"}`], ["接口超时", request.provider_timeout_sec != null ? `${request.provider_timeout_sec} 秒` : "未记录"], ["任务超时", request.task_timeout_sec != null ? `${request.task_timeout_sec} 秒` : "未记录"], ["有效生成超时", request.effective_timeout_sec != null ? `${request.effective_timeout_sec} 秒（两者取较短）` : "未记录"]];
+  const info = node("div", "info-list request-info");
+  for (const [label, content] of rows) { const row = node("div", "info-row"); row.append(node("span", "", label), node("span", "", content)); info.append(row); }
+  detail.append(info, node("h4", "", preparedOnly ? "准备阶段正面提示词" : "最终正面提示词"), node("pre", "request-prompt", request.prompt || "未提交"), node("h4", "", preparedOnly ? "准备阶段独立负面提示词" : "实际独立负面提示词"), node("pre", "request-prompt", request.negative_prompt || (mode === "natural_language" ? preparedOnly ? "尚未提交；自然语言约束将在适配器处理时加入正面描述。" : "未使用独立字段；约束已写入最终正面提示词。" : "未发送独立负面词。")), node("h4", "", preparedOnly ? "准备阶段生成参数" : "实际生成参数"), node("pre", "request-options", JSON.stringify(request.options || {}, null, 2)));
+  if (mode === "disabled") detail.append(node("p", "muted", "此接口未发送负面词。可在模型接口设置自然语言约束，或确认接口支持后启用独立字段。"));
+  if (item.failure_stage || item.error_stage) detail.append(node("p", "danger-text", `失败阶段：${stageNames[item.failure_stage || item.error_stage] || item.failure_stage || item.error_stage}`));
+  return detail;
+}
 function renderDiagnostics() {
   const data = model.diagnostics || {}, setup = $("setup-list"); setup.replaceChildren();
   for (const step of data.setup || []) { const row = node("div", "setup-row"), body = node("div"); body.append(node("strong", "", `${step.ok === true ? "✓" : step.ok === false ? "○" : "◇"} ${step.name}`), node("small", "", step.message)); row.append(body, button("前往设置", async () => setPage(step.page))); setup.append(row); }
@@ -151,7 +168,7 @@ function renderDiagnostics() {
   const container = $("diagnostic-list"), query = value("diagnostic-filter").toLowerCase(); container.replaceChildren();
   const items = (data.items || []).filter(item => !query || JSON.stringify(item).toLowerCase().includes(query)).slice(0, 40);
   if (!items.length) return empty(container, "暂无匹配的动作记录。可先预演角色反应，再发起一次请求。");
-  for (const item of items) { const row = node("article", "diagnostic-row"); row.append(node("span", `badge ${item.status}`, decisionNames[item.status] || statusNames[item.status] || item.status), node("p", "", item.summary || item.request || item.reply || "主动联系机会"), node("small", "muted", `${item.umo || ""} · ${date(item.updated_at || item.at)}`)); if (item.error) row.append(node("p", "danger-text", item.error)); if (item.reply && item.reply !== item.request) row.append(node("p", "", item.reply)); row.append(actionDetail(item)); container.append(row); }
+  for (const item of items) { const row = node("article", "diagnostic-row"); row.append(node("span", `badge ${item.status}`, decisionNames[item.status] || statusNames[item.status] || item.status), node("p", "", item.summary || item.request || item.reply || "主动联系机会"), node("small", "muted", `${item.umo || ""} · ${date(item.updated_at || item.at)}`)); if (item.error) row.append(node("p", "danger-text", item.error)); if (item.reply && item.reply !== item.request) row.append(node("p", "", item.reply)); const request = requestDetail(item); if (request) row.append(request); row.append(actionDetail(item)); container.append(row); }
 }
 function renderProviders() {
   const container = $("provider-list"); container.replaceChildren();
@@ -166,17 +183,42 @@ function defaultProviderAuth() {
 function changeProviderKind() {
   const before = authDefaults(providerKind), kind = value("v-kind"), next = authDefaults(kind);
   if (value("v-header") === before.header && $("v-prefix").value === before.prefix) { set("v-header", next.header); set("v-prefix", next.prefix); }
+  const mode = value("v-negative-mode");
+  if (providerKind === "novelai" && kind !== "novelai") set("v-negative-mode", "disabled");
+  renderProviderFields(providerKind !== "novelai" ? mode : "disabled");
   providerKind = kind;
+}
+function providerNegativeMode(p) {
+  if (p.kind === "novelai") return "field";
+  return p.negative_mode || p.capabilities?.negative_mode || (p.kind === "custom" && p.negative_prompt === true ? "field" : "disabled");
+}
+function renderProviderFields(selectedMode = value("v-negative-mode")) {
+  const kind = value("v-kind");
+  const modes = kind === "novelai" ? ["field"] : kind === "gemini" ? ["disabled", "natural_language"] : ["disabled", "natural_language", "field"];
+  fillSelect("v-negative-mode", modes.map(mode => ({ value: mode, label: negativeModes[mode] })), modes.includes(selectedMode) ? selectedMode : modes[0]);
+  $("v-negative-mode").disabled = kind === "novelai";
+  const field = value("v-negative-mode") === "field" && kind !== "novelai";
+  $("v-negative-field-row").hidden = !field; $("v-negative-field").disabled = !field;
+  setText("v-negative-help", kind === "novelai" ? "NovelAI 固定使用原生独立负面通道；负面词不会拼入正面标签。" : value("v-negative-mode") === "field" ? (kind === "openai" ? "仅适用于明确支持独立负面字段的中转接口。OpenAI 原生 Images 没有通用负面字段，请先核对接口文档。" : "按指定字段路径发送负面词，不再拼入正面提示词。") : value("v-negative-mode") === "natural_language" ? "将负面词转为自然语言约束加入正面描述。仅适用于理解自然语言指令的模型；标签模型应使用独立负面字段。" : "负面词不发送，也不会追加到正面提示词；可避免标签模型把禁止内容画进图片。");
+  document.querySelectorAll("[data-provider-kinds]").forEach(el => { const enabled = el.dataset.providerKinds.split(" ").includes(kind); el.hidden = !enabled; el.querySelectorAll("input,select,textarea").forEach(input => { input.disabled = !enabled; }); });
+  renderProviderTimeout();
+}
+function renderProviderTimeout() {
+  const providerTimeout = num("v-timeout") || 180, taskTimeout = model.state.settings?.generation?.timeout_sec || 180;
+  setText("v-timeout-summary", `接口超时 ${providerTimeout} 秒；已保存的任务生成超时 ${taskTimeout} 秒。有效生成超时为 ${Math.min(providerTimeout, taskTimeout)} 秒，聊天、工作台与测试图共用此限制。`);
 }
 function fillProvider(p) {
   selection.provider = structuredClone(p);
   for (const [id, key] of [["v-name", "name"], ["v-kind", "kind"], ["v-endpoint", "endpoint"], ["v-model", "model"], ["v-response", "response_path"]]) set(id, p[key] || (key === "kind" ? "openai" : ""));
   providerKind = p.kind || "openai"; const auth = authDefaults(providerKind);
   set("v-key", ""); set("v-header", p.auth_header ?? auth.header); set("v-prefix", p.auth_prefix ?? auth.prefix); set("v-timeout", p.timeout || p.timeout_sec || 180);
-  set("v-extra", JSON.stringify(p.extra_body || {}, null, 2)); setCheck("v-edit", p.supports_image_edit); setCheck("v-negative", p.negative_prompt !== false); setCheck("v-set-default", p.name === model.state.settings?.default_provider);
+  set("v-extra", JSON.stringify(p.extra_body || {}, null, 2)); setCheck("v-edit", p.supports_image_edit); setCheck("v-set-default", p.name === model.state.settings?.default_provider); set("v-negative-field", p.negative_prompt_field ?? "negative_prompt");
   setText("provider-default", p.name === model.state.settings?.default_provider ? "默认绘画接口" : "独立接口"); setText("v-key-state", p.has_api_key || p.api_key_set ? "已保存密钥；留空保留，密钥不回显。" : "密钥不回显，填写后保存。");
   for (const [id, key] of [["v-generation-path", "generation_path"], ["v-edit-path", "edit_path"], ["v-models-path", "models_path"]]) set(id, p[key]);
+  for (const [id, key] of [["v-prompt-field", "prompt_field"], ["v-model-field", "model_field"], ["v-reference-field", "reference_field"], ["v-reference-mime", "reference_mime_field"], ["v-models-response", "models_response_path"]]) set(id, p[key]);
+  set("v-reference-format", p.reference_format || "data_url"); set("v-supported-sizes", Array.isArray(p.supported_sizes) ? p.supported_sizes.join("\n") : p.supported_sizes || "");
   setCheck("v-seed", p.supports_seed); setCheck("v-sampler", p.supports_sampler); set("v-options", p.option_fields ? JSON.stringify(p.option_fields, null, 2) : ""); setCheck("v-allow-urls", p.allow_image_urls); setCheck("v-clear-key", false); set("v-image-hosts", Array.isArray(p.allowed_image_hosts) ? p.allowed_image_hosts.join("\n") : p.allowed_image_hosts || "");
+  renderProviderFields(providerNegativeMode(p));
   $("v-name").readOnly = model.providers.some(x => x.name === p.name); available("delete-provider", model.providers.length > 1 && model.providers.some(x => x.name === p.name));
   $("image-model-options").replaceChildren(); $("provider-test-result").replaceChildren(); if (p.error) $("provider-test-result").append(node("p", "danger-text", `当前配置无法使用，请修正后保存：${p.error}`)); markDirty("provider-form", false); renderProviders();
 }
@@ -184,9 +226,19 @@ function readProvider() {
   let extra;
   try { extra = JSON.parse(value("v-extra") || "{}"); } catch { throw new Error("附加请求体需要是有效 JSON"); }
   if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("附加请求体需要是 JSON 对象");
+  const kind = value("v-kind"), mode = kind === "novelai" ? "field" : value("v-negative-mode");
   let fields;
-  if (value("v-options")) { try { fields = JSON.parse(value("v-options")); } catch { throw new Error("参数字段映射需要是有效 JSON"); } if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new Error("参数字段映射需要是 JSON 对象"); }
-  return { name: value("v-name"), kind: value("v-kind"), endpoint: value("v-endpoint"), model: value("v-model"), api_key: value("v-key"), auth_header: value("v-header"), auth_prefix: $("v-prefix").value, timeout: num("v-timeout"), extra_body: extra, response_path: value("v-response"), generation_path: value("v-generation-path"), edit_path: value("v-edit-path"), models_path: value("v-models-path"), supports_seed: check("v-seed"), supports_sampler: check("v-sampler"), option_fields: fields || { width: "width", height: "height", seed: "seed", steps: "steps", scale: "scale", sampler: "sampler" }, allow_image_urls: check("v-allow-urls"), allowed_image_hosts: $("v-image-hosts").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean), clear_api_key: check("v-clear-key"), supports_image_edit: check("v-edit"), negative_prompt: check("v-negative"), set_default: check("v-set-default") };
+  if (kind === "custom" && value("v-options")) { try { fields = JSON.parse(value("v-options")); } catch { throw new Error("参数字段映射需要是有效 JSON"); } if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw new Error("参数字段映射需要是 JSON 对象"); }
+  const data = { name: value("v-name"), kind, endpoint: value("v-endpoint"), model: value("v-model"), api_key: value("v-key"), auth_header: value("v-header"), auth_prefix: $("v-prefix").value, timeout: num("v-timeout"), extra_body: extra, response_path: value("v-response"), generation_path: value("v-generation-path"), edit_path: value("v-edit-path"), models_path: value("v-models-path"), allow_image_urls: check("v-allow-urls"), allowed_image_hosts: $("v-image-hosts").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean), clear_api_key: check("v-clear-key"), supports_image_edit: check("v-edit"), negative_mode: mode, negative_prompt: mode === "field", set_default: check("v-set-default") };
+  if (mode === "field" && kind !== "novelai") data.negative_prompt_field = value("v-negative-field") || "negative_prompt";
+  if (kind === "custom") {
+    data.supports_seed = check("v-seed"); data.supports_sampler = check("v-sampler");
+    if (fields) data.option_fields = fields;
+    for (const [id, key] of [["v-prompt-field", "prompt_field"], ["v-model-field", "model_field"], ["v-reference-field", "reference_field"], ["v-reference-mime", "reference_mime_field"], ["v-models-response", "models_response_path"]]) if (value(id) || Object.hasOwn(selection.provider || {}, key)) data[key] = value(id);
+    data.reference_format = value("v-reference-format");
+  }
+  if (kind === "openai" || kind === "custom") { const sizes = $("v-supported-sizes").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean); if (sizes.length) data.supported_sizes = sizes; else if (Object.hasOwn(selection.provider || {}, "supported_sizes")) data.supported_sizes = null; }
+  return data;
 }
 function renderLlmOptions(selected) {
   fillSelect("l-provider", model.llms.map(p => ({ value: p.id, label: `${p.id} · ${p.model || p.type || "聊天模型"}` })), selected ?? null, "沿用当前会话模型");
@@ -232,22 +284,27 @@ function fillGenerationDefaults() {
   if (dirty.has("generate-form")) return;
   const g = model.state.settings?.generation || {};
   for (const [id, key, fallback] of [["g-width", "width", 832], ["g-height", "height", 1216], ["g-steps", "steps", 28], ["g-scale", "scale", 5], ["g-seed", "seed", -1]]) set(id, g[key] ?? fallback);
+  set("g-aspect-ratio", g.aspect_ratio || ""); set("g-image-size", g.image_size || "");
   if (!selection.previewJob) { set("g-persona", model.state.settings?.current_persona); set("s-persona", model.state.settings?.current_persona); set("g-provider", model.state.settings?.default_provider); }
   renderGenerationCapabilities();
 }
 function renderGenerationCapabilities() {
   const provider = model.providers.find(p => p.name === value("g-provider")), cap = provider?.capabilities || {};
   const override = check("g-override"), dimensions = provider?.kind !== "gemini";
-  for (const id of ["g-width", "g-height"]) { $(id).disabled = !override || !dimensions; $(id).step = provider?.kind === "openai" ? "16" : "64"; }
-  for (const id of ["g-steps", "g-scale"]) $(id).disabled = !override || !cap.sampler;
-  $("g-seed").disabled = !override || !cap.seed;
+  const mapped = key => provider?.kind !== "custom" || !provider.option_fields || Boolean(provider.option_fields[key]);
+  for (const id of ["g-width", "g-height"]) { $(id).disabled = !override || !dimensions || !mapped(id.slice(2)); $(id).step = provider?.kind === "openai" ? "16" : "64"; $(id).closest("label").hidden = !dimensions; }
+  for (const id of ["g-steps", "g-scale"]) $(id).disabled = !override || !cap.sampler || !mapped(id.slice(2));
+  $("g-seed").disabled = !override || !cap.seed || !mapped("seed");
+  for (const id of ["g-aspect-ratio", "g-image-size"]) { $(id).disabled = !override || provider?.kind !== "gemini"; $(id).closest("label").hidden = provider?.kind !== "gemini"; }
   const submit = $("generate-form").querySelector('[type="submit"]'); submit.disabled = cap.text_to_image === false; submit.dataset.unavailable = cap.text_to_image === false ? "true" : "false";
-  setText("g-capabilities", provider?.error ? `接口配置错误：${provider.error}。请到模型接口修正后保存。` : `${cap.dimensions || "尺寸取决于模型"}。${override ? "只提交接口支持的参数。" : "使用已保存默认参数，由适配器按模型能力处理。"}${cap.identity_reference ? ` ${cap.identity_reference}` : ""} 参考图上限：${cap.max_reference_images || 1} 张。`);
+  const providerTimeout = provider?.timeout || provider?.timeout_sec || 180, taskTimeout = model.state.settings?.generation?.timeout_sec || 180;
+  setText("g-capabilities", provider?.error ? `接口配置错误：${provider.error}。请到模型接口修正后保存。` : `${cap.dimensions || "尺寸取决于模型"}。${override ? "只提交接口支持的参数。" : "使用已保存默认参数，由适配器按模型能力处理。"}${cap.identity_reference ? ` ${cap.identity_reference}` : ""} 参考图上限：${cap.max_reference_images || 1} 张。负面处理：${cap.negative_prompt_mode || negativeModes[providerNegativeMode(provider || {})]}。有效生成超时：${Math.min(providerTimeout, taskTimeout)} 秒（接口 ${providerTimeout} / 任务 ${taskTimeout} 秒）。`);
 }
 function readGenerationOptions() {
   if (!check("g-override")) return {};
   const options = {};
   for (const [id, key] of [["g-width", "width"], ["g-height", "height"], ["g-steps", "steps"], ["g-scale", "scale"], ["g-seed", "seed"]]) if (!$(id).disabled) options[key] = num(id);
+  for (const [id, key] of [["g-aspect-ratio", "aspect_ratio"], ["g-image-size", "image_size"]]) if (!$(id).disabled && value(id)) options[key] = value(id);
   return options;
 }
 function renderOverview() {
@@ -282,7 +339,7 @@ function renderJobs() {
     if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
     if (job.status === "uncertain") body.append(node("p", "danger-text", "请先检查目标会话，确认是否已发送。发送结果不确定的任务不能直接重试。"));
     if (["queued", "deciding", "generating", "succeeded"].includes(job.status) && !job.cancel_requested) actions.append(button("取消拍摄", async () => { await api("jobs/cancel", "POST", { id: jobId(job) }); notice("已停止等待与发送；上游已受理的任务可能仍计费。"); await refreshJobs(); }));
-    body.append(actionDetail(job)); row.append(body, actions); container.append(row);
+    const request = requestDetail(job); if (request) body.append(request); body.append(actionDetail(job)); row.append(body, actions); container.append(row);
   }
   const current = model.jobs.find(j => jobId(j) === selection.previewJob) || model.jobs.find(finished) || model.jobs[0]; if (current) renderPreview(current);
 }
@@ -305,7 +362,8 @@ function renderHistory() {
     if (safeImage(h.image)) { const img = node("img"); img.src = h.image; img.alt = h.caption || "生成结果"; img.loading = "lazy"; media.append(img); } else media.append(node("span", "", ok ? "图片不可用" : "生成未完成"));
     content.append(node("span", `badge ${ok ? "success" : "failed"}`, ok ? "生成成功" : "生成失败"), node("h4", "", h.caption || h.raw || h.request?.text || "生成请求"), node("small", "", `${h.provider || "默认接口"} / ${h.model || "默认模型"} · ${date(h.at || h.created_at)}`));
     if (h.error) content.append(node("p", "danger-text", h.error));
-    const detail = node("details"); detail.append(node("summary", "", "查看提示词与执行信息"), node("pre", "", JSON.stringify({ prompt: h.prompt || "", negative: h.negative_prompt || h.negative || "", mode: h.mode, state_patch: h.state_patch, job_id: h.job_id }, null, 2))); content.append(detail);
+    const request = requestDetail(h); if (request) content.append(request);
+    const detail = node("details"); detail.append(node("summary", "", request ? "查看状态修改与任务信息" : "查看历史提示词与任务信息"), node("pre", "", JSON.stringify({ ...(request ? {} : { prompt: h.prompt || "", negative_prompt: h.negative_prompt || h.negative || "", note: "早期记录未保存最终请求摘要，以下提示词不代表适配器实际提交内容。" }), mode: h.mode, state_patch: h.state_patch, job_id: h.job_id }, null, 2))); content.append(detail, actionDetail(h));
     const actions = node("div", "actions"); if (!ok && h.job_id && ["failed", "cancelled"].includes(model.jobs.find(j => jobId(j) === h.job_id)?.status || h.status) && !model.jobs.find(j => jobId(j) === h.job_id)?.cancel_requested) actions.append(button("重试任务", async () => { const result = await api("jobs/retry", "POST", { id: h.job_id }); selection.previewJob = result.job_id; setPage("studio"); await refreshJobs(); }));
     if (safeImage(h.image) && h.job_id) actions.append(button("保存原图", async () => { const job = await api(`jobs/${encodeURIComponent(h.job_id)}`); if (!safeImage(job.image)) throw new Error("原图不可用"); const a = node("a"); a.href = job.image; a.download = `persona-canvas-${h.job_id}.${job.image.startsWith("data:image/jpeg") ? "jpg" : job.image.startsWith("data:image/webp") ? "webp" : "png"}`; document.body.append(a); a.click(); a.remove(); }));
     content.append(actions); el.append(media, content); container.append(el);
@@ -334,6 +392,9 @@ function bind(id, action) { $(id).addEventListener("click", () => run($(id), act
 function testResult(id, result) {
   const container = $(id); container.replaceChildren(node("p", result.ok === false ? "danger-text" : "", result.message || `${result.ok === false ? "失败" : "成功"}${result.elapsed_ms != null ? ` · ${result.elapsed_ms} ms` : ""}${result.model ? ` · ${result.model}` : ""}${result.text ? ` · ${result.text}` : ""}`));
   if (safeImage(result.image)) { const img = node("img"); img.src = result.image; img.alt = "接口测试图片"; container.append(img); }
+  const request = requestDetail(result); if (request) container.append(request);
+  if (!request && result.effective_timeout_sec != null) container.append(node("p", "muted", `有效生成超时：${result.effective_timeout_sec} 秒。`));
+  if (result.trace?.length) container.append(actionDetail(result));
 }
 async function savedProvider() { const name = value("v-name"); if (!model.providers.some(p => p.name === name)) throw new Error("请先保存这个绘画接口"); if (dirty.has("provider-form")) throw new Error("接口有未保存修改，请先保存后测试"); return name; }
 
@@ -397,6 +458,7 @@ bind("export-data", async () => { const data = await api("export"), blob = new B
 bind("theme-toggle", async () => { const html = document.documentElement; html.dataset.theme = html.dataset.theme === "dark" ? "light" : "dark"; });
 $("g-provider").addEventListener("change", renderGenerationCapabilities); $("g-override").addEventListener("change", renderGenerationCapabilities);
 $("v-kind").addEventListener("change", changeProviderKind); bind("default-provider-auth", async () => defaultProviderAuth());
+$("v-negative-mode").addEventListener("change", () => renderProviderFields()); $("v-timeout").addEventListener("input", renderProviderTimeout);
 $("token-form").addEventListener("submit", event => { event.preventDefault(); run($("token-form").querySelector('[type="submit"]'), async () => { token = value("access-token"); try { await reload(); $("token-dialog").close(); set("access-token", ""); setText("token-error", ""); notice(""); try { await loadLlm(); } catch (error) { notice(`主体已连接，模型列表读取失败：${error.message}`, true); } } catch (error) { token = ""; setText("token-error", error.message); throw error; } }); });
 $("token-dialog").addEventListener("cancel", event => event.preventDefault()); bind("change-token", async () => { token = ""; connection(false, "等待连接"); $("token-dialog").showModal(); });
 window.addEventListener("beforeunload", event => { if (Array.from(dirty).some(id => !["generate-form", "simulate-form"].includes(id))) { event.preventDefault(); event.returnValue = ""; } });

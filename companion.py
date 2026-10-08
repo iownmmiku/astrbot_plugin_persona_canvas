@@ -21,7 +21,7 @@ def is_confirmation(text):
 
 def cancel_request(text):
     clean = re.sub(r'```[\s\S]*?```|[“「『"][\s\S]*?[”」』"]', "", request_text(text)).strip()
-    return bool(re.fullmatch(r"(?:请|麻烦|先|那|算了[，,]?\s*)?(?:别拍了|不要拍了|不用拍了|不拍了|别生成了|不要生成了|取消(?:这次|刚才的|本次)?(?:拍摄|生图|生成|照片|任务)|停止(?:拍摄|生图|生成))[。！!，,\s]*", clean))
+    return bool(re.fullmatch(r"(?:请|麻烦|先|那|算了[，,]?\s*)?(?:别拍了|不要拍了|不用拍了|不拍了|别生成了|不要生成了|(?:我)?不想看了|先不看了|不用了|算了|不要发(?:图|照片|自拍)?(?:了)?|别发(?:图|照片|自拍)?(?:了)?|取消(?:这次|刚才的|本次)?(?:拍摄|生图|生成|照片|任务)|停止(?:拍摄|生图|生成))[。！!，,\s]*", clean))
 
 def semantic_request_error(text):
     """Veto empty/quoted input and explicit withdrawal, without keyword consent."""

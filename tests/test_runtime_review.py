@@ -60,13 +60,14 @@ class RuntimeReviewTests(unittest.IsolatedAsyncioTestCase):
                 if persona_id == "[%None]":
                     self.assertEqual(env["system"], "")
 
-    async def test_unrelated_chat_does_not_leave_short_confirmation_armed(self):
+    async def test_native_unrelated_chat_preserves_conditions_without_generating(self):
         request = Event("给我拍一张你的自拍")
         await self.plugin.remember_conditions(request, types.SimpleNamespace(completion_text="只拍背影可以吗？"))
         unrelated = Event("你今天吃的什么？")
         await self.plugin.remember_conditions(unrelated, types.SimpleNamespace(completion_text="今天吃了面条。"))
         current = await self.plugin.dialogue.environment(unrelated.unified_msg_origin)
-        self.assertFalse(self.plugin._eligible("好", current))
+        self.assertTrue(current["session"].get("pending"))
+        self.assertFalse(self.image_provider.calls)
 
     async def test_restart_recovers_pre_send_delivery_for_retry(self):
         self.store.reserve_delivery("morning:qq:FriendMessage:123:today")
