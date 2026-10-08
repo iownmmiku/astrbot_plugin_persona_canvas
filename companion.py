@@ -23,6 +23,28 @@ def cancel_request(text):
     clean = re.sub(r'```[\s\S]*?```|[“「『"][\s\S]*?[”」』"]', "", request_text(text)).strip()
     return bool(re.fullmatch(r"(?:请|麻烦|先|那|算了[，,]?\s*)?(?:别拍了|不要拍了|不用拍了|不拍了|别生成了|不要生成了|取消(?:这次|刚才的|本次)?(?:拍摄|生图|生成|照片|任务)|停止(?:拍摄|生图|生成))[。！!，,\s]*", clean))
 
+def semantic_request_error(text):
+    """Veto empty/quoted input and explicit withdrawal, without keyword consent."""
+    clean = re.sub(r'```[\s\S]*?```|[“「『\"\'][\s\S]*?[”」』\"\']', "", request_text(text)).strip()
+    if not clean:
+        return "当前消息为空或只有引用，不能当作用户的新请求"
+    if cancel_request(text) or re.search(r"(?:^|[，。！？,!?.\n])\s*(?:我)?(?:不想看了|不想拍了|不要拍了|别拍了|不用拍了|不拍了|别生成了|不要生成了|不要发(?:图|照片|自拍)?|别发(?:图|照片|自拍)?|不用(?:拍|生成|发图)|不需要(?:照片|图片|自拍))(?:[。！!，,\s]|$)", clean):
+        return "用户已明确拒绝或撤回本次图片请求，不能拍摄"
+    if re.search(r"(?:不要|别|不想|不需要|不用)(?:再)?(?:给我|帮我|向我)?(?:拍(?:照|自拍|照片)?|自拍|生成(?:图片|照片)?|发(?:送)?(?:图|图片|照片|自拍))(?=[，。！？,!?.\s]|了|$)", clean):
+        return "用户已明确拒绝或撤回本次图片请求，不能拍摄"
+    return ""
+
+def changed_conditions(text):
+    """Recognize obvious edits; the tool's model still judges all other wording."""
+    clean = request_text(text)
+    # Repeating an agreed outfit/pose ("按约定穿上白裙") is not a change.
+    return bool(re.search(
+        r"(?:但是|不过|可是|但)[^。！？\n]{0,40}(?:换|改|穿|坐|站|近一点|远一点)"
+        r"|(?:^|[，,])\s*(?:那|那就|请|再)?\s*(?:换成|换上|换个姿势|改成|改为)"
+        r"|(?:镜头|构图)(?:再|改|改成|换成)(?:近|远)一?[点些]",
+        clean,
+    ))
+
 def pending_request(env, text, reply, required=None, *, kind="photo", ttl=1800):
     return {"request_id": secrets.token_hex(10), "session_key": env["key"], "persona_id": env["persona"]["id"], "request_kind": kind, "request": request_text(text)[:2000], "conditions": reply[:2000], "requirements": {"notes": reply[:1000], **requirements(required)}, "expires_at": time.time() + ttl}
 

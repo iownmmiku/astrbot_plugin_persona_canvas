@@ -16,7 +16,7 @@ from astrbot.api.star import Context, Star, register
 
 from .active import ActiveScheduler
 from .dialogue import Dialogue, field, maybe_await
-from .companion import apply_state, cancel_request, infer_requirements, is_confirmation, pending_request, requirements, valid_pending
+from .companion import apply_state, cancel_request, changed_conditions, infer_requirements, is_confirmation, pending_request, requirements, semantic_request_error, valid_pending
 from .intent import Intent, message_text, photo_request, prompt_bundle, state_patch, state_request
 from .moderation import Moderation
 from .page_api import CanvasPageApi, image_data_url
@@ -25,7 +25,7 @@ from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 
 def _text(event):
@@ -236,6 +236,50 @@ class PersonaCanvasPlugin(Star):
         pending = {**(env["session"].get("pending") or {}), "last_image": env["session"].get("last_image")}
         return photo_request(text, pending)
 
+    def _native_request(self, event, env, kind, request_summary, confirmed_request_id):
+        # Re-read conditions so a cached event cannot approve stale/replaced ones.
+        env.pop("approved_requirements", None)
+        env["session"] = self.storage.session(env["key"], env["persona"]["id"])
+        self._prepare_request(env, _text(event))
+        if not self.storage.settings["integration"].get("enabled", True):
+            return "聊天接入已停用", "request"
+        if not _addressed(event):
+            return "群聊没有明确唤醒机器人", "request"
+        if _extra(event, "conditions_recorded"):
+            return "本轮正在询问条件，请等下一条用户确认", "conditions"
+        summary = str(request_summary or "").strip()[:1500]
+        request_id = str(confirmed_request_id or "").strip()
+        pending = env["session"].get("pending") or {}
+        if summary or request_id:
+            reason = semantic_request_error(_text(event))
+            if reason:
+                return reason, "request"
+            if not summary:
+                return "请在 request_summary 说明本轮用户意图与上下文依据", "request"
+            if request_id and (not valid_pending(pending, env) or pending.get("request_id") != request_id):
+                return "待确认请求已失效或编号不匹配，请读取当前条件，不能沿用旧确认", "conditions"
+            if pending:
+                if pending.get("request_kind") != kind:
+                    return "待确认条件的类型不匹配，换装确认不能授权拍照", "conditions"
+                if not request_id:
+                    return "已有待确认条件。确认原条件时填写当前 confirmed_request_id；修改要求时先调用 persona_canvas_conditions", "conditions"
+                if changed_conditions(_text(event)):
+                    return "用户修改了衣服、姿势或镜头，请先记录新条件并重新确认", "conditions"
+                env["approved_requirements"] = requirements(pending.get("requirements"))
+            # The model explicitly judged intent. A positive keyword match is
+            # unnecessary; known condition edits and withdrawal still veto it.
+            env.pop("changed_request", None)
+            env.pop("previous_conditions", None)
+            env["request_basis"] = {"source": "model_tool", "summary": summary, "confirmed_request_id": request_id}
+            return "", ""
+        eligible = self._eligible(_text(event), env) if kind == "photo" else state_request(_text(event), pending)
+        if not eligible:
+            return "没有明确的拍摄或状态请求；若上下文已明确，请用 request_summary 提交语义判断，无需让用户重复关键词", "request"
+        if env.get("changed_request"):
+            return "要求改变，请先重新确认条件", "conditions"
+        env["request_basis"] = {"source": "keyword", "summary": _text(event)[:1500]}
+        return "", ""
+
     def _claim_photo(self, event):
         if _extra(event, "photo_attempted"):
             return False
@@ -269,7 +313,7 @@ class PersonaCanvasPlugin(Star):
             return
         env = await self.dialogue.environment(event.unified_msg_origin, conversation=getattr(req, "conversation", None))
         self._prepare_request(env, _text(event))
-        if env["session"].get("pending") and not self._eligible(_text(event), env) and not state_request(_text(event), env["session"].get("pending")):
+        if self.storage.settings["integration"].get("mode") != "native_tools" and env["session"].get("pending") and not self._eligible(_text(event), env) and not state_request(_text(event), env["session"].get("pending")):
             env["session"]["pending"] = {}
             env["session"] = self.storage.save_session(env["key"], env["session"])
         _extra(event, "environment", env, set_value=True)
@@ -280,12 +324,14 @@ class PersonaCanvasPlugin(Star):
             except Exception as exc:
                 _extra(event, "reference_error", self._error(exc), set_value=True)
         req.system_prompt = (getattr(req, "system_prompt", "") or "") + "\n" + self.dialogue.visual_prompt(env)
+        if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event):
+            req.system_prompt += "\n原生工具支持上下文语义判断：你已经理解用户要图片/更新外观时，在相应工具的 request_summary 简述本轮意图与上下文依据，直接调用，不要求用户重说关键词。确认已有条件时，另填写 pending_conditions.request_id 到 confirmed_request_id；确认必须针对原条件且没有修改。没有条件时留空编号。拒绝、撤回、讨论、引用或普通聊天不要调用执行工具。"
         if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event) and self._eligible(_text(event), env):
             req.system_prompt += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"
 
     @filter.on_llm_response()
     async def remember_conditions(self, event: AstrMessageEvent, response):
-        if not self.storage.settings["integration"].get("enabled", True) or _extra(event, "photo_attempted") or _extra(event, "conditions_recorded"):
+        if not self.storage.settings["integration"].get("enabled", True) or _extra(event, "photo_attempted") or _extra(event, "conditions_recorded") or _extra(event, "native_tool_seen"):
             return
         # A tool-call response is not the final reply: AstrBot executes it next.
         # Stream chunks likewise cannot establish that no tool will be called.
@@ -316,7 +362,7 @@ class PersonaCanvasPlugin(Star):
             self._save_conditions(env, "角色主动提议拍照，等待用户确认", text, infer_requirements(text))
 
     @filter.llm_tool(name="persona_canvas_conditions")
-    async def tool_conditions(self, event: AstrMessageEvent, reply: str, request_kind: str = "photo", outfit: str = "", camera: str = "", pose: str = "", expression: str = "", scene: str = "", avoid: str = ""):
+    async def tool_conditions(self, event: AstrMessageEvent, reply: str, request_kind: str = "photo", outfit: str = "", camera: str = "", pose: str = "", expression: str = "", scene: str = "", avoid: str = "", request_summary: str = ""):
         """你愿意提拍摄或换装条件时先记录条件、询问用户确认，本轮不生图。
 
         Args:
@@ -328,19 +374,26 @@ class PersonaCanvasPlugin(Star):
             expression (string): 表情条件，未限定留空。
             scene (string): 场景条件，未限定留空。
             avoid (string): 明确不能拍的内容或角度，未限定留空。
+            request_summary (string): 从本轮消息及上下文判断出的用户图片/状态意图，不要求固定关键词；修改条件时说明修改点。
         """
         env = await self._env(event)
-        if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or request_kind not in {"photo", "state"} or not (self._eligible(_text(event), env) or state_request(_text(event), env["session"].get("pending"))):
+        _extra(event, "native_tool_seen", True, set_value=True)
+        self._prepare_request(env, _text(event))
+        semantic = bool(str(request_summary or "").strip())
+        if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or request_kind not in {"photo", "state"} or (semantic_request_error(_text(event)) if semantic else not (self._eligible(_text(event), env) or state_request(_text(event), env["session"].get("pending")))):
             return json.dumps({"ok": False, "reason": "当前没有明确的拍摄或状态请求"}, ensure_ascii=False)
         if _extra(event, "photo_attempted") or not reply.strip():
             return json.dumps({"ok": False, "reason": "本轮已安排拍摄或缺少确认问题"}, ensure_ascii=False)
+        if valid_pending(env["session"].get("pending"), env):
+            env["changed_request"] = True
+            env["previous_conditions"] = env["session"]["pending"]
         pending = self._save_conditions(env, _text(event), reply, {"outfit": outfit, "camera": camera, "pose": pose, "expression": expression, "scene": scene, "avoid": avoid}, request_kind)
         _extra(event, "conditions_recorded", True, set_value=True)
-        self.storage.record_action({"session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "kind": "decision", "status": "ask", "request": _text(event), "reply": reply, "requirements": pending["requirements"]})
+        self.storage.record_action({"session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "kind": "decision", "status": "ask", "request": _text(event), "request_basis": {"source": "model_tool" if semantic else "keyword", "summary": str(request_summary or _text(event))[:1500]}, "reply": reply, "requirements": pending["requirements"]})
         return json.dumps({"ok": True, "request_id": pending["request_id"], "instruction": "现在向用户询问这些条件。本轮不得拍照或更新状态，等下一条明确确认。"}, ensure_ascii=False)
 
     @filter.llm_tool(name="persona_canvas_state")
-    async def tool_state(self, event: AstrMessageEvent, outfit: str = "", pose: str = "", expression: str = "", scene: str = ""):
+    async def tool_state(self, event: AstrMessageEvent, outfit: str = "", pose: str = "", expression: str = "", scene: str = "", request_summary: str = "", confirmed_request_id: str = ""):
         """你愿意接受用户明确提出的换装/姿势要求时，更新会话视觉状态，不会拍照。拒绝或提条件时不要调用。
 
         Args:
@@ -348,17 +401,19 @@ class PersonaCanvasPlugin(Star):
             pose (string): 新姿势，未改变留空。
             expression (string): 新表情，未改变留空。
             scene (string): 新场景，未改变留空。
+            request_summary (string): 根据本轮消息和上下文判断的换装/状态请求或条件确认依据，填写后不要求固定关键词。
+            confirmed_request_id (string): 用户已确认原条件时填写 pending_conditions.request_id；没有条件时留空，修改要求先重新提条件。
         """
         self._track_current()
+        _extra(event, "native_tool_seen", True, set_value=True)
         env = await self._env(event)
-        self._prepare_request(env, _text(event))
-        if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or not state_request(_text(event), env["session"].get("pending")):
-            return json.dumps({"ok": False, "reason": "用户没有明确要求更新状态"}, ensure_ascii=False)
-        if _extra(event, "conditions_recorded") or env.get("changed_request"):
-            return json.dumps({"ok": False, "reason": "要求改变或正在询问条件，请先重新确认"}, ensure_ascii=False)
+        reason, _stage = self._native_request(event, env, "state", request_summary, confirmed_request_id)
+        if reason:
+            return json.dumps({"ok": False, "reason": reason}, ensure_ascii=False)
         patch = state_patch({k: v for k, v in {"outfit": outfit, "pose": pose, "expression": expression, "scene": scene}.items() if v})
         if is_confirmation(_text(event)):
             patch.update(state_patch((env["session"].get("pending") or {}).get("requirements")))
+        patch.update(state_patch(env.get("approved_requirements")))
         async with self._lock(env["key"]):
             session = self.storage.session(env["key"], env["persona"]["id"])
             apply_state(session, patch, self.storage.settings)
@@ -369,8 +424,8 @@ class PersonaCanvasPlugin(Star):
         return json.dumps({"ok": True, "state": session["state"], "photo_generated": False}, ensure_ascii=False)
 
     @filter.llm_tool(name="persona_canvas_photo")
-    async def tool_photo(self, event: AstrMessageEvent, prompt: str, mode: str = "persona", caption: str = "", outfit: str = "", pose: str = "", expression: str = "", scene: str = "", use_last_image: bool = False):
-        """用户明确请求照片/绘图或确认了拍摄条件，并且你本人愿意时才执行。普通聊天、否定、引用、拒绝、提条件时不得调用。一次请求一次图片。
+    async def tool_photo(self, event: AstrMessageEvent, prompt: str, mode: str = "persona", caption: str = "", outfit: str = "", pose: str = "", expression: str = "", scene: str = "", use_last_image: bool = False, request_summary: str = "", confirmed_request_id: str = ""):
+        """根据上下文判断用户要照片/绘图且你愿意时，直接实际生图并发图，无需用户重复关键词。填写 request_summary；已有条件时还需 confirmed_request_id。普通聊天、否定、引用、拒绝、提条件时不得调用。一次请求一次图片。
 
         Args:
             prompt (string): 你同意的拍摄描述，体现镜头、动作与情绪，保持固定长相。
@@ -381,18 +436,18 @@ class PersonaCanvasPlugin(Star):
             expression (string): 新表情，未改变留空。
             scene (string): 新场景，未改变留空。
             use_last_image (boolean): 编辑上一张图片时为 true。
+            request_summary (string): 简述本轮用户要图片或已确认原条件的语义及上下文依据，填写后不要求原话命中拍照关键词。
+            confirmed_request_id (string): 已有拍摄条件且用户未修改要求地确认时，填写 pending_conditions.request_id；没有条件留空，修改要求先调用 persona_canvas_conditions。
         """
         self._track_current()
+        _extra(event, "native_tool_seen", True, set_value=True)
         env = await self._env(event)
-        self._prepare_request(env, _text(event))
         def rejected(reason, stage):
             self.storage.record_action({"kind": "decision", "source": "native_tool", "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "request": _text(event), "status": "blocked", "error": reason, "trace": [{"stage": stage, "status": "blocked", "detail": reason}]})
             return json.dumps({"ok": False, "reason": reason}, ensure_ascii=False)
-        if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or not self._eligible(_text(event), env):
-            reason = "聊天接入已停用" if not self.storage.settings["integration"].get("enabled", True) else "群聊没有明确唤醒机器人" if not _addressed(event) else "没有明确的拍摄请求或条件尚未确认，请继续正常聊天"
-            return rejected(reason, "request")
-        if _extra(event, "conditions_recorded") or env.get("changed_request"):
-            return rejected("要求改变或正在询问条件，本轮不能拍摄，请先重新确认条件", "conditions")
+        reason, stage = self._native_request(event, env, "photo", request_summary, confirmed_request_id)
+        if reason:
+            return rejected(reason, stage)
         if not self._claim_photo(event):
             return json.dumps({"ok": False, "reason": "本轮已经执行过拍摄，请不要重复调用"}, ensure_ascii=False)
         patch = {k: v for k, v in {"outfit": outfit, "pose": pose, "expression": expression, "scene": scene}.items() if v}
@@ -402,7 +457,7 @@ class PersonaCanvasPlugin(Star):
                 raise ValueError(_extra(event, "reference_error"))
             if mode not in {"persona", "scene", "edit"} or not prompt.strip():
                 raise ValueError("拍摄模式或描述无效")
-            job = self.storage.create_job({"status": "queued", "source": "chat", "caption": caption, "raw": _text(event), "mode": mode, "delivery_key": _extra(event, "delivery_key", ""), "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"]})
+            job = self.storage.create_job({"status": "queued", "source": "chat", "caption": caption, "raw": _text(event), "mode": mode, "request_basis": copy.deepcopy(env.get("request_basis", {})), "delivery_key": _extra(event, "delivery_key", ""), "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"]})
             self._photo_note(job)
             async def run():
                 try:
@@ -460,7 +515,8 @@ class PersonaCanvasPlugin(Star):
         job_data = {"status": "queued", "source": source, "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": persona["id"], "persona_snapshot": persona, "session_revision": env["session"].get("revision", 0), "prompt": positive, "negative_prompt": negative, "request_prompt": prompt, "raw": raw, "caption": caption, "state_patch": patch, "provider": provider.name, "reference_asset": reference_name, "reference_assets": reference_names, "reference_warning": reference_warning, "requirements": agreed, "options": options}
         job = self.storage.update_job(job_id, job_data) if job_id else self.storage.create_job(job_data)
         self._bind_job_task(job["id"], asyncio.current_task())
-        self._trace_job(job["id"], "request", detail="明确请求 / 主动机会，角色已同意")
+        basis = job.get("request_basis") or {}
+        self._trace_job(job["id"], "request", detail=("角色工具语义判断：" + basis.get("summary", "")) if basis.get("source") == "model_tool" else "明确请求 / 主动机会，角色已同意")
         self._trace_job(job["id"], "role", "photo" if mode == "persona" else mode, caption)
         self._trace_job(job["id"], "conditions", detail=json.dumps(agreed, ensure_ascii=False) if agreed else "未设置额外拍摄条件")
         self._trace_job(job["id"], "reference", "warning" if reference_warning else "ok", reference_warning or f"使用 {len(reference_names)} 张真实参考图")

@@ -38,6 +38,7 @@ class InstallationArchiveTests(unittest.TestCase):
             self.assertTrue((installed / "providers/base.py").is_file())
             self.assertEqual((installed / "metadata.yaml").read_bytes(), (ROOT / "metadata.yaml").read_bytes())
             self.assertTrue((installed / "companion.py").is_file())
+            self.assertEqual((installed / "logo.png").read_bytes(), (ROOT / "logo.png").read_bytes())
             self.assertFalse((installed / "data").exists())
             self.assertFalse((installed / ".git").exists())
 
