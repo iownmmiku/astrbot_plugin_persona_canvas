@@ -416,13 +416,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         target["enabled"] = True
         self.store.settings["active"]["enabled"] = True
         scheduler._in_window = lambda *args: True
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertFalse(self.context.llm.calls)
         target["last_inbound"] = time.time() - 10000
         self.context.llm.next = {"decision": "skip", "reply": ""}
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.llm.calls), 1)
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.llm.calls), 1)
         self.assertFalse(self.context.sent)
         self.assertFalse(self.image_provider.calls)
@@ -435,11 +435,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.store.settings["good_morning"]["enabled"] = True
         scheduler._in_window = lambda *args: True
         self.context.llm.next = {"decision": "chat", "reply": "早安，昨晚睡好了吗？"}
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.sent), 1)
         self.assertTrue(target["morning_date"])
         target["last_active"] = 0
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.sent), 1)
         target["silent_until"] = time.time() + 10000
         self.assertTrue(scheduler._blocked(target, time.time()))

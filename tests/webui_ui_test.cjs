@@ -12,6 +12,7 @@ const { chromium } = require("playwright");
 
 const pageRoot = path.resolve(__dirname, "../pages/canvas");
 const requestSummary = {
+  submitted: true,
   prompt: "adult character, white dress, soft light, <img src=x onerror=alert(1)>",
   negative_prompt: "abs, muscular female, extra toes", negative_mode: "field",
   negative_prompt_field: "parameters.negative_prompt", model: "offline-image",
@@ -31,8 +32,14 @@ const fixtures = {
     { name: "novelai", kind: "novelai", endpoint: "https://offline.invalid", model: "offline-novelai", timeout: 90, capabilities: { ...capabilities, seed: true, sampler: true, negative_prompt: true, negative_mode: "field", negative_prompt_mode: "原生负面通道" } },
   ] },
   targets: { items: [] }, sessions: { items: [] },
-  jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", request_summary: { ...requestSummary, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] }] },
-  history: { items: [{ job_id: "job-failed", ok: false, caption: "离线失败测试", provider: "default", model: "offline-image", error: "绘图接口超时", request_summary: requestSummary, state_patch: { outfit: "white dress" }, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }] },
+  jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
+    { id: "job-delivery-failed", status: "delivery_failed", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
+    { id: "job-uncertain", status: "uncertain", caption: "已生成发送待确认", asset: "original-uncertain.png", umo: "offline:FriendMessage:test", created_at: 1725000000 },
+    { id: "job-sending", status: "sending", caption: "原图正在发送", asset: "sending.png", umo: "offline:FriendMessage:test", created_at: 1724000000 },
+  ] },
+  history: { items: [{ job_id: "job-failed", ok: false, caption: "离线失败测试", provider: "default", model: "offline-image", error: "绘图接口超时", request_summary: requestSummary, state_patch: { outfit: "white dress" }, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] },
+    { job_id: "job-delivery-failed", ok: true, caption: "已生成平台拒收" }, { job_id: "job-uncertain", ok: true, caption: "已生成发送待确认" },
+  ] },
   diagnostics: { setup: [], budget: {}, items: [{ status: "failed", summary: "离线失败测试", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }] },
   "llm/providers": { items: [], personas: [] },
 };
@@ -62,10 +69,23 @@ async function main() {
           if (route === "providers") {
             const current = data.providers.items.find(item => item.name === body.name);
             const saved = { ...current, ...body, capabilities: current?.capabilities || { text_to_image: true } };
-            if (current) Object.assign(current, saved); else data.providers.items.push(saved);
+            if (body.reset_option_fields === true) delete saved.option_fields;
+            delete saved.reset_option_fields;
+            if (current) { if (body.reset_option_fields === true) delete current.option_fields; Object.assign(current, saved); } else data.providers.items.push(saved);
             return structuredClone(saved);
           }
-          if (route === "image/test") return { ok: true, message: "离线测试，无真实接口调用", request_summary: data.jobs.items[0].request_summary, effective_timeout_sec: 60 };
+          if (route === "image/test") {
+            if (window.__testTransportFailure) throw new Error("离线桥接传输失败");
+            return window.__testResponse ? structuredClone(window.__testResponse) : { ok: true, message: "离线测试，无真实接口调用", request_summary: data.jobs.items[0].request_summary, effective_timeout_sec: 60 };
+          }
+          if (route === "jobs/resend") {
+            const job = data.jobs.items.find(item => item.id === body.id);
+            job.status = "sending";
+            await new Promise(resolve => { window.__releaseResend = resolve; });
+            job.status = window.__resendFailure ? "delivery_failed" : "sent";
+            return window.__resendFailure ? { ok: false, error: "离线平台明确拒收" } : { ok: true, message: "原图已补发", job_id: job.id };
+          }
+          if (route === "settings") { for (const [key, patch] of Object.entries(body)) data.state.settings[key] = { ...data.state.settings[key], ...patch }; return { ok: true }; }
           if (route === "generate") return { job_id: "offline-generated-job" };
           return {};
         },
@@ -99,8 +119,13 @@ async function main() {
     saved = await lastPost("providers");
     for (const key of ["prompt_field", "model_field", "reference_field", "reference_mime_field", "reference_format", "models_response_path", "supported_sizes", "option_fields"]) assert.deepEqual(saved[key], fixtures.providers.items[1][key], `高级字段 ${key} 应完整往返保存`);
     await get("v-options").fill(""); await get("v-model").fill("changed-model"); await saveProvider();
-    saved = await lastPost("providers"); assert.equal(Object.hasOwn(saved, "option_fields"), false, "空映射输入不应改写已有字段");
-    assert.equal(JSON.parse(await get("v-options").inputValue()).width, "parameters.width");
+    saved = await lastPost("providers"); assert.equal(Object.hasOwn(saved, "option_fields"), false); assert.equal(saved.reset_option_fields, true, "清空映射应明确恢复默认映射");
+    assert.equal(await get("v-options").inputValue(), "", "恢复默认映射后不能回填旧字段");
+    await get("v-options").fill("{}"); await saveProvider();
+    assert.deepEqual((await lastPost("providers")).option_fields, {}, "显式空对象应保留禁用参数映射的含义");
+    assert.equal(await get("v-options").inputValue(), "{}");
+    await get("reset-provider-options").click(); await saveProvider();
+    assert.equal((await lastPost("providers")).reset_option_fields, true); assert.equal(await get("v-options").inputValue(), "");
     await get("v-supported-sizes").fill(""); await saveProvider();
     assert.equal((await lastPost("providers")).supported_sizes, null, "清空原自定义尺寸列表恢复模型默认");
     await get("v-kind").selectOption("gemini");
@@ -145,6 +170,59 @@ async function main() {
     await get("provider-list").getByRole("button", { name: /^default/ }).click();
     await get("test-image-generation").click();
     assert.equal(await get("provider-test-result").locator(".request-detail").count(), 1, "测试图应展示同一格式的最终摘要");
+    await page.evaluate(() => { window.__testResponse = { status: "ok", data: { ok: false, error: "离线接口超时", request_summary: { ...window.__canvasFixtures.jobs.items[0].request_summary, notes: ["同时发送 v4_negative_prompt.caption.base_caption"] } } }; });
+    await get("test-image-generation").click();
+    await page.waitForFunction(() => !document.getElementById("test-image-generation").disabled);
+    assert.match(await get("provider-test-result").innerText(), /离线接口超时/);
+    assert.doesNotMatch(await get("provider-test-result").innerText(), /正在生成测试图/);
+    let testDetail = get("provider-test-result").locator(".request-detail"); await testDetail.locator("summary").click();
+    assert.match(await testDetail.innerText(), /查看最终请求摘要/); assert.doesNotMatch(await testDetail.innerText(), /查看请求准备摘要/);
+    assert.match(await testDetail.innerText(), /v4_negative_prompt/); assert.match(await testDetail.innerText(), /最终正面提示词/);
+    await page.evaluate(() => { window.__testResponse = { ok: false, error: "离线手动负面字段错误", request_summary: { ...window.__canvasFixtures.jobs.items[0].request_summary, negative_mode: "disabled", negative_source: "extra_body", negative_prompt: "manual negative", negative_prompt_field: "parameters.negative", notes: ["手动附加请求体"] } }; });
+    await get("test-image-generation").click(); await page.waitForFunction(() => !document.getElementById("test-image-generation").disabled);
+    testDetail = get("provider-test-result").locator(".request-detail"); await testDetail.locator("summary").click();
+    assert.match(await testDetail.innerText(), /实际独立负面提示词/); assert.match(await testDetail.innerText(), /manual negative/); assert.match(await testDetail.innerText(), /手动附加请求体/);
+    await page.evaluate(() => { window.__testTransportFailure = true; });
+    await get("test-image-generation").click(); await page.waitForFunction(() => !document.getElementById("test-image-generation").disabled);
+    assert.match(await get("provider-test-result").innerText(), /离线桥接传输失败/); assert.doesNotMatch(await get("provider-test-result").innerText(), /正在生成测试图/);
+    await page.evaluate(() => { window.__testTransportFailure = false; window.__testResponse = null; });
+
+    await page.locator("[data-page='active']").click();
+    assert.equal(await get("a-concurrency").inputValue(), "3"); assert.equal(await get("a-concurrency").getAttribute("max"), "16");
+    await get("a-concurrency").fill("5"); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
+    await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+    assert.equal((await lastPost("settings")).active.max_concurrent_targets, 5); assert.equal(await get("a-concurrency").inputValue(), "5");
+
+    await page.locator("[data-page='studio']").click();
+    const deliveryRow = get("job-list").locator("article").filter({ hasText: "已生成平台拒收" });
+    const uncertainRow = get("job-list").locator("article").filter({ hasText: "已生成发送待确认" });
+    const sendingRow = get("job-list").locator("article").filter({ hasText: "原图正在发送" });
+    assert.equal(await deliveryRow.getByRole("button", { name: "重试", exact: true }).count(), 0, "发送失败不能安排重新绘图");
+    assert.equal(await sendingRow.getByRole("button", { name: "正在发送原图…", exact: true }).isDisabled(), true);
+    await deliveryRow.getByRole("button", { name: "补发原图", exact: true }).click();
+    await page.waitForFunction(() => Boolean(window.__releaseResend));
+    assert.equal(await deliveryRow.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true);
+    await page.locator("[data-page='history']").click();
+    const deliveryHistory = get("history-list").locator("article").filter({ hasText: "已生成平台拒收" });
+    assert.equal(await deliveryHistory.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true, "任务与历史共用补发中的状态");
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 1);
+    await page.evaluate(() => { window.__releaseResend(); window.__releaseResend = null; });
+    await page.waitForFunction(() => window.__canvasFixtures.jobs.items.find(job => job.id === "job-delivery-failed").status === "sent");
+    await page.waitForFunction(() => !Array.from(document.querySelectorAll("#history-list button")).some(button => button.textContent === "正在补发原图…"));
+    assert.equal(await deliveryHistory.getByRole("button", { name: /补发/ }).count(), 0, "已发送任务不保留重复补发入口");
+    await page.locator("[data-page='studio']").click();
+    await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
+    assert.equal(await get("confirm-ok").isDisabled(), true); assert.equal(await get("confirm-uncertain-row").isVisible(), true);
+    await get("confirm-cancel").click();
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 1, "未明确核对不能补发结果不明的任务");
+    await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
+    await get("confirm-uncertain").check(); assert.equal(await get("confirm-ok").isDisabled(), false); await get("confirm-ok").click();
+    await page.waitForFunction(() => Boolean(window.__releaseResend));
+    assert.deepEqual(await lastPost("jobs/resend"), { id: "job-uncertain", confirm_uncertain: true });
+    await page.evaluate(() => { window.__resendFailure = true; window.__releaseResend(); window.__releaseResend = null; });
+    await page.waitForFunction(() => document.getElementById("notice").textContent === "离线平台明确拒收");
+    assert.match(await get("notice").getAttribute("class"), /error/);
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "generate").length), 1, "补发不得调用绘图入口");
     await page.locator("[data-page='settings']").click();
     assert.equal(await get("d-timeout").getAttribute("max"), "600");
     assert.match(await get("settings-form").innerText(), /persona_canvas_control/);
@@ -158,8 +236,19 @@ async function main() {
       await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-providers-mobile.png"), fullPage: true });
     } else await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动页面不应横向溢出");
+    await page.locator("[data-page='active']").click();
+    assert.equal(await get("a-concurrency").isVisible(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动主动策略页面不应横向溢出");
+    if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-active-mobile.png"), fullPage: true });
+    await page.evaluate(() => { window.__canvasFixtures.jobs.items.find(job => job.id === "job-uncertain").status = "uncertain"; });
+    await page.locator("[data-page='studio']").click(); await get("refresh-jobs").click();
+    await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
+    assert.equal(await get("confirm-ok").isDisabled(), true);
+    assert.equal(await page.evaluate(() => { const box = document.getElementById("confirm-dialog").getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth; }), true, "移动补发确认框应完整显示");
+    if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-resend-mobile.png"), fullPage: true });
+    await get("confirm-cancel").click();
     assert.deepEqual(browserErrors, [], "页面运行不应有未捕获的 JavaScript 异常");
-    console.log("PASS: WebUI offline Chrome checks (negative modes, custom fields, Gemini options, job/history/test diagnostics, escaping, mobile layout).");
+    console.log("PASS: WebUI offline Chrome checks (negative modes, mapping reset, Gemini options, failed test summaries, submitted notes, resend confirmation and deduplication, target concurrency, escaping, mobile layout).");
   } finally {
     if (browser) await browser.close();
     await new Promise(resolve => server.close(resolve));

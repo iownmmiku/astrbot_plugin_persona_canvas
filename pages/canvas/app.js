@@ -10,17 +10,17 @@ const pageNames = {
   providers: ["模型接口", "管理绘画接口与动作判断模型。"], studio: ["生图工作台", "构图、预演与生成任务，集中在这里。"],
   active: ["主动消息", "安排自然的破冰与每日早安。"], history: ["生成历史", "回看画面与每次请求的执行结果。"], settings: ["运行设置", "控制对话集成、配额与默认生成参数。"]
 };
-const statusNames = { queued: "等待中", pending: "等待中", generating: "生成中", running: "生成中", processing: "生成中", sending: "发送中", sent: "已发送", uncertain: "发送结果待确认", succeeded: "已完成", success: "已完成", done: "已完成", completed: "已完成", failed: "失败", error: "失败", interrupted: "已中断", cancelled: "已取消" };
+const statusNames = { queued: "等待中", pending: "等待中", generating: "生成中", running: "生成中", processing: "生成中", sending: "发送中", sent: "已发送", delivery_failed: "生成成功，发送失败", uncertain: "发送结果待确认", succeeded: "已完成", success: "已完成", done: "已完成", completed: "已完成", failed: "失败", error: "失败", interrupted: "已中断", cancelled: "已取消" };
 const finished = job => ["succeeded", "success", "done", "completed", "sent"].includes(job.status);
 const failed = job => ["failed", "error", "interrupted", "cancelled", "uncertain"].includes(job.status);
 const fullImages = new Map(), imageRequests = new Set();
-const referenceImages = new Map();
+const referenceImages = new Map(), resending = new Set();
 const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截" };
 const stageNames = { request: "请求检查", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
-const negativeModes = { disabled: "不发送负面词", natural_language: "自然语言约束", field: "独立负面字段" };
+const negativeModes = { disabled: "不自动发送人设负面词", natural_language: "自然语言约束", field: "独立负面字段" };
 const referenceSources = { persona: "角色参考图库", persona_gallery: "角色参考图库", explicit: "指定参考图", explicit_reference: "指定参考图", attachment: "聊天附件", message_attachment: "聊天附件", last_image: "上一张图片", none: "无参考图" };
-const activeJob = job => !finished(job) && !failed(job);
+const activeJob = job => !finished(job) && !failed(job) && job.status !== "delivery_failed";
 const jobId = job => String(job.id || job.job_id || "");
 const value = id => $(id).value.trim();
 const num = id => Number($(id).value);
@@ -48,7 +48,7 @@ async function run(el, action) {
   try { return await action(); } catch (error) { notice(error.message || "操作失败", true); } finally { el.disabled = el.dataset.unavailable === "true"; el.textContent = label; }
 }
 function unwrap(result) {
-  if (result?.status === "error" || result?.error) throw new Error(result.message || result.error || "请求失败");
+  if (result?.status === "error" || (result?.error && result?.ok !== false)) throw new Error(result.message || result.error || "请求失败");
   return result?.status === "ok" && Object.hasOwn(result, "data") ? result.data : result;
 }
 async function api(path, method = "GET", body) {
@@ -61,11 +61,15 @@ async function api(path, method = "GET", body) {
   if (!response.ok) throw new Error(result.message || result.error || `请求失败（${response.status}）`);
   return unwrap(result);
 }
-async function confirmAction(title, message) {
+async function confirmAction(title, message, { requireUncertainCheck = false } = {}) {
   const dialog = $("confirm-dialog");
   setText("confirm-title", title); setText("confirm-message", message);
+  const checked = $("confirm-uncertain"), confirm = $("confirm-ok");
+  checked.checked = false; $("confirm-uncertain-row").hidden = !requireUncertainCheck;
+  confirm.disabled = requireUncertainCheck;
+  checked.onchange = () => { confirm.disabled = requireUncertainCheck && !checked.checked; };
   return new Promise(resolve => {
-    const finish = answer => { dialog.close(); $("confirm-ok").onclick = null; $("confirm-cancel").onclick = null; dialog.oncancel = null; resolve(answer); };
+    const finish = answer => { dialog.close(); confirm.onclick = null; confirm.disabled = false; checked.onchange = null; checked.checked = false; $("confirm-uncertain-row").hidden = true; $("confirm-cancel").onclick = null; dialog.oncancel = null; resolve(answer); };
     $("confirm-ok").onclick = () => finish(true); $("confirm-cancel").onclick = () => finish(false);
     dialog.oncancel = event => { event.preventDefault(); finish(false); }; dialog.showModal();
   });
@@ -148,15 +152,16 @@ function actionDetail(item) {
 function requestDetail(item) {
   const request = item.request_summary;
   if (!request || typeof request !== "object" || Array.isArray(request) || !Object.keys(request).length) return null;
-  const preparedOnly = Boolean(request.notes);
-  const detail = node("details", "request-detail"); detail.append(node("summary", "", preparedOnly ? "查看请求准备摘要" : "查看最终请求摘要"));
+  const preparedOnly = request.submitted === false, submitted = request.submitted === true;
+  const detail = node("details", "request-detail"); detail.append(node("summary", "", preparedOnly ? "查看请求准备摘要" : submitted ? "查看最终请求摘要" : "查看请求摘要（早期记录）"));
   if (request.notes) detail.append(node("p", "request-note", Array.isArray(request.notes) ? request.notes.join("\n") : String(request.notes)));
   const mode = request.negative_mode || "disabled";
-  const rows = [["绘图模型", request.model || "接口默认"], ["负面处理", negativeModes[mode] || mode], ["负面字段", request.negative_prompt_field || "未使用独立字段"], ["参考图", `${request.reference_count ?? 0} 张 · ${referenceSources[request.reference_source] || request.reference_source || "未记录来源"}`], ["接口超时", request.provider_timeout_sec != null ? `${request.provider_timeout_sec} 秒` : "未记录"], ["任务超时", request.task_timeout_sec != null ? `${request.task_timeout_sec} 秒` : "未记录"], ["有效生成超时", request.effective_timeout_sec != null ? `${request.effective_timeout_sec} 秒（两者取较短）` : "未记录"]];
+  const negativeSource = request.negative_source === "extra_body" ? "手动附加请求体" : request.negative_source === "plugin" ? "插件独立负面字段" : mode === "natural_language" ? "插件自然语言约束，编入正面描述" : request.negative_prompt_field ? "独立字段，早期记录未标明来源" : "无独立负面字段";
+  const rows = [["绘图模型", request.model || "接口默认"], ["负面处理", negativeModes[mode] || mode], ["负面来源", negativeSource], ["负面字段", request.negative_prompt_field || "未使用独立字段"], ["参考图", `${request.reference_count ?? 0} 张 · ${referenceSources[request.reference_source] || request.reference_source || "未记录来源"}`], ["接口超时", request.provider_timeout_sec != null ? `${request.provider_timeout_sec} 秒` : "未记录"], ["任务超时", request.task_timeout_sec != null ? `${request.task_timeout_sec} 秒` : "未记录"], ["有效生成超时", request.effective_timeout_sec != null ? `${request.effective_timeout_sec} 秒（两者取较短）` : "未记录"]];
   const info = node("div", "info-list request-info");
   for (const [label, content] of rows) { const row = node("div", "info-row"); row.append(node("span", "", label), node("span", "", content)); info.append(row); }
-  detail.append(info, node("h4", "", preparedOnly ? "准备阶段正面提示词" : "最终正面提示词"), node("pre", "request-prompt", request.prompt || "未提交"), node("h4", "", preparedOnly ? "准备阶段独立负面提示词" : "实际独立负面提示词"), node("pre", "request-prompt", request.negative_prompt || (mode === "natural_language" ? preparedOnly ? "尚未提交；自然语言约束将在适配器处理时加入正面描述。" : "未使用独立字段；约束已写入最终正面提示词。" : "未发送独立负面词。")), node("h4", "", preparedOnly ? "准备阶段生成参数" : "实际生成参数"), node("pre", "request-options", JSON.stringify(request.options || {}, null, 2)));
-  if (mode === "disabled") detail.append(node("p", "muted", "此接口未发送负面词。可在模型接口设置自然语言约束，或确认接口支持后启用独立字段。"));
+  detail.append(info, node("h4", "", preparedOnly ? "准备阶段正面提示词" : submitted ? "最终正面提示词" : "记录的正面提示词"), node("pre", "request-prompt", request.prompt || "未提交"), node("h4", "", preparedOnly ? "准备阶段独立负面提示词" : submitted ? "实际独立负面提示词" : "记录的独立负面提示词"), node("pre", "request-prompt", request.negative_prompt || (mode === "natural_language" ? preparedOnly ? "尚未提交；自然语言约束将在适配器处理时加入正面描述。" : "未使用独立字段；约束已写入正面描述。" : "未记录独立负面词。")), node("h4", "", preparedOnly ? "准备阶段生成参数" : submitted ? "实际生成参数" : "记录的生成参数"), node("pre", "request-options", JSON.stringify(request.options || {}, null, 2)));
+  if (mode === "disabled") detail.append(node("p", "muted", request.negative_prompt_field ? "插件未自动发送人设负面词；此请求的独立负面字段来自手动附加请求体。" : "插件未自动发送人设负面词。可在模型接口设置自然语言约束，或确认接口支持后启用独立字段。"));
   if (item.failure_stage || item.error_stage) detail.append(node("p", "danger-text", `失败阶段：${stageNames[item.failure_stage || item.error_stage] || item.failure_stage || item.error_stage}`));
   return detail;
 }
@@ -233,7 +238,8 @@ function readProvider() {
   if (mode === "field" && kind !== "novelai") data.negative_prompt_field = value("v-negative-field") || "negative_prompt";
   if (kind === "custom") {
     data.supports_seed = check("v-seed"); data.supports_sampler = check("v-sampler");
-    if (fields) data.option_fields = fields;
+    if (fields !== undefined) data.option_fields = fields;
+    else data.reset_option_fields = true;
     for (const [id, key] of [["v-prompt-field", "prompt_field"], ["v-model-field", "model_field"], ["v-reference-field", "reference_field"], ["v-reference-mime", "reference_mime_field"], ["v-models-response", "models_response_path"]]) if (value(id) || Object.hasOwn(selection.provider || {}, key)) data[key] = value(id);
     data.reference_format = value("v-reference-format");
   }
@@ -253,7 +259,7 @@ async function loadLlm() {
 }
 function fillActive() {
   const a = model.state.settings?.active || {}, m = model.state.settings?.good_morning || {};
-  setCheck("a-enabled", a.enabled); set("a-timezone", a.timezone || "Asia/Shanghai"); set("a-start", a.default_start || "09:00"); set("a-end", a.default_end || "22:00"); set("a-interval", a.check_interval_sec ?? 30); set("a-gap", a.min_gap_sec ?? 3600); set("a-idle", a.min_idle_sec ?? 1800); set("a-silence", a.silence_after ?? 3); set("a-silence-hours", a.silence_hours ?? 24);
+  setCheck("a-enabled", a.enabled); set("a-timezone", a.timezone || "Asia/Shanghai"); set("a-start", a.default_start || "09:00"); set("a-end", a.default_end || "22:00"); set("a-interval", a.check_interval_sec ?? 30); set("a-gap", a.min_gap_sec ?? 3600); set("a-idle", a.min_idle_sec ?? 1800); set("a-silence", a.silence_after ?? 3); set("a-silence-hours", a.silence_hours ?? 24); set("a-concurrency", a.max_concurrent_targets ?? 3);
   setCheck("m-enabled", m.enabled); set("m-timezone", m.timezone || "Asia/Shanghai"); set("m-start", m.start || "07:00"); set("m-end", m.end || "10:00"); set("a-jitter", a.jitter_percent ?? 15); const b = model.state.settings?.proactive_budget || {}; for (const [key, fallback] of [["messages", 10], ["photos", 2], ["llm", 24]]) set(`b-${key}`, b[key] ?? fallback); set("b-timezone", b.timezone || "Asia/Shanghai"); markDirty("active-form", false);
 }
 function renderTargets() {
@@ -328,6 +334,24 @@ function renderSessions() {
 }
 function safeImage(source) { return typeof source === "string" && /^data:image\/(png|jpeg|webp|gif|avif);base64,/i.test(source) ? source : ""; }
 function jobImage(job) { return safeImage(job.image || job.image_url || job.result?.image || model.history.find(h => h.job_id === jobId(job) || h.id === jobId(job))?.image); }
+async function resendImage(job) {
+  const id = jobId(job);
+  if (resending.has(id)) return;
+  resending.add(id); renderJobs(); renderHistory();
+  try {
+    const uncertain = job.status === "uncertain";
+    if (uncertain && !await confirmAction("核对后补发原图", "先检查目标聊天记录。确认没有收到这张图片后，再补发同一张原图。", { requireUncertainCheck: true })) return;
+    const result = await api("jobs/resend", "POST", { id, confirm_uncertain: uncertain });
+    notice(result.message || result.error || "原图补发操作已完成，请查看任务的发送状态。", result.ok === false);
+    await refreshJobs();
+  } finally { resending.delete(id); renderJobs(); renderHistory(); }
+}
+function deliveryActions(actions, body, job) {
+  if (job.status === "delivery_failed") body.append(node("p", "danger-text", "图片已生成并保存，补发将发送同一张原图，不会重新生图。"));
+  if (job.status === "uncertain") body.append(node("p", "danger-text", "请先检查目标聊天记录，确认原图尚未收到，再补发。"));
+  if (["delivery_failed", "uncertain"].includes(job.status) && !job.cancel_requested) { const resend = button(resending.has(jobId(job)) ? "正在补发原图…" : job.status === "uncertain" ? "核对后补发原图" : "补发原图", () => resendImage(job)); resend.disabled = resending.has(jobId(job)); actions.append(resend); }
+  if (job.status === "sending") { const pending = button("正在发送原图…", () => {}); pending.disabled = true; actions.append(pending); }
+}
 function renderJobs() {
   const container = $("job-list"); container.replaceChildren();
   if (!model.jobs.length) empty(container, "暂无生成任务。");
@@ -335,9 +359,9 @@ function renderJobs() {
     const row = node("article", "task-row"), body = node("div"), actions = node("div", "actions");
     body.append(node("span", `badge ${job.status}`, statusNames[job.status] || job.status), node("p", "", job.caption || job.request?.text || job.text || "生成任务"), node("small", "", `${jobId(job)} · ${job.provider || job.request?.provider || "默认接口"} · ${date(job.created_at || job.at)}`));
     if (job.error) body.append(node("pre", "", job.error));
-    if (finished(job) || jobImage(job)) actions.append(button("查看画面", async () => { selection.previewJob = jobId(job); renderPreview(job); }));
+    if (finished(job) || job.asset || jobImage(job)) actions.append(button("查看画面", async () => { selection.previewJob = jobId(job); renderPreview(job); }));
     if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
-    if (job.status === "uncertain") body.append(node("p", "danger-text", "请先检查目标会话，确认是否已发送。发送结果不确定的任务不能直接重试。"));
+    deliveryActions(actions, body, job);
     if (["queued", "deciding", "generating", "succeeded"].includes(job.status) && !job.cancel_requested) actions.append(button("取消拍摄", async () => { await api("jobs/cancel", "POST", { id: jobId(job) }); notice("已停止等待与发送；上游已受理的任务可能仍计费。"); await refreshJobs(); }));
     const request = requestDetail(job); if (request) body.append(request); body.append(actionDetail(job)); row.append(body, actions); container.append(row);
   }
@@ -347,8 +371,8 @@ function renderPreview(job) {
   setText("preview-status", statusNames[job.status] || job.status); $("preview-status").className = `badge ${job.status}`; setText("preview-caption", job.caption || job.request?.text || job.text || "");
   const image = fullImages.get(jobId(job)) || jobImage(job), stage = $("studio-preview");
   if (image) { const img = node("img"); img.src = image; img.alt = job.caption || "生成结果"; stage.replaceChildren(img); }
-  else { const el = node("div", "empty"); el.append(node("span", "", failed(job) ? "×" : "✧"), node("p", "", failed(job) ? job.error || "生成失败，可在任务列表重试" : finished(job) ? "任务已完成，刷新历史查看画面" : "任务正在处理，完成后自动显示")); stage.replaceChildren(el); }
-  if (finished(job) && selection.previewJob === jobId(job) && !fullImages.has(jobId(job)) && !imageRequests.has(jobId(job))) {
+  else { const generated = Boolean(job.asset), el = node("div", "empty"); el.append(node("span", "", !generated && failed(job) ? "×" : "✧"), node("p", "", generated ? "原图已保存，正在读取预览…" : failed(job) ? job.error || "生成失败，可在任务列表重试" : finished(job) ? "任务已完成，刷新历史查看画面" : "任务正在处理，完成后自动显示")); stage.replaceChildren(el); }
+  if ((finished(job) || job.asset) && selection.previewJob === jobId(job) && !fullImages.has(jobId(job)) && !imageRequests.has(jobId(job))) {
     const id = jobId(job); imageRequests.add(id);
     api(`jobs/${encodeURIComponent(id)}`).then(result => { if (safeImage(result.image)) { fullImages.set(id, result.image); if (fullImages.size > 3) fullImages.delete(fullImages.keys().next().value); if (selection.previewJob === id) renderPreview(result); } }).catch(error => notice(`原图读取失败：${error.message}`, true)).finally(() => imageRequests.delete(id));
   }
@@ -365,6 +389,7 @@ function renderHistory() {
     const request = requestDetail(h); if (request) content.append(request);
     const detail = node("details"); detail.append(node("summary", "", request ? "查看状态修改与任务信息" : "查看历史提示词与任务信息"), node("pre", "", JSON.stringify({ ...(request ? {} : { prompt: h.prompt || "", negative_prompt: h.negative_prompt || h.negative || "", note: "早期记录未保存最终请求摘要，以下提示词不代表适配器实际提交内容。" }), mode: h.mode, state_patch: h.state_patch, job_id: h.job_id }, null, 2))); content.append(detail, actionDetail(h));
     const actions = node("div", "actions"); if (!ok && h.job_id && ["failed", "cancelled"].includes(model.jobs.find(j => jobId(j) === h.job_id)?.status || h.status) && !model.jobs.find(j => jobId(j) === h.job_id)?.cancel_requested) actions.append(button("重试任务", async () => { const result = await api("jobs/retry", "POST", { id: h.job_id }); selection.previewJob = result.job_id; setPage("studio"); await refreshJobs(); }));
+    deliveryActions(actions, content, { ...h, ...(model.jobs.find(j => jobId(j) === h.job_id) || {}), id: h.job_id });
     if (safeImage(h.image) && h.job_id) actions.append(button("保存原图", async () => { const job = await api(`jobs/${encodeURIComponent(h.job_id)}`); if (!safeImage(job.image)) throw new Error("原图不可用"); const a = node("a"); a.href = job.image; a.download = `persona-canvas-${h.job_id}.${job.image.startsWith("data:image/jpeg") ? "jpg" : job.image.startsWith("data:image/webp") ? "webp" : "png"}`; document.body.append(a); a.click(); a.remove(); }));
     content.append(actions); el.append(media, content); container.append(el);
   }
@@ -390,7 +415,7 @@ async function refreshJobs() {
 function bindForm(id, handler) { $(id).addEventListener("submit", event => { event.preventDefault(); const el = $(id).querySelector('[type="submit"]'); run(el, handler); }); $(id).addEventListener("input", () => markDirty(id)); $(id).addEventListener("change", () => markDirty(id)); }
 function bind(id, action) { $(id).addEventListener("click", () => run($(id), action)); }
 function testResult(id, result) {
-  const container = $(id); container.replaceChildren(node("p", result.ok === false ? "danger-text" : "", result.message || `${result.ok === false ? "失败" : "成功"}${result.elapsed_ms != null ? ` · ${result.elapsed_ms} ms` : ""}${result.model ? ` · ${result.model}` : ""}${result.text ? ` · ${result.text}` : ""}`));
+  const container = $(id); container.replaceChildren(node("p", result.ok === false ? "danger-text" : "", result.message || result.error || `${result.ok === false ? "失败" : "成功"}${result.elapsed_ms != null ? ` · ${result.elapsed_ms} ms` : ""}${result.model ? ` · ${result.model}` : ""}${result.text ? ` · ${result.text}` : ""}`));
   if (safeImage(result.image)) { const img = node("img"); img.src = result.image; img.alt = "接口测试图片"; container.append(img); }
   const request = requestDetail(result); if (request) container.append(request);
   if (!request && result.effective_timeout_sec != null) container.append(node("p", "muted", `有效生成超时：${result.effective_timeout_sec} 秒。`));
@@ -433,11 +458,12 @@ $("p-reference-file").addEventListener("change", async event => {
 });
 bind("new-provider", async () => { if (await canReplace("provider-form")) fillProvider({ name: "", kind: "openai", extra_body: {} }); });
 bind("restore-provider", async () => fillProvider(model.providers.find(p => p.name === selection.provider?.name) || selection.provider || { kind: "openai" }));
+bind("reset-provider-options", async () => { set("v-options", ""); markDirty("provider-form"); notice("已选择恢复默认参数映射，请保存接口使其生效。"); });
 bindForm("provider-form", async () => { const saved = await api("providers", "POST", readProvider()); selection.provider = saved; set("v-key", ""); markDirty("provider-form", false); await reload(); notice("绘画接口已保存"); });
 bind("delete-provider", async () => { if (await confirmAction("删除绘画接口？", "已保存密钥也会移除。请确保保留至少一个可用接口。")) { await api("providers/delete", "POST", { name: selection.provider.name }); selection.provider = null; markDirty("provider-form", false); await reload(); notice("绘画接口已删除"); } });
 bind("list-image-models", async () => { const result = await api("image/models", "POST", { name: await savedProvider() }); const models = result.models || result.items || []; $("image-model-options").replaceChildren(...models.map(m => { const el = node("option"); el.value = typeof m === "string" ? m : m.id || m.name; return el; })); testResult("provider-test-result", { ok: true, message: result.note || result.message || `已读取 ${models.length} 个模型${result.automatic === false ? "；这些是建议项，以测试结果为准" : ""}。可从模型输入框选择或手动填写。` }); });
 bind("test-image-connection", async () => { const result = await api("image/test", "POST", { name: await savedProvider(), generate_image: false }); testResult("provider-test-result", result); });
-bind("test-image-generation", async () => { const name = await savedProvider(); setText("provider-test-result", "正在生成小图，接口可能需要一段时间…"); const result = await api("image/test", "POST", { name, generate_image: true }); testResult("provider-test-result", result); });
+bind("test-image-generation", async () => { const name = await savedProvider(); setText("provider-test-result", "正在生成测试图，接口可能需要一段时间…"); try { const result = await api("image/test", "POST", { name, generate_image: true }); testResult("provider-test-result", result); } catch (error) { testResult("provider-test-result", { ok: false, error: error.message || "测试图请求失败" }); throw error; } });
 bind("refresh-llm", async () => { await loadLlm(); notice("已读取 AstrBot 聊天 Provider 和人格"); }); $("l-provider").addEventListener("change", renderLlmModels);
 bindForm("llm-form", async () => { await api("settings", "POST", { llm: { provider_id: value("l-provider"), model: value("l-model"), fallback_to_current: check("l-fallback"), timeout_sec: num("l-timeout") } }); markDirty("llm-form", false); await reload(); notice("动作判断模型设置已保存"); });
 bind("restore-llm", async () => fillLlm()); bind("test-llm", async () => { setText("llm-test-result", "正在测试…"); testResult("llm-test-result", await api("llm/test", "POST", { provider_id: value("l-provider"), model: value("l-model") })); });
@@ -445,13 +471,13 @@ bindForm("generate-form", async () => { const result = await api("generate", "PO
 bind("use-persona-reference", async () => { const p = model.personas.find(x => x.id === value("g-persona")); if (!p?.reference_asset) throw new Error("所选人设没有保存参考图，请在人设工作台上传并保存"); set("g-reference", ""); markDirty("generate-form"); notice(`已使用人设参考图库，共 ${p.reference_assets?.length || 1} 张；实际使用数量取决于接口。`); });
 bind("refresh-jobs", refreshJobs);
 bindForm("simulate-form", async () => { setText("simulate-result", "正在读取角色判断…"); const result = await api("simulate", "POST", { text: value("s-text"), umo: value("s-umo"), persona_id: value("s-persona"), execute: false }); setText("simulate-result", JSON.stringify(result, null, 2)); });
-bindForm("active-form", async () => { await api("settings", "POST", { active: { enabled: check("a-enabled"), timezone: value("a-timezone"), default_start: value("a-start"), default_end: value("a-end"), check_interval_sec: num("a-interval"), min_gap_sec: num("a-gap"), min_idle_sec: num("a-idle"), silence_after: num("a-silence"), silence_hours: num("a-silence-hours"), jitter_percent: num("a-jitter") }, proactive_budget: { messages: num("b-messages"), photos: num("b-photos"), llm: num("b-llm"), timezone: value("b-timezone") }, good_morning: { enabled: check("m-enabled"), timezone: value("m-timezone"), start: value("m-start"), end: value("m-end") } }); markDirty("active-form", false); await reload(); notice("主动消息策略已保存"); });
+bindForm("active-form", async () => { await api("settings", "POST", { active: { enabled: check("a-enabled"), timezone: value("a-timezone"), default_start: value("a-start"), default_end: value("a-end"), check_interval_sec: num("a-interval"), min_gap_sec: num("a-gap"), min_idle_sec: num("a-idle"), silence_after: num("a-silence"), silence_hours: num("a-silence-hours"), jitter_percent: num("a-jitter"), max_concurrent_targets: num("a-concurrency") }, proactive_budget: { messages: num("b-messages"), photos: num("b-photos"), llm: num("b-llm"), timezone: value("b-timezone") }, good_morning: { enabled: check("m-enabled"), timezone: value("m-timezone"), start: value("m-start"), end: value("m-end") } }); markDirty("active-form", false); await reload(); notice("主动消息策略已保存"); });
 bind("restore-active", async () => fillActive()); bind("restore-target", async () => fillTarget(model.targets.find(t => t.umo === selection.target?.umo) || selection.target || {}));
 bindForm("target-form", async () => { const umo = value("t-umo"), patch = readTarget(); await api("targets", "POST", { action: "save", umo, patch, ...patch }); selection.target = { umo }; markDirty("target-form", false); await reload(); notice("会话目标已保存"); });
 bind("test-target", async () => { const umo = value("t-umo"); if (!model.targets.some(t => t.umo === umo)) throw new Error("请先保存目标会话"); if (await confirmAction("发送测试消息？", `这会向会话 ${umo} 立即发送一条测试消息。`)) { await api("targets", "POST", { action: "test", umo }); setText("target-test-result", "测试消息已发送，请在目标会话中查看。"); } });
 bind("delete-target", async () => { if (await confirmAction("移除这个目标？", "移除后不会再向该会话发送主动消息；再次收到私聊消息时可重新发现它。")) { await api("targets", "POST", { action: "remove", umo: value("t-umo") }); selection.target = null; markDirty("target-form", false); await reload(); notice("主动目标已移除"); } });
 bind("refresh-diagnostics", async () => { model.diagnostics = await api("diagnostics"); renderDiagnostics(); }); $("diagnostic-filter").addEventListener("input", renderDiagnostics);
-bind("reload-history", async () => { model.history = (await api("history")).items || []; model.history.sort((a, b) => (b.at || 0) - (a.at || 0)); renderHistory(); }); $("history-filter").addEventListener("change", renderHistory);
+bind("reload-history", refreshJobs); $("history-filter").addEventListener("change", renderHistory);
 bindForm("settings-form", async () => { await api("settings", "POST", { integration: { enabled: check("c-enabled"), mode: value("c-mode"), strict_trigger: true }, dialogue: { timeout_sec: num("c-timeout"), context_turns: num("c-context"), confirmation_ttl_sec: num("c-confirmation") }, state_lifetimes: Object.fromEntries(["outfit", "pose", "expression", "scene"].map(key => [key + "_sec", num(`s-${key}-life`)])), moderation: { enabled: check("q-enabled"), daily_limit: num("q-daily"), min_interval_sec: num("q-interval"), max_concurrency: num("q-concurrency"), timezone: value("q-timezone") }, generation: { width: num("d-width"), height: num("d-height"), steps: num("d-steps"), scale: num("d-scale"), sampler: value("d-sampler"), seed: num("d-seed"), max_history: num("d-history"), max_concurrency: num("d-concurrency"), timeout_sec: num("d-timeout") } }); markDirty("settings-form", false); await reload(); notice("运行设置已保存"); });
 bind("restore-settings", async () => fillSettings());
 bind("export-data", async () => { const data = await api("export"), blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }), url = URL.createObjectURL(blob), a = node("a"); a.href = url; a.download = `persona-canvas-backup-${new Date().toISOString().slice(0, 10)}.json`; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); notice("安全备份已导出，密钥不包含在其中。"); });

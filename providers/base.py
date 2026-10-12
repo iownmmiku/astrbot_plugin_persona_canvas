@@ -221,6 +221,7 @@ class ImageProvider:
             return None
         mode = self.capabilities.negative_mode
         self.last_request = {
+            "submitted": True,
             "prompt": safe(str(prompt)),
             "negative_prompt": safe(str(negative or "")) if negative_field else "",
             "negative_mode": mode,

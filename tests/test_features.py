@@ -230,7 +230,7 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.store.settings["good_morning"]["enabled"] = True
         self.store.settings["proactive_budget"].update(messages=1, llm=10, photos=0)
         self.context.llm.next = {"decision": "chat", "reply": "早安，想接着聊昨天的电影。"}
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.llm.calls), 1)
         self.assertEqual(len(self.context.sent), 1)
         summary = self.store.budget_summary(self.store.settings["proactive_budget"])
@@ -240,7 +240,7 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertIn("只允许文字或skip", self.context.llm.calls[0]["prompt"])
         self.store.settings["good_morning"]["enabled"] = False
         first.update(last_active=0, next_opportunity=0)
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.sent), 1)
 
     async def test_role_skip_consumes_only_model_budget_and_persists_next_opportunity(self):
@@ -248,12 +248,12 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.store.settings["proactive_budget"]["llm"] = 1
         self.context.llm.next = {"decision": "skip", "reply": ""}
         before = time.time()
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertGreaterEqual(target["next_opportunity"], before + 3600)
         self.assertLessEqual(target["next_opportunity"], time.time() + 3600 * 1.15)
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         target["next_opportunity"] = 0
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.llm.calls), 1)
         summary = self.store.budget_summary(self.store.settings["proactive_budget"])
         self.assertEqual(summary["messages"]["used"], 0)
@@ -264,7 +264,7 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         scheduler, target = await self.target()
         self.image_provider.pause = asyncio.Event()
         self.context.llm.next = {"decision": "photo", "reply": "想给你看今天的白裙。", "prompt": "white dress"}
-        running = asyncio.create_task(scheduler.tick())
+        running = asyncio.create_task(scheduler.tick(wait=True))
         await self.wait_for_provider()
         job = self.store.recent_jobs()[0]
         await self.plugin.web_cancel_job({"id": job["id"]})
@@ -273,7 +273,7 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.delivery(job["delivery_key"])["status"], "skipped")
         self.context.llm.next = {"decision": "chat", "reply": "接着聊昨天的电影吧。"}
         target["next_opportunity"] = 0
-        await scheduler.tick()
+        await scheduler.tick(wait=True)
         self.assertEqual(len(self.context.sent), 1)
         self.assertEqual(self.store.budget_summary(self.store.settings["proactive_budget"])["photos"]["used"], 1)
 
@@ -287,7 +287,7 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return await original(**kwargs)
         self.context.llm.text_chat = delayed
-        running = asyncio.create_task(scheduler.tick())
+        running = asyncio.create_task(scheduler.tick(wait=True))
         await asyncio.wait_for(started.wait(), 2)
         self.store.targets["items"].remove(target)
         release.set()

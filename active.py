@@ -13,6 +13,8 @@ class ActiveScheduler:
     def __init__(self, plugin):
         self.plugin = plugin
         self._tick_lock = asyncio.Lock()
+        self._target_tasks = {}
+        self._cursor = 0
 
     def observe(self, event):
         umo = str(event.unified_msg_origin or "")
@@ -83,22 +85,67 @@ class ActiveScheduler:
         jitter = max(0, min(40, int(active.get("jitter_percent", 15)))) / 100
         return now + gap * (1 + random.uniform(0, jitter))
 
-    async def _attempt(self, target, kind, key, now, date=""):
-        # A cancelled photo must stop only this opportunity, not the scheduler.
-        task = self.plugin._spawn(self._deliver(target, kind, key, now, date), "persona-canvas-active-attempt")
-        try:
-            await task
-        except asyncio.CancelledError:
-            if asyncio.current_task().cancelling():
-                raise
+    @staticmethod
+    def _interrupted_status(state, job):
+        # The send operation owns the delivery outcome. Keep a retained image
+        # out of automatic generation retries, including when cancellation
+        # arrives after the platform send has already started.
+        outcomes = {state.get("status"), job.get("status")}
+        if "uncertain" in outcomes:
+            return "uncertain"
+        if "delivery_failed" in outcomes:
+            return "delivery_failed"
+        if "sending" in outcomes:
+            return "uncertain"
+        return "skipped" if job.get("cancel_requested") else "failed"
 
-    async def tick(self):
+    async def _attempt(self, target, kind, key, now, date=""):
+        try:
+            if self._still_allowed(target, kind):
+                await self._deliver(target, kind, key, now, date)
+        except asyncio.CancelledError:
+            # The task belongs to one target; cancelling its photo does not
+            # cancel a scheduler tick or any other target's opportunity.
+            raise
+        except Exception as exc:
+            target["last_error"] = self.plugin._error(exc)
+            self.plugin.storage.save_targets()
+
+    def _start_attempt(self, target, kind, key, now, date=""):
+        umo = target["umo"]
+        task = self.plugin._spawn(self._attempt(target, kind, key, now, date), "persona-canvas-active-attempt")
+        self._target_tasks[umo] = task
+        def release(completed):
+            if self._target_tasks.get(umo) is completed:
+                self._target_tasks.pop(umo, None)
+        task.add_done_callback(release)
+        return task
+
+    async def tick(self, *, wait=False):
+        """Dispatch bounded per-target work without waiting in the tick lock.
+
+        ``wait`` is useful for a one-shot check; the background scheduler keeps
+        dispatching while slow deliveries are still running. Generation itself
+        continues to use the plugin's shared image-generation slots and budgets.
+        """
+        started = []
         async with self._tick_lock:
             settings = self.plugin.storage.settings
-            if not settings["integration"].get("enabled", True):
+            if getattr(self.plugin, "_closing", False) or not settings["integration"].get("enabled", True):
                 return
             now = time.time()
-            for target in list(self.plugin.storage.targets["items"]):
+            self._target_tasks = {umo: task for umo, task in self._target_tasks.items() if not task.done()}
+            capacity = max(1, min(16, int(settings["active"].get("max_concurrent_targets", 3))))
+            targets = list(self.plugin.storage.targets["items"])
+            count = len(targets)
+            offset = self._cursor % count if count else 0
+            for index in range(count):
+                if len(self._target_tasks) >= capacity:
+                    break
+                position = (offset + index) % count
+                target = targets[position]
+                if target.get("umo") in self._target_tasks:
+                    continue
                 if self._blocked(target, now):
                     continue
                 try:
@@ -106,22 +153,27 @@ class ActiveScheduler:
                     timezone = str(target.get("timezone") or morning.get("timezone", "Asia/Shanghai"))
                     if morning.get("enabled") and target.get("morning_enabled", True) and self._in_window(target.get("morning_start") or morning["start"], target.get("morning_end") or morning["end"], timezone):
                         date = datetime.now(ZoneInfo(timezone)).date().isoformat()
-                        await self._attempt(target, "morning", f"morning:{target['umo']}:{date}", now, date)
+                        started.append(self._start_attempt(target, "morning", f"morning:{target['umo']}:{date}", now, date))
+                        self._cursor = (position + 1) % count
                     elif active.get("enabled") and self._in_window(target.get("start") or active["default_start"], target.get("end") or active["default_end"], str(target.get("timezone") or active.get("timezone", "Asia/Shanghai"))):
                         previous = self.plugin.storage.delivery(target.get("active_delivery_key", ""))
                         retry = previous and previous.get("status") == "failed" and int(previous.get("attempts", 0)) < 3
                         if retry:
-                            await self._attempt(target, "active", previous["key"], now)
+                            started.append(self._start_attempt(target, "active", previous["key"], now))
+                            self._cursor = (position + 1) % count
                         elif now >= float(target.get("next_opportunity", 0)):
                             key = f"active:{target['umo']}:{int(now * 1000)}"
                             target.update(active_delivery_key=key, next_opportunity=self._next_opportunity(target, now))
                             self.plugin.storage.save_targets()
-                            await self._attempt(target, "active", key, now)
+                            started.append(self._start_attempt(target, "active", key, now))
+                            self._cursor = (position + 1) % count
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     target["last_error"] = self.plugin._error(exc)
                     self.plugin.storage.save_targets()
+        if wait and started:
+            await asyncio.gather(*started, return_exceptions=True)
 
     async def _deliver(self, target, kind, key, now, date=""):
         storage = self.plugin.storage
@@ -182,6 +234,7 @@ class ActiveScheduler:
                 storage.finish_budget(message_budget, used=True)
                 accepted = await self.plugin.context.send_message(target["umo"], MessageChain().message(decision["reply"]))
                 if accepted is False:
+                    storage.update_delivery(key, {"status": "delivery_failed"})
                     raise ValueError("平台没有接受主动消息")
             storage.update_delivery(key, {"status": "sent"})
             target.update(last_active=time.time(), unanswered=int(target.get("unanswered", 0)) + 1, last_error="", next_opportunity=self._next_opportunity(target, time.time()))
@@ -197,13 +250,12 @@ class ActiveScheduler:
             state = storage.delivery(key) or {}
             job = storage.job(state.get("job_id", "")) or {}
             withdrawn = job.get("cancel_requested")
-            storage.update_delivery(key, {"status": "skipped" if withdrawn else "uncertain" if state.get("status") == "sending" else "failed", "error": "用户撤回拍摄" if withdrawn else "任务被停止", "retry_at": now + 300})
+            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": "用户撤回拍摄" if withdrawn else "任务被停止", "retry_at": now + 300})
             raise
         except Exception as exc:
             state = storage.delivery(key) or {}
-            uncertain = state.get("status") == "sending"
-            storage.update_delivery(key, {"status": "uncertain" if uncertain else "failed", "error": self.plugin._error(exc), "retry_at": time.time() + 300})
             job = storage.job(state.get("job_id", "")) or {}
+            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": self.plugin._error(exc), "retry_at": time.time() + 300})
             if job and job["status"] in {"queued", "generating"}:
                 self.plugin._photo_note(storage.update_job(job["id"], {"status": "failed", "error": self.plugin._error(exc)}))
             target["last_error"] = self.plugin._error(exc)

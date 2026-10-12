@@ -43,12 +43,12 @@ DEFAULT_SETTINGS = {
     "proactive_budget": {"messages": 10, "photos": 2, "llm": 24, "timezone": "Asia/Shanghai"},
     "providers": {"default": DEFAULT_PROVIDER},
     "moderation": {"enabled": True, "daily_limit": 5, "min_interval_sec": 20, "max_concurrency": 1, "timezone": "Asia/Shanghai"},
-    "active": {"enabled": False, "check_interval_sec": 30, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "min_idle_sec": 1800, "timezone": "Asia/Shanghai", "silence_after": 3, "silence_hours": 24, "jitter_percent": 15},
+    "active": {"enabled": False, "check_interval_sec": 30, "max_concurrent_targets": 3, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "min_idle_sec": 1800, "timezone": "Asia/Shanghai", "silence_after": 3, "silence_hours": 24, "jitter_percent": 15},
     "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai"},
     "generation": {"width": 832, "height": 1216, "steps": 28, "scale": 5, "sampler": "k_euler_ancestral", "seed": -1, "max_history": 100, "max_concurrency": 2, "timeout_sec": 180},
 }
-JOB_STATUSES = frozenset({"queued", "deciding", "generating", "succeeded", "failed", "sending", "sent", "uncertain", "cancelled"})
-DELIVERY_STATUSES = frozenset({"claimed", "decided", "skipped", "generating", "sending", "sent", "failed", "uncertain"})
+JOB_STATUSES = frozenset({"queued", "deciding", "generating", "succeeded", "failed", "sending", "sent", "uncertain", "delivery_failed", "cancelled"})
+DELIVERY_STATUSES = frozenset({"claimed", "decided", "skipped", "generating", "sending", "sent", "failed", "uncertain", "delivery_failed"})
 _LEGACY_FILES = ("personas.json", "settings.json", "targets.json", "history.jsonl", "runtime.json", "webui_token.txt")
 _SECRET_KEYS = frozenset({"api_key", "apikey", "api_token", "authorization", "auth", "auth_key", "auth_token", "auth_value", "access_token", "refresh_token", "bearer_token", "token", "secret", "client_secret", "password", "x_api_key"})
 _ASSET_SUFFIXES = frozenset({"png", "jpg", "jpeg", "webp", "gif", "avif", "bin"})
@@ -549,6 +549,66 @@ class Storage:
                 self._db.rollback()
                 raise
 
+    def claim_job_retry(self, old_job_id: str, new_job_id: str) -> dict[str, Any]:
+        """Atomically select one retry, including jobs without pending consent.
+
+        Reusing a live/completed retry never opens a second provider request.
+        Consent rebinding and the retry pointer commit together so a changed
+        persona or withdrawn request cannot be overwritten by a stale caller.
+        """
+        if not all(isinstance(item, str) and item for item in (old_job_id, new_job_id)) or old_job_id == new_job_id:
+            raise StorageConflictError("重试任务必须对应原来的失败拍摄")
+        reusable = {"queued", "deciding", "generating", "succeeded", "sending", "sent", "uncertain", "delivery_failed"}
+        with self._lock:
+            self._check_open()
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                old, candidate = self.job(old_job_id), self.job(new_job_id)
+                if not old or old.get("status") not in {"failed", "cancelled"} or old.get("cancel_requested"):
+                    raise StorageConflictError("原拍摄不能重试；撤回后需要重新判断")
+                session_key, persona_id = old.get("session_key"), old.get("persona_id")
+                session = self.read_session(session_key) if session_key else None
+                if not session or session.get("persona_id") != persona_id:
+                    raise StorageConflictError("会话角色已经更新，请重新判断拍摄请求")
+                if not candidate or candidate.get("status") != "queued" or candidate.get("session_key") != session_key or candidate.get("persona_id") != persona_id:
+                    raise StorageConflictError("重试任务与原来的拍摄不一致")
+                pending, request_id = session.get("pending"), str(old.get("confirmed_request_id") or "")
+                selected = self.job(str(old.get("retry_job_id") or ""))
+                if selected and selected.get("cancel_requested"):
+                    raise StorageConflictError("已有重试任务已经撤回，请重新判断拍摄请求")
+                if selected and selected.get("status") in reusable and not selected.get("cancel_requested"):
+                    if selected.get("session_key") != session_key or selected.get("persona_id") != persona_id:
+                        raise StorageConflictError("已有重试任务与当前会话不一致")
+                    if pending:
+                        if not request_id or not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo" or pending.get("execution_job_id") != selected["id"]:
+                            raise StorageConflictError("拍摄条件已经更新，请重新确认当前条件")
+                    elif request_id and selected.get("status") not in {"succeeded", "sending", "sent", "uncertain", "delivery_failed"}:
+                        raise StorageConflictError("拍摄条件已经撤回，请重新确认当前条件")
+                    self._db.commit()
+                    return {"claimed": False, "job_id": selected["id"], "job": selected, "session": session}
+                if request_id:
+                    if not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo":
+                        raise StorageConflictError("拍摄条件已经更新或撤回，请重新确认当前条件")
+                elif pending:
+                    raise StorageConflictError("当前有新的拍摄条件，请先处理当前请求")
+                if request_id and pending.get("execution_job_id") != old_job_id:
+                    raise StorageConflictError("原拍摄不能重试；撤回或条件变化后需要重新判断")
+                now = time.time()
+                old.update(retry_job_id=new_job_id, updated_at=now)
+                candidate.update(retry_of=old_job_id, confirmed_request_id=request_id, updated_at=now)
+                for item in (old, candidate):
+                    self._db.execute("UPDATE jobs SET updated_at=?,payload=? WHERE id=?", (now, _json(item), item["id"]))
+                if request_id:
+                    pending["execution_job_id"] = new_job_id
+                    session["revision"] = int(session.get("revision", 0)) + 1
+                    session["updated_at"] = now
+                    self._write_session(session)
+                self._db.commit()
+                return {"claimed": True, "job_id": new_job_id, "job": copy.deepcopy(candidate), "session": copy.deepcopy(session)}
+            except Exception:
+                self._db.rollback()
+                raise
+
     @staticmethod
     def _validate_status(value: dict[str, Any], statuses: frozenset[str]) -> None:
         if value.get("status") not in statuses:
@@ -697,6 +757,11 @@ class Storage:
         return result
 
     def reserve_quota(self, user_key: str, limits: dict[str, Any], is_admin: bool = False) -> tuple[bool, str]:
+        """Compatibility API; new callers should retain the reservation token."""
+        allowed, reason, _token = self.reserve_quota_token(user_key, limits, is_admin=is_admin)
+        return allowed, reason
+
+    def reserve_quota_token(self, user_key: str, limits: dict[str, Any], is_admin: bool = False) -> tuple[bool, str, str | None]:
         user_key = _safe_text(user_key, 1000)
         if not user_key:
             raise StorageError("用户标识不能为空")
@@ -712,7 +777,7 @@ class Storage:
                 self._db.execute("DELETE FROM quota_reservations WHERE expires_at<?", (now,))
                 row = self._db.execute("SELECT successes FROM quota_usage WHERE user_key=? AND day=?", (user_key, day)).fetchone()
                 successes = int(row["successes"]) if row else 0
-                reservations = self._db.execute("SELECT day FROM quota_reservations WHERE user_key=?", (user_key,)).fetchall()
+                reservations = self._db.execute("SELECT day FROM quota_reservations WHERE user_key=? AND is_admin=0", (user_key,)).fetchall()
                 last = self._db.execute("SELECT MAX(last_attempt) FROM quota_usage WHERE user_key=?", (user_key,)).fetchone()[0] or 0
                 reason = ""
                 if enforced and not is_admin and len(reservations) >= concurrency:
@@ -724,25 +789,34 @@ class Storage:
                         reason = f"请求太频繁，请 {int(interval - (now - last)) + 1} 秒后再试。"
                 if reason:
                     self._db.commit()
-                    return False, reason
-                self._db.execute("INSERT INTO quota_usage(user_key,day,successes,last_attempt) VALUES(?,?,0,?) ON CONFLICT(user_key,day) DO UPDATE SET last_attempt=excluded.last_attempt", (user_key, day, now))
-                self._db.execute("INSERT INTO quota_reservations(user_key,day,at,expires_at,is_admin) VALUES(?,?,?,?,?)", (user_key, day, now, now + lease, int(is_admin)))
+                    return False, reason, None
+                if not is_admin:
+                    self._db.execute("INSERT INTO quota_usage(user_key,day,successes,last_attempt) VALUES(?,?,0,?) ON CONFLICT(user_key,day) DO UPDATE SET last_attempt=excluded.last_attempt", (user_key, day, now))
+                cursor = self._db.execute("INSERT INTO quota_reservations(user_key,day,at,expires_at,is_admin) VALUES(?,?,?,?,?)", (user_key, day, now, now + lease, int(is_admin)))
                 self._db.commit()
-                return True, ""
+                return True, "", str(cursor.lastrowid)
             except Exception:
                 self._db.rollback()
                 raise
 
     def finish_quota(self, user_key: str, success: bool = False) -> None:
+        """Compatibility FIFO settlement for callers without a token."""
+        self._finish_quota(user_key=user_key, success=success)
+
+    def finish_quota_token(self, token: str | None, success: bool = False) -> None:
+        if token is not None:
+            self._finish_quota(token=str(token), success=success)
+
+    def _finish_quota(self, *, user_key: str = "", token: str | None = None, success: bool = False) -> None:
         with self._lock:
             self._check_open()
             try:
                 self._db.execute("BEGIN IMMEDIATE")
-                row = self._db.execute("SELECT * FROM quota_reservations WHERE user_key=? ORDER BY id LIMIT 1", (user_key,)).fetchone()
+                row = self._db.execute("SELECT * FROM quota_reservations WHERE id=?", (token,)).fetchone() if token is not None else self._db.execute("SELECT * FROM quota_reservations WHERE user_key=? ORDER BY id LIMIT 1", (user_key,)).fetchone()
                 if row:
                     self._db.execute("DELETE FROM quota_reservations WHERE id=?", (row["id"],))
                     if success and not row["is_admin"]:
-                        self._db.execute("UPDATE quota_usage SET successes=successes+1 WHERE user_key=? AND day=?", (user_key, row["day"]))
+                        self._db.execute("UPDATE quota_usage SET successes=successes+1 WHERE user_key=? AND day=?", (row["user_key"], row["day"]))
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -802,7 +876,7 @@ class Storage:
             rows = self._db.execute("SELECT id,payload FROM history ORDER BY id DESC LIMIT -1 OFFSET ?", (limit,)).fetchall()
             deleted = [_decoded(row["payload"], "history") for row in rows]
             now = time.time()
-            delivery_rows = self._db.execute("SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain')", (now - 30 * 86400,)).fetchall()
+            delivery_rows = self._db.execute("SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain','delivery_failed')", (now - 30 * 86400,)).fetchall()
             expired_delivery_keys = {row["key"] for row in delivery_rows}
             protected_jobs = set()
             for row in self._db.execute("SELECT key,payload FROM deliveries"):
@@ -814,7 +888,7 @@ class Storage:
                 pending = _decoded(row["payload"], "session").get("pending") or {}
                 if isinstance(pending, dict) and pending.get("execution_job_id") and self._timestamp(pending.get("expires_at")) > now:
                     protected_jobs.add(str(pending["execution_job_id"]))
-            finished = self._db.execute("SELECT id,status,updated_at,payload FROM jobs WHERE status IN ('succeeded','failed','sent','uncertain','cancelled') ORDER BY updated_at DESC,rowid DESC").fetchall()
+            finished = self._db.execute("SELECT id,status,updated_at,payload FROM jobs WHERE status IN ('succeeded','failed','sent','uncertain','delivery_failed','cancelled') ORDER BY updated_at DESC,rowid DESC").fetchall()
             eligible_finished = []
             for row in finished:
                 value = _decoded(row["payload"], "job")

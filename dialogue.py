@@ -110,10 +110,13 @@ class Dialogue:
     async def remember(self, env: dict, user_text: str, reply: str):
         manager = getattr(self.context, "conversation_manager", None)
         if not manager or not env.get("cid"):
-            session = self.storage.session(env["key"], env["persona"]["id"])
+            session = self.storage.read_session(env["key"])
+            expected = env.get("session") or {}
+            if not session or session.get("persona_id") != env["persona"]["id"] or session.get("revision", 0) != expected.get("revision", 0):
+                return
             turns = int(self.storage.settings["dialogue"].get("context_turns", 12))
             session["last_context"] = ((session.get("last_context") or []) + [{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])[-turns * 2:]
-            self.storage.save_session(env["key"], session)
+            env["session"] = self.storage.save_session(env["key"], session)
             return
         if hasattr(manager, "add_message_pair"):
             await maybe_await(manager.add_message_pair(env["cid"], {"role": "user", "content": user_text}, {"role": "assistant", "content": reply}))

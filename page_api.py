@@ -21,7 +21,7 @@ GET_ROUTES = {
     "jobs": "web_jobs", "llm/providers": "_llm_providers", "export": "web_export",
 }
 POST_ROUTES = {
-    "jobs/cancel": "web_cancel_job",
+    "jobs/cancel": "web_cancel_job", "jobs/resend": "web_resend_job",
     "settings": "web_save_settings", "personas": "web_save_persona",
     "personas/delete": "web_delete_persona", "providers": "web_save_provider",
     "providers/delete": "web_delete_provider", "targets": "web_target_action",
