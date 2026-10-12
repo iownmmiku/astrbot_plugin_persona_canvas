@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import io
 import json
+import math
 import re
 import time
 from contextlib import asynccontextmanager
@@ -21,15 +22,35 @@ from .intent import Intent, message_text, photo_request, prompt_bundle, state_pa
 from .moderation import Moderation
 from .page_api import CanvasPageApi, image_data_url
 from .providers.base import ProviderCapabilities, ProviderError, provider_from_config
-from .storage import Storage
+from .reply_images import ReplyImages
+from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 
 
 class DeliveryRejectedError(ValueError):
     """The platform explicitly rejected a saved image, so it may be resent."""
+
+
+def _restore_workflow_secrets(value, previous):
+    """Round-trip the redacted editor without deleting stored node credentials."""
+    if isinstance(value, list):
+        old = previous if isinstance(previous, list) else []
+        return [_restore_workflow_secrets(item, old[i] if i < len(old) else None) for i, item in enumerate(value)]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    old = previous if isinstance(previous, dict) else {}
+    restored = {key: _restore_workflow_secrets(item, old.get(key)) for key, item in value.items()}
+    for key, secret in old.items():
+        if _secret_key(key):
+            marker = "has_" + str(key).lower().replace("-", "_")
+            if marker in value and isinstance(value[marker], bool):
+                if key not in value:
+                    restored[key] = copy.deepcopy(secret)
+                restored.pop(marker, None)
+    return restored
 
 
 def _text(event):
@@ -59,6 +80,7 @@ class PersonaCanvasPlugin(Star):
         self.storage = Storage()
         self.dialogue = Dialogue(context, self.storage)
         self.moderation = Moderation(self.storage.settings, self.storage)
+        self.reply_images = ReplyImages(self)
         self.page_api = CanvasPageApi(self)
         self.webui = None
         self.active = None
@@ -204,7 +226,12 @@ class PersonaCanvasPlugin(Star):
                 self.storage.update_job(job["id"], {"status": "uncertain", "error": "重启前正在发送，结果不确定，请先检查聊天记录"})
                 self._photo_note(self.storage.job(job["id"]))
         for delivery in self.storage.export().get("deliveries", []):
-            if delivery.get("status") in {"claimed", "decided", "generating"}:
+            if delivery.get("kind") == "reply_image":
+                if delivery.get("attached"):
+                    self.storage.update_delivery(delivery["key"], {"status": "uncertain", "error": "重启前图片已附加回复链，平台发送结果未知，不自动重发"})
+                elif delivery.get("status") in {"claimed", "decided", "generating"}:
+                    self.storage.update_delivery(delivery["key"], {"status": "skipped", "error": "重启前配图尚未附加，不自动补图"})
+            elif delivery.get("status") in {"claimed", "decided", "generating"}:
                 self.storage.update_delivery(delivery["key"], {"status": "failed", "error": "重启中断，尚未发送，将有限重试", "retry_at": time.time() + 300})
             elif delivery.get("status") == "sending":
                 self.storage.update_delivery(delivery["key"], {"status": "uncertain", "error": "重启前正在发送，请先检查聊天记录"})
@@ -358,6 +385,7 @@ class PersonaCanvasPlugin(Star):
 
     @filter.on_llm_request()
     async def inject_visual_state(self, event: AstrMessageEvent, req):
+        self.reply_images.observe(event)
         if not self.storage.settings["integration"].get("enabled", True):
             return
         env = await self.dialogue.environment(event.unified_msg_origin, conversation=getattr(req, "conversation", None))
@@ -406,6 +434,10 @@ class PersonaCanvasPlugin(Star):
             self._save_conditions(env, _text(event), text, infer_requirements(text), "photo" if self._eligible(_text(event), env) else "state")
         elif not pending and re.search(r"(?:给你|发你|给你看|要不要)[^。！？\n]{0,20}(?:照片|自拍|拍一张)", text) and re.search(r"可以吗|好吗|要不要|想看吗|好不好", text):
             self._save_conditions(env, "角色主动提议拍照，等待用户确认", text, infer_requirements(text))
+
+    @filter.on_decorating_result()
+    async def decorate_reply_image(self, event: AstrMessageEvent):
+        await self.reply_images.decorate(event)
 
     @filter.llm_tool(name="persona_canvas_conditions")
     async def tool_conditions(self, event: AstrMessageEvent, reply: str, request_kind: str = "photo", outfit: str = "", camera: str = "", pose: str = "", expression: str = "", scene: str = "", avoid: str = "", request_summary: str = ""):
@@ -676,7 +708,7 @@ class PersonaCanvasPlugin(Star):
     def _request_summary(self, provider, positive, negative, options, count, reference_source):
         provider_timeout, task_timeout, effective = self._timeouts(provider, options)
         actual = getattr(provider, "last_request", {}) or {}
-        allowed = {"prompt", "negative_prompt", "negative_mode", "negative_prompt_field", "negative_source", "model", "options", "reference_count", "provider_timeout_sec", "notes", "submitted"}
+        allowed = {"prompt", "negative_prompt", "negative_mode", "negative_prompt_field", "negative_source", "model", "options", "reference_count", "provider_timeout_sec", "notes", "submitted", "workflow_prompt_id", "output_node"}
         summary = {k: copy.deepcopy(v) for k, v in actual.items() if k in allowed}
         if not summary:
             summary = {"submitted": False, "prompt": positive, "negative_prompt": negative if provider.capabilities.negative_prompt else "", "negative_mode": getattr(provider.capabilities, "negative_mode", "disabled"), "model": getattr(provider, "config", {}).get("model", ""), "reference_count": count, "notes": "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准"}
@@ -716,8 +748,9 @@ class PersonaCanvasPlugin(Star):
         if job_id:
             self.storage.update_job(job_id, {"preparation_stage": "provider"})
         provider = self._provider(provider_name)
-        if source in {"active", "morning"} and not getattr(provider.capabilities, "automated_generation", True):
-            raise ValueError("此生图接口要求人工发起生成，不能用于定时主动照片；请选择支持自动生成的接口")
+        explicit_retry = bool(job_id and (self.storage.job(job_id) or {}).get("retry_of"))
+        if source in {"active", "morning", "reply_image"} and not explicit_retry and not getattr(provider.capabilities, "automated_generation", True):
+            raise ValueError("此生图接口要求人工发起生成，不能用于定时主动照片或对话随机配图；请选择支持自动生成的接口")
         reference_names = env.get("approved_reference_assets") or ([reference_asset] if reference_asset else (list(dict.fromkeys(([persona["reference_asset"]] if persona.get("reference_asset") else []) + persona.get("reference_assets", []))) if persona.get("reference_enabled") and mode == "persona" else []))
         reference_limit = int(getattr(provider.capabilities, "max_reference_images", 1))
         reference_warning = f"接口单次支持 {reference_limit} 张参考图，使用列表中前 {reference_limit} 张" if len(reference_names) > reference_limit else ""
@@ -780,7 +813,7 @@ class PersonaCanvasPlugin(Star):
                 success = True
                 async with self._lock(env["key"]):
                     session = self.storage.read_session(env["key"])
-                    state_committed = bool(session and session.get("persona_id") == persona["id"] and session.get("revision", 0) == env["session"].get("revision", 0))
+                    state_committed = bool(source != "reply_image" and session and session.get("persona_id") == persona["id"] and session.get("revision", 0) == env["session"].get("revision", 0))
                     if state_committed:
                         if mode == "persona":
                             apply_state(session, patch, self.storage.settings)
@@ -789,7 +822,7 @@ class PersonaCanvasPlugin(Star):
                         session = self.storage.save_session(env["key"], session)
                         env["session"] = session
                 job = self.storage.update_job(job["id"], {"status": "succeeded", "failure_stage": "", "asset": asset.name, "model": result.model, "state_after": (session or {}).get("state", {}), "state_committed": state_committed, "elapsed_ms": int((time.time() - job.get("at", time.time())) * 1000)})
-                job = self._trace_job(job["id"], "generation", detail="图片已验证并保存；" + ("状态已提交" if state_committed else "较新状态保留，未覆盖"))
+                job = self._trace_job(job["id"], "generation", detail="图片已验证并保存；" + ("对话配图不修改持续视觉状态" if source == "reply_image" else "状态已提交" if state_committed else "较新状态保留，未覆盖"))
                 self._photo_note(job)
                 self.storage.append_history({"ok": True, "job_id": job["id"], "image": "/assets/" + asset.name, "caption": caption, "prompt": positive, "negative_prompt": negative, "request_summary": job["request_summary"], "state_patch": patch, "requirements": agreed, "reference_source": reference_source, "trace": job["trace"], "provider": provider.name, "model": result.model, "mode": mode})
                 self.storage.cleanup_history(int(options.get("max_history", 100)))
@@ -979,8 +1012,9 @@ class PersonaCanvasPlugin(Star):
         else:
             yield event.plain_result("请在 AstrBot WebUI 的插件详情中打开“随想画卷”。如需旧版独立页面，可开启兼容 WebUI 后重载。")
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def observe_private(self, event: AstrMessageEvent):
+        self.reply_images.observe(event)
         if self.active:
             self.active.observe(event)
 
@@ -1106,13 +1140,15 @@ class PersonaCanvasPlugin(Star):
         name = str(body.get("name") or "").strip()
         if not re.fullmatch(r"[\w.-]{1,80}", name):
             raise ValueError("接口名称请使用字母、数字、汉字、点、下划线或短横线")
-        allowed = {"kind", "endpoint", "model", "api_key", "auth_header", "auth_prefix", "supports_image_edit", "supports_seed", "negative_prompt", "negative_mode", "extra_body", "response_path", "timeout", "allow_image_urls", "allowed_image_hosts", "generation_path", "edit_path", "models_path", "connection_path", "connection_method", "prompt_field", "model_field", "negative_prompt_field", "reference_field", "reference_format", "reference_mime_field", "option_fields", "models_response_path", "supports_sampler", "supported_sizes", "params_version", "strength", "noise"}
+        allowed = {"kind", "endpoint", "model", "api_key", "auth_header", "auth_prefix", "supports_image_edit", "supports_seed", "negative_prompt", "negative_mode", "extra_body", "response_path", "timeout", "allow_image_urls", "allowed_image_hosts", "generation_path", "edit_path", "models_path", "connection_path", "connection_method", "prompt_field", "model_field", "negative_prompt_field", "reference_field", "reference_format", "reference_mime_field", "option_fields", "models_response_path", "supports_sampler", "supported_sizes", "params_version", "strength", "noise", "workflow", "workflow_fields", "output_node"}
         patch = {k: v for k, v in body.items() if k in allowed and (k != "api_key" or v)}
-        if patch.get("kind", "openai") not in {"openai", "gemini", "novelai", "custom"}:
+        if patch.get("kind", "openai") not in {"openai", "gemini", "novelai", "custom", "comfyui"}:
             raise ValueError("接口类型无效")
         if "extra_body" in patch and not isinstance(patch["extra_body"], dict):
             raise ValueError("额外参数必须为 JSON 对象")
         old = self.storage.settings["providers"].get(name, {})
+        if "workflow" in patch and isinstance(patch["workflow"], dict):
+            patch["workflow"] = _restore_workflow_secrets(patch["workflow"], old.get("workflow"))
         candidate = {**old, **patch, "name": name}
         if "reset_option_fields" in body and not isinstance(body["reset_option_fields"], bool):
             raise ValueError("reset_option_fields 必须为开关值")
@@ -1137,6 +1173,8 @@ class PersonaCanvasPlugin(Star):
         del providers[name]
         if self.storage.settings["default_provider"] == name:
             self.storage.settings["default_provider"] = next(iter(providers))
+        if self.storage.settings["reply_images"].get("provider") == name:
+            self.storage.settings["reply_images"]["provider"] = ""
         self.storage.save_settings()
         return await self.web_providers()
 
@@ -1144,7 +1182,9 @@ class PersonaCanvasPlugin(Star):
         ranges = {"daily_limit": (0, 10000), "min_interval_sec": (0, 86400), "max_concurrency": (1, 16), "width": (64, 4096), "height": (64, 4096), "steps": (1, 150), "scale": (0, 30), "seed": (-1, 4294967295), "max_history": (1, 5000), "timeout_sec": (5, 300), "context_turns": (1, 100), "confirmation_ttl_sec": (30, 86400), "check_interval_sec": (15, 3600), "min_gap_sec": (60, 604800), "min_idle_sec": (0, 604800), "silence_after": (1, 100), "silence_hours": (1, 720)}
         ranges.update({"outfit_sec": (0, 2592000), "pose_sec": (0, 604800), "expression_sec": (0, 604800), "scene_sec": (0, 2592000), "messages": (0, 10000), "photos": (0, 10000), "llm": (0, 10000), "jitter_percent": (0, 40)})
         ranges["max_concurrent_targets"] = (1, 16)
-        allowed_groups = {"integration", "dialogue", "llm", "moderation", "generation", "active", "good_morning", "state_lifetimes", "proactive_budget"}
+        ranges["min_interval_sec"] = (0, 86400)
+        ranges["default_probability"] = (0, 100)
+        allowed_groups = {"integration", "dialogue", "reply_images", "llm", "moderation", "generation", "active", "good_morning", "state_lifetimes", "proactive_budget"}
         candidate = copy.deepcopy(self.storage.settings)
         for group, patch in body.items():
             if group not in allowed_groups or not isinstance(patch, dict):
@@ -1156,8 +1196,10 @@ class PersonaCanvasPlugin(Star):
                     low, high = ranges[key]
                     if key == "timeout_sec" and group == "generation":
                         high = 600
-                    value = float(value) if key == "scale" else int(value)
-                    if not low <= value <= high:
+                    if isinstance(value, bool):
+                        raise ValueError(f"{key} 必须为数值")
+                    value = float(value) if key in {"scale", "default_probability"} else int(value)
+                    if not math.isfinite(value) or not low <= value <= high:
                         raise ValueError(f"{key} 应在 {low} 到 {high} 之间")
                 elif isinstance(candidate[group][key], bool):
                     if not isinstance(value, bool):
@@ -1170,6 +1212,9 @@ class PersonaCanvasPlugin(Star):
                         raise ValueError("时间格式应为 HH:MM")
                 elif key == "mode" and value not in {"native_tools", "compatibility"}:
                     raise ValueError("聊天接入模式无效")
+                elif group == "reply_images" and key == "provider":
+                    if not isinstance(value, str) or (value and value not in candidate["providers"]):
+                        raise ValueError("配图接口不存在，请重新选择")
                 candidate[group][key] = value
         candidate["integration"]["strict_trigger"] = True
         for key, section in (("current_persona", self.storage.personas["items"]), ("default_provider", self.storage.settings["providers"])):
@@ -1206,7 +1251,7 @@ class PersonaCanvasPlugin(Star):
             raise ValueError("角色决策与场景模式不一致，请明确要求普通场景绘图")
         options = {k: body[k] for k in ("width", "height", "steps", "scale", "seed", "sampler", "aspect_ratio", "image_size", "timeout_sec") if body.get(k) is not None}
         options["_explicit"] = [key for key in body.get("_explicit", list(options)) if key in options]
-        source = "chat" if event else "webui"
+        source = "reply_image" if retry_old and retry_old.get("source") == "reply_image" else "chat" if event else "webui"
         reference = str(body.get("reference_asset") or (env["session"].get("last_image") if mode == "edit" else "") or "")
         reference_source = str(body.get("reference_source") or ("explicit_reference" if reference else "persona" if mode == "persona" else "none"))
         job = self.storage.create_job({"status": "queued", "source": source, "raw": text, "caption": decision["reply"], "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "reference_asset": reference, "reference_assets": env.get("approved_reference_assets", []), "reference_source": reference_source, "request_basis": env.get("request_basis", {})})
@@ -1331,7 +1376,7 @@ class PersonaCanvasPlugin(Star):
         persona["state"] = copy.deepcopy(session["state"])
         env = {"umo": old["umo"], "key": old["session_key"], "persona": persona, "session": session, "approved_requirements": old.get("requirements", {}), "approved_reference_assets": old.get("reference_assets", []), "request_basis": {"source": "model_tool" if event else "webui_retry", "summary": "用户明确重试失败任务 " + old["id"]}}
         decision = {"decision": {"persona": "photo", "scene": "scene", "edit": "edit"}[old["mode"]], "prompt": old["request_prompt"], "reply": old["caption"], "state_patch": old["state_patch"]}
-        result = await self._queue_job(env, decision, old["raw"], {**old["options"], "reference_asset": old["reference_asset"], "reference_source": old.get("reference_source", "explicit_reference"), "provider": old["provider"], "mode": old["mode"]}, event=event, retry_old=old)
+        result = await self._queue_job(env, decision, old["raw"], {**old.get("options", {}), "reference_asset": old.get("reference_asset", ""), "reference_source": old.get("reference_source", "explicit_reference"), "provider": old.get("provider", ""), "mode": old["mode"]}, event=event, retry_old=old)
         return result
 
     async def web_cancel_job(self, body):
@@ -1343,7 +1388,7 @@ class PersonaCanvasPlugin(Star):
         default = settings["providers"].get(settings["default_provider"], {})
         steps = [
             {"name": "聊天模型", "ok": (self.context.get_provider_by_id(selected) is not None if selected else settings["llm"].get("fallback_to_current", True)), "message": "沿用会话聊天模型，使用测试 LLM 验证" if not selected else selected + ("；不存在时允许回退" if settings["llm"].get("fallback_to_current", True) else "；禁用回退"), "page": "providers"},
-            {"name": "绘画接口", "ok": bool(default.get("endpoint") and default.get("model") and not self._provider_status()[1]), "message": "已配置地址和模型；连接与测试图需主动验证", "page": "providers"},
+            {"name": "绘画接口", "ok": bool(default.get("endpoint") and (default.get("workflow") if default.get("kind") == "comfyui" else default.get("model")) and not self._provider_status()[1]), "message": "检查地址与模型 / API 工作流；连接与测试图需主动验证", "page": "providers"},
             {"name": "角色外观", "ok": bool(self.storage.persona().get("positive_prompt") or self.storage.persona().get("reference_asset")), "message": "填写固定外观或上传角色参考图", "page": "persona"},
             {"name": "工具启用", "ok": None, "message": "原生模式需在 AstrBot 允许 state、photo、conditions、control 四个工具；兼容模式不需要工具调用", "page": "settings"},
         ]
@@ -1372,28 +1417,38 @@ class PersonaCanvasPlugin(Star):
         action, umo = str(body.get("action") or ""), str(body.get("umo") or "")
         target = next((t for t in self.storage.targets["items"] if t.get("umo") == umo), None)
         if not target:
-            raise ValueError("目标会话不存在，请先在私聊中发送一条消息")
+            raise ValueError("目标会话不存在，请先在对应私聊或群聊中发送一条消息")
         if action == "remove":
             self.storage.targets["items"].remove(target)
         elif action == "toggle":
+            if target.get("scope") == "group":
+                raise ValueError("群聊只支持对话配图，不启用主动联系")
             target["enabled"] = not target.get("enabled", False)
         elif action == "test":
+            if target.get("scope") == "group":
+                raise ValueError("群聊不发送主动测试消息，请通过对话测试配图")
             accepted = await self.context.send_message(umo, MessageChain().message("这是随想画卷的连接测试消息。"))
             if accepted is False:
                 raise ValueError("平台没有接受测试消息")
         elif action == "save":
             patch = body.get("patch") or body
-            allowed = {"enabled", "persona_id", "start", "end", "timezone", "min_gap_sec", "min_idle_sec", "silence_after", "with_image", "morning_enabled", "morning_start", "morning_end"}
+            allowed = {"enabled", "persona_id", "start", "end", "timezone", "min_gap_sec", "min_idle_sec", "silence_after", "with_image", "morning_enabled", "morning_start", "morning_end", "reply_image_enabled", "reply_image_probability"}
             candidate = copy.deepcopy(target)
             for key, value in patch.items():
                 if key in allowed:
-                    if key in {"min_gap_sec", "min_idle_sec", "silence_after"}:
+                    if key == "reply_image_probability":
+                        if isinstance(value, bool):
+                            raise ValueError("配图概率必须为 0–100 的数值")
+                        value = float(value)
+                        if not math.isfinite(value) or not 0 <= value <= 100:
+                            raise ValueError("配图概率必须在 0–100% 之间")
+                    elif key in {"min_gap_sec", "min_idle_sec", "silence_after"}:
                         value = int(value)
                         if value < (1 if key == "silence_after" else 0):
                             raise ValueError("间隔和未回复次数不能为负数")
                     elif key in {"start", "end", "morning_start", "morning_end"} and value and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(value)):
                         raise ValueError("时间格式应为 HH:MM")
-                    elif key in {"enabled", "with_image", "morning_enabled"} and not isinstance(value, bool):
+                    elif key in {"enabled", "with_image", "morning_enabled", "reply_image_enabled"} and not isinstance(value, bool):
                         raise ValueError("目标开关必须为布尔值")
                     elif key == "timezone" and value:
                         from zoneinfo import ZoneInfo
@@ -1401,6 +1456,8 @@ class PersonaCanvasPlugin(Star):
                     elif key == "persona_id" and value and not any(p["id"] == value for p in self.storage.personas["items"]):
                         raise ValueError("绑定的角色不存在")
                     candidate[key] = value
+            if target.get("scope") == "group" and (candidate.get("enabled") or candidate.get("morning_enabled")):
+                raise ValueError("群聊只支持对话配图，不能启用主动联系或早安")
             target.clear()
             target.update(candidate)
         else:

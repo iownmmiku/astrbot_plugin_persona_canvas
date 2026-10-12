@@ -39,6 +39,7 @@ DEFAULT_SETTINGS = {
     "llm": {"provider_id": "", "model": "", "fallback_to_current": True, "timeout_sec": 45},
     "integration": {"enabled": True, "mode": "native_tools", "strict_trigger": True},
     "dialogue": {"enabled": True, "timeout_sec": 60, "context_turns": 12, "confirmation_ttl_sec": 1800},
+    "reply_images": {"enabled": False, "default_probability": 20, "min_interval_sec": 300, "provider": ""},
     "state_lifetimes": {"outfit_sec": 0, "pose_sec": 1800, "expression_sec": 1800, "scene_sec": 14400},
     "proactive_budget": {"messages": 10, "photos": 2, "llm": 24, "timezone": "Asia/Shanghai"},
     "providers": {"default": DEFAULT_PROVIDER},
@@ -313,12 +314,18 @@ class Storage:
         if not isinstance(items, list) or any(not isinstance(item, dict) or not item.get("umo") for item in items):
             raise StorageError("主动消息目标格式无效；原数据已保留")
         result = copy.deepcopy(value)
+        for item in result["items"]:
+            item.setdefault("scope", "group" if ":GroupMessage:" in str(item["umo"]) else "private")
+            item.setdefault("reply_image_enabled", False)
+            item.setdefault("reply_image_probability", 20)
+            if item["scope"] == "group":
+                item["enabled"], item["morning_enabled"] = False, False
         result["version"] = SCHEMA_VERSION
         return result
 
     @staticmethod
     def _validate_settings(value: dict[str, Any]) -> None:
-        for key in ("providers", "llm", "integration", "dialogue", "moderation", "active", "good_morning", "generation", "state_lifetimes", "proactive_budget"):
+        for key in ("providers", "llm", "integration", "dialogue", "reply_images", "moderation", "active", "good_morning", "generation", "state_lifetimes", "proactive_budget"):
             if not isinstance(value.get(key), dict):
                 raise StorageError(f"设置中的 {key} 格式无效；原数据已保留")
         if any(not isinstance(provider, dict) for provider in value["providers"].values()):

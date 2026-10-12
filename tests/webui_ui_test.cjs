@@ -30,8 +30,9 @@ const fixtures = {
     { name: "custom-nested", kind: "custom", endpoint: "https://offline.invalid/generate", model: "custom-model", timeout: 120, negative_prompt: true, negative_prompt_field: "parameters.negative", prompt_field: "input.positive", model_field: "input.model", reference_field: "input.image", reference_format: "base64", reference_mime_field: "input.mime", models_response_path: "models.items", supported_sizes: ["832x1216"], option_fields: { width: "parameters.width", height: "parameters.height", seed: "parameters.seed" }, supports_seed: true, capabilities: { ...capabilities, seed: true, negative_prompt: true, negative_mode: "field", negative_prompt_mode: "自定义独立字段" } },
     { name: "gemini", kind: "gemini", endpoint: "https://offline.invalid", model: "offline-gemini", timeout: 90, capabilities },
     { name: "novelai", kind: "novelai", endpoint: "https://offline.invalid", model: "offline-novelai", timeout: 90, capabilities: { ...capabilities, seed: true, sampler: true, negative_prompt: true, negative_mode: "field", negative_prompt_mode: "原生负面通道" } },
+    { name: "local-comfy", kind: "comfyui", endpoint: "http://127.0.0.1:8188", model: "角色本地工作流", timeout: 180, workflow: { "6": { class_type: "CLIPTextEncode", inputs: { text: "default" } } }, workflow_fields: { prompt: "6.inputs.text" }, capabilities: { ...capabilities, image_to_image: false, negative_mode: "disabled" } },
   ] },
-  targets: { items: [] }, sessions: { items: [] },
+  targets: { items: [{ umo: "offline:FriendMessage:friend", name: "私聊测试", scope: "private", enabled: false, morning_enabled: false, reply_image_enabled: false }, { umo: "offline:GroupMessage:group", name: "群聊测试", scope: "group", enabled: false, morning_enabled: false, reply_image_enabled: false }] }, sessions: { items: [] },
   jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
     { id: "job-delivery-failed", status: "delivery_failed", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
     { id: "job-uncertain", status: "uncertain", caption: "已生成发送待确认", asset: "original-uncertain.png", umo: "offline:FriendMessage:test", created_at: 1725000000 },
@@ -69,6 +70,7 @@ async function main() {
           if (route === "providers") {
             const current = data.providers.items.find(item => item.name === body.name);
             const saved = { ...current, ...body, capabilities: current?.capabilities || { text_to_image: true } };
+            if (saved.kind === "comfyui") saved.capabilities = { ...saved.capabilities, seed: Boolean(saved.workflow_fields?.seed), sampler: ["steps", "scale", "sampler"].some(key => saved.workflow_fields?.[key]), image_to_image: Boolean(saved.workflow_fields?.reference), negative_mode: saved.workflow_fields?.negative_prompt ? "field" : "disabled" };
             if (body.reset_option_fields === true) delete saved.option_fields;
             delete saved.reset_option_fields;
             if (current) { if (body.reset_option_fields === true) delete current.option_fields; Object.assign(current, saved); } else data.providers.items.push(saved);
@@ -86,6 +88,8 @@ async function main() {
             return window.__resendFailure ? { ok: false, error: "离线平台明确拒收" } : { ok: true, message: "原图已补发", job_id: job.id };
           }
           if (route === "settings") { for (const [key, patch] of Object.entries(body)) data.state.settings[key] = { ...data.state.settings[key], ...patch }; return { ok: true }; }
+          if (route === "targets") { const current = data.targets.items.find(item => item.umo === body.umo); if (body.action === "save") Object.assign(current, body.patch); return structuredClone(current || {}); }
+          if (route === "image/models") return { models: [data.providers.items.find(item => item.name === body.name)?.model], note: "显示当前工作流名称，不请求云端模型列表" };
           if (route === "generate") return { job_id: "offline-generated-job" };
           return {};
         },
@@ -97,7 +101,8 @@ async function main() {
     const lastPost = async route => page.evaluate(route => window.__canvasCalls.filter(call => call.route === route).at(-1)?.body, route);
     const saveProvider = async () => {
       await get("provider-form").getByRole("button", { name: "保存接口", exact: true }).click();
-      await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+      try { await page.waitForFunction(() => !document.getElementById("dirty-label").textContent); }
+      catch (error) { console.error(await page.evaluate(() => ({ notice: document.getElementById("notice").textContent, dirty: document.getElementById("dirty-label").textContent, invalid: Array.from(document.querySelectorAll("#provider-form :invalid")).map(el => ({ id: el.id, value: el.value, message: el.validationMessage })), call: window.__canvasCalls.at(-1) }))); throw error; }
     };
 
     assert.equal(await get("v-negative-mode").inputValue(), "disabled", "OpenAI 缺省不得伪装成支持负面字段");
@@ -193,6 +198,65 @@ async function main() {
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
     assert.equal((await lastPost("settings")).active.max_concurrent_targets, 5); assert.equal(await get("a-concurrency").inputValue(), "5");
 
+    assert.equal(await get("r-enabled").isChecked(), false, "缺省全局配图关闭");
+    assert.equal(await get("r-probability").inputValue(), "20"); assert.equal(await get("r-interval").inputValue(), "300");
+    assert.equal(await get("t-reply-enabled").isChecked(), false, "发现的聊天缺省配图关闭");
+    await get("target-scope-filter").selectOption("group");
+    assert.equal(await get("target-list").getByRole("button").count(), 1);
+    await get("target-list").getByRole("button", { name: /群聊测试/ }).click();
+    assert.equal(await get("t-enabled").isDisabled(), true); assert.equal(await get("t-morning").isDisabled(), true); assert.equal(await get("test-target").isDisabled(), true);
+    assert.match(await get("t-scope-help").innerText(), /不会主动联系或发送早安/);
+    await get("t-reply-enabled").check(); await get("t-reply-probability").fill("0");
+    await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
+    await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+    let targetSaved = await lastPost("targets");
+    assert.equal(targetSaved.umo, "offline:GroupMessage:group"); assert.equal(targetSaved.patch.reply_image_enabled, true); assert.equal(targetSaved.patch.reply_image_probability, 0);
+    assert.equal(targetSaved.patch.enabled, false); assert.equal(targetSaved.patch.morning_enabled, false, "群聊保存不得开启主动或早安");
+    await get("t-reply-probability").fill("100"); await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
+    await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+    assert.equal((await lastPost("targets")).patch.reply_image_probability, 100);
+    await get("target-scope-filter").selectOption("private"); await get("target-list").getByRole("button", { name: /私聊测试/ }).click();
+    assert.equal(await get("t-reply-enabled").isChecked(), false, "群聊设置不能改变私聊开关");
+    assert.equal(await get("t-enabled").isDisabled(), false); assert.equal(await get("test-target").isDisabled(), false);
+    await get("t-reply-enabled").check(); await get("t-reply-probability").fill("35");
+    await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
+    await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+    assert.equal((await lastPost("targets")).patch.reply_image_probability, 35);
+    await get("r-enabled").check(); await get("r-probability").fill("40"); await get("r-interval").fill("120"); await get("r-provider").selectOption("local-comfy");
+    await get("reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
+    await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+    assert.deepEqual((await lastPost("settings")).reply_images, { enabled: true, default_probability: 40, min_interval_sec: 120, provider: "local-comfy" });
+    assert.equal(await get("r-provider").inputValue(), "local-comfy"); assert.equal(await get("t-reply-probability").inputValue(), "35", "修改全局默认不得覆盖聊天概率");
+    const settingsCount = await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length);
+    await get("r-probability").fill("101"); await get("reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length), settingsCount, "HTML范围校验阻止超过100%的概率");
+    await get("restore-reply-images").click();
+
+    await page.locator("[data-page='providers']").click(); await get("provider-list").getByRole("button", { name: /local-comfy/ }).click();
+    assert.equal(await get("comfy-workflow").isVisible(), true); assert.match(await get("v-model-label").innerText(), /工作流显示名称/);
+    assert.equal(await get("v-negative-mode").inputValue(), "disabled"); assert.equal(await get("v-negative-mode").isDisabled(), true);
+    assert.match(await get("v-negative-help").innerText(), /保留工作流原有负面内容/);
+    const apiWorkflow = { "6": { class_type: "CLIPTextEncode", inputs: { text: "positive" } }, "7": { class_type: "CLIPTextEncode", inputs: { text: "negative" } }, "3": { class_type: "KSampler", inputs: { seed: 9, steps: 20 } }, "9": { class_type: "SaveImage", inputs: { filename_prefix: "offline" } } };
+    await get("v-workflow-file").setInputFiles({ name: "canvas-format.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify({ nodes: [], links: [] })) });
+    await page.waitForFunction(() => document.getElementById("v-workflow-import-status").textContent.includes("前端画布格式"));
+    assert.equal(JSON.parse(await get("v-workflow").inputValue())["6"].inputs.text, "default", "无效导入不能覆盖已保存工作流");
+    await get("v-workflow-file").setInputFiles({ name: "local-api.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(apiWorkflow)) });
+    await page.waitForFunction(() => document.getElementById("v-workflow-import-status").textContent.includes("共 4 个节点"));
+    assert.deepEqual(JSON.parse(await get("v-workflow").inputValue()), apiWorkflow);
+    const workflowFields = { prompt: "6.inputs.text", negative_prompt: "7.inputs.text", seed: "3.inputs.seed", steps: "3.inputs.steps" };
+    await get("v-workflow-fields").fill(JSON.stringify(workflowFields)); await get("v-output-node").fill("9");
+    assert.equal(await get("v-negative-mode").inputValue(), "field"); assert.equal(await get("v-negative-field-row").isVisible(), false);
+    await saveProvider(); saved = await lastPost("providers");
+    assert.deepEqual(saved.workflow, apiWorkflow); assert.deepEqual(saved.workflow_fields, workflowFields); assert.equal(saved.output_node, "9"); assert.equal(saved.negative_mode, "field");
+    await get("list-image-models").click(); assert.equal(await get("image-model-options").locator("option").first().getAttribute("value"), "角色本地工作流");
+    await get("test-image-connection").click(); assert.equal((await lastPost("image/test")).generate_image, false);
+    await get("v-kind").selectOption("openai"); assert.equal(await get("comfy-workflow").isVisible(), false);
+    await get("v-kind").selectOption("comfyui"); assert.deepEqual(JSON.parse(await get("v-workflow").inputValue()), apiWorkflow, "未保存的类型切换保留工作流编辑内容");
+    await get("restore-provider").click();
+    await page.locator("[data-page='studio']").click(); await get("g-provider").selectOption("local-comfy"); await get("g-override").check();
+    assert.equal(await get("g-width").isDisabled(), true); assert.equal(await get("g-height").isDisabled(), true); assert.equal(await get("g-scale").isDisabled(), true);
+    assert.equal(await get("g-steps").isDisabled(), false); assert.equal(await get("g-seed").isDisabled(), false, "仅允许覆盖工作流实际映射的参数");
+
     await page.locator("[data-page='studio']").click();
     const deliveryRow = get("job-list").locator("article").filter({ hasText: "已生成平台拒收" });
     const uncertainRow = get("job-list").locator("article").filter({ hasText: "已生成发送待确认" });
@@ -240,6 +304,14 @@ async function main() {
     assert.equal(await get("a-concurrency").isVisible(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动主动策略页面不应横向溢出");
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-active-mobile.png"), fullPage: true });
+    assert.equal(await get("r-enabled").isChecked(), true); assert.equal(await get("r-provider").inputValue(), "local-comfy");
+    await get("target-scope-filter").selectOption("group"); await get("target-list").getByRole("button", { name: /群聊测试/ }).click();
+    assert.equal(await get("t-reply-probability").inputValue(), "100"); assert.equal(await get("t-enabled").isDisabled(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动群聊配图页面不应横向溢出");
+    await page.locator("[data-page='providers']").click(); await get("provider-list").getByRole("button", { name: /local-comfy/ }).click();
+    assert.equal(await get("v-workflow").isVisible(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动工作流编辑器不应横向溢出");
+    if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-comfy-mobile.png"), fullPage: true });
     await page.evaluate(() => { window.__canvasFixtures.jobs.items.find(job => job.id === "job-uncertain").status = "uncertain"; });
     await page.locator("[data-page='studio']").click(); await get("refresh-jobs").click();
     await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
@@ -248,7 +320,7 @@ async function main() {
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-resend-mobile.png"), fullPage: true });
     await get("confirm-cancel").click();
     assert.deepEqual(browserErrors, [], "页面运行不应有未捕获的 JavaScript 异常");
-    console.log("PASS: WebUI offline Chrome checks (negative modes, mapping reset, Gemini options, failed test summaries, submitted notes, resend confirmation and deduplication, target concurrency, escaping, mobile layout).");
+    console.log("PASS: WebUI offline Chrome checks (ComfyUI workflow import and mapping, per-chat reply images and probability, private/group scopes, negative modes, mapping reset, Gemini options, failed test summaries, resend confirmation, target concurrency, escaping, mobile layout).");
   } finally {
     if (browser) await browser.close();
     await new Promise(resolve => server.close(resolve));

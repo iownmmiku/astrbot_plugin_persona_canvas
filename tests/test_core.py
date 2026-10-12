@@ -43,7 +43,7 @@ api.logger = logging.getLogger("canvas-tests")
 event_module = types.ModuleType("astrbot.api.event")
 event_module.AstrMessageEvent = object
 event_module.MessageChain = Chain
-event_module.filter = types.SimpleNamespace(command=decorator, llm_tool=decorator, on_llm_request=decorator, on_llm_response=decorator, event_message_type=decorator, EventMessageType=types.SimpleNamespace(ALL=1, PRIVATE_MESSAGE=2))
+event_module.filter = types.SimpleNamespace(command=decorator, llm_tool=decorator, on_llm_request=decorator, on_llm_response=decorator, on_decorating_result=decorator, event_message_type=decorator, EventMessageType=types.SimpleNamespace(ALL=1, PRIVATE_MESSAGE=2))
 star_module = types.ModuleType("astrbot.api.star")
 star_module.Context, star_module.Star, star_module.register = object, Star, decorator
 components_module = types.ModuleType("astrbot.api.message_components")

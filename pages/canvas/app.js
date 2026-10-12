@@ -8,7 +8,7 @@ let bridge = null, token = "", loading = false, polling = false, connected = fal
 const pageNames = {
   overview: ["总览", "让对话、人设状态与画面保持一致。"], persona: ["人设工作台", "维护角色外观、判断规则与参考图。"],
   providers: ["模型接口", "管理绘画接口与动作判断模型。"], studio: ["生图工作台", "构图、预演与生成任务，集中在这里。"],
-  active: ["主动消息", "安排自然的破冰与每日早安。"], history: ["生成历史", "回看画面与每次请求的执行结果。"], settings: ["运行设置", "控制对话集成、配额与默认生成参数。"]
+  active: ["聊天与主动消息", "按聊天设置回复配图，安排私聊主动联系与早安。"], history: ["生成历史", "回看画面与每次请求的执行结果。"], settings: ["运行设置", "控制对话集成、配额与默认生成参数。"]
 };
 const statusNames = { queued: "等待中", pending: "等待中", generating: "生成中", running: "生成中", processing: "生成中", sending: "发送中", sent: "已发送", delivery_failed: "生成成功，发送失败", uncertain: "发送结果待确认", succeeded: "已完成", success: "已完成", done: "已完成", completed: "已完成", failed: "失败", error: "失败", interrupted: "已中断", cancelled: "已取消" };
 const finished = job => ["succeeded", "success", "done", "completed", "sent"].includes(job.status);
@@ -94,6 +94,7 @@ function renderSelectors() {
   const personas = model.personas.map(p => ({ value: p.id, label: p.name || p.id }));
   for (const id of ["g-persona", "s-persona", "t-persona"]) fillSelect(id, personas, null, id === "t-persona" ? "默认视觉人设" : "");
   fillSelect("g-provider", model.providers.map(p => ({ value: p.name, label: `${p.name} · ${p.model || "未设模型"}` })));
+  fillSelect("r-provider", model.providers.map(p => ({ value: p.name, label: p.name })), null, "使用默认绘画接口");
   const astrbot = model.astrbotPersonas.map(p => ({ value: p.persona_id || p.id, label: p.name || p.persona_id || p.id }));
   fillSelect("p-astrbot", astrbot, null, "不绑定，使用默认视觉人设");
   $("session-options").replaceChildren(...model.sessions.map(s => { const el = node("option"); el.value = s.umo || s.unified_msg_origin || ""; return el; }));
@@ -158,6 +159,8 @@ function requestDetail(item) {
   const mode = request.negative_mode || "disabled";
   const negativeSource = request.negative_source === "extra_body" ? "手动附加请求体" : request.negative_source === "plugin" ? "插件独立负面字段" : mode === "natural_language" ? "插件自然语言约束，编入正面描述" : request.negative_prompt_field ? "独立字段，早期记录未标明来源" : "无独立负面字段";
   const rows = [["绘图模型", request.model || "接口默认"], ["负面处理", negativeModes[mode] || mode], ["负面来源", negativeSource], ["负面字段", request.negative_prompt_field || "未使用独立字段"], ["参考图", `${request.reference_count ?? 0} 张 · ${referenceSources[request.reference_source] || request.reference_source || "未记录来源"}`], ["接口超时", request.provider_timeout_sec != null ? `${request.provider_timeout_sec} 秒` : "未记录"], ["任务超时", request.task_timeout_sec != null ? `${request.task_timeout_sec} 秒` : "未记录"], ["有效生成超时", request.effective_timeout_sec != null ? `${request.effective_timeout_sec} 秒（两者取较短）` : "未记录"]];
+  if (request.workflow_prompt_id) rows.push(["本地任务编号", request.workflow_prompt_id]);
+  if (request.output_node) rows.push(["输出节点", request.output_node]);
   const info = node("div", "info-list request-info");
   for (const [label, content] of rows) { const row = node("div", "info-row"); row.append(node("span", "", label), node("span", "", content)); info.append(row); }
   detail.append(info, node("h4", "", preparedOnly ? "准备阶段正面提示词" : submitted ? "最终正面提示词" : "记录的正面提示词"), node("pre", "request-prompt", request.prompt || "未提交"), node("h4", "", preparedOnly ? "准备阶段独立负面提示词" : submitted ? "实际独立负面提示词" : "记录的独立负面提示词"), node("pre", "request-prompt", request.negative_prompt || (mode === "natural_language" ? preparedOnly ? "尚未提交；自然语言约束将在适配器处理时加入正面描述。" : "未使用独立字段；约束已写入正面描述。" : "未记录独立负面词。")), node("h4", "", preparedOnly ? "准备阶段生成参数" : submitted ? "实际生成参数" : "记录的生成参数"), node("pre", "request-options", JSON.stringify(request.options || {}, null, 2)));
@@ -180,7 +183,7 @@ function renderProviders() {
   if (!model.providers.length) return empty(container, "请新增绘画接口。");
   for (const p of model.providers) { const el = button("", async () => { if (await canReplace("provider-form")) fillProvider(p); }, `select-item${p.name === selection.provider?.name ? " active" : ""}`); el.replaceChildren(node("strong", "", p.name), node("small", "", `${p.name === model.state.settings?.default_provider ? "默认 · " : ""}${p.kind} / ${p.model || "未设模型"}`)); if (p.error) el.append(node("small", "danger-text", p.error)); container.append(el); }
 }
-function authDefaults(kind) { return kind === "gemini" ? { header: "x-goog-api-key", prefix: "" } : { header: "Authorization", prefix: "Bearer " }; }
+function authDefaults(kind) { return kind === "gemini" ? { header: "x-goog-api-key", prefix: "" } : kind === "comfyui" ? { header: "Authorization", prefix: "" } : { header: "Authorization", prefix: "Bearer " }; }
 let providerKind = "openai";
 function defaultProviderAuth() {
   const defaults = authDefaults(value("v-kind")); set("v-header", defaults.header); set("v-prefix", defaults.prefix); markDirty("provider-form");
@@ -195,16 +198,25 @@ function changeProviderKind() {
 }
 function providerNegativeMode(p) {
   if (p.kind === "novelai") return "field";
+  if (p.kind === "comfyui") return p.workflow_fields?.negative_prompt ? "field" : "disabled";
   return p.negative_mode || p.capabilities?.negative_mode || (p.kind === "custom" && p.negative_prompt === true ? "field" : "disabled");
 }
 function renderProviderFields(selectedMode = value("v-negative-mode")) {
   const kind = value("v-kind");
-  const modes = kind === "novelai" ? ["field"] : kind === "gemini" ? ["disabled", "natural_language"] : ["disabled", "natural_language", "field"];
+  let workflowFields = {}; try { workflowFields = JSON.parse(value("v-workflow-fields") || "{}"); } catch { /* Editable JSON may be incomplete. */ }
+  const modes = kind === "comfyui" ? [workflowFields?.negative_prompt ? "field" : "disabled"] : kind === "novelai" ? ["field"] : kind === "gemini" ? ["disabled", "natural_language"] : ["disabled", "natural_language", "field"];
   fillSelect("v-negative-mode", modes.map(mode => ({ value: mode, label: negativeModes[mode] })), modes.includes(selectedMode) ? selectedMode : modes[0]);
-  $("v-negative-mode").disabled = kind === "novelai";
-  const field = value("v-negative-mode") === "field" && kind !== "novelai";
+  $("v-negative-mode").disabled = ["novelai", "comfyui"].includes(kind);
+  const field = value("v-negative-mode") === "field" && !["novelai", "comfyui"].includes(kind);
   $("v-negative-field-row").hidden = !field; $("v-negative-field").disabled = !field;
-  setText("v-negative-help", kind === "novelai" ? "NovelAI 固定使用原生独立负面通道；负面词不会拼入正面标签。" : value("v-negative-mode") === "field" ? (kind === "openai" ? "仅适用于明确支持独立负面字段的中转接口。OpenAI 原生 Images 没有通用负面字段，请先核对接口文档。" : "按指定字段路径发送负面词，不再拼入正面提示词。") : value("v-negative-mode") === "natural_language" ? "将负面词转为自然语言约束加入正面描述。仅适用于理解自然语言指令的模型；标签模型应使用独立负面字段。" : "负面词不发送，也不会追加到正面提示词；可避免标签模型把禁止内容画进图片。");
+  setText("v-negative-help", kind === "comfyui" ? (workflowFields?.negative_prompt ? "按 negative_prompt 映射写入工作流的负面节点，不会追加到正面提示词。" : "未配置 negative_prompt 映射：保留工作流原有负面内容，不自动发送人设负面词，也不会追加到正面提示词。") : kind === "novelai" ? "NovelAI 固定使用原生独立负面通道；负面词不会拼入正面标签。" : value("v-negative-mode") === "field" ? (kind === "openai" ? "仅适用于明确支持独立负面字段的中转接口。OpenAI 原生 Images 没有通用负面字段，请先核对接口文档。" : "按指定字段路径发送负面词，不再拼入正面提示词。") : value("v-negative-mode") === "natural_language" ? "将负面词转为自然语言约束加入正面描述。仅适用于理解自然语言指令的模型；标签模型应使用独立负面字段。" : "负面词不发送，也不会追加到正面提示词；可避免标签模型把禁止内容画进图片。");
+  setText("v-model-label", kind === "comfyui" ? "工作流显示名称" : "模型");
+  $("v-model").placeholder = kind === "comfyui" ? "例如：角色自拍 SDXL；不替换工作流模型节点" : "可手动输入模型名";
+  $("v-endpoint").placeholder = kind === "comfyui" ? "http://127.0.0.1:8188" : "https://api.example.com";
+  $("v-prefix").placeholder = kind === "comfyui" ? "无前缀；可按本地服务鉴权设置" : "Bearer ";
+  setText("provider-auth-help", kind === "comfyui" ? "ComfyUI 本地服务通常无需 API Key。如服务配置了鉴权，可在这里设置请求头与前缀。" : "Gemini 原生接口默认使用 x-goog-api-key；中转服务可保留自定义认证头。切换类型时保留自定义值。");
+  $("v-edit-row").hidden = kind === "comfyui"; $("v-edit").disabled = kind === "comfyui";
+  for (const id of ["v-extra", "v-response", "v-generation-path", "v-edit-path", "v-models-path", "v-allow-urls", "v-image-hosts"]) { $(id).closest("label").hidden = kind === "comfyui"; $(id).disabled = kind === "comfyui"; }
   document.querySelectorAll("[data-provider-kinds]").forEach(el => { const enabled = el.dataset.providerKinds.split(" ").includes(kind); el.hidden = !enabled; el.querySelectorAll("input,select,textarea").forEach(input => { input.disabled = !enabled; }); });
   renderProviderTimeout();
 }
@@ -223,13 +235,14 @@ function fillProvider(p) {
   for (const [id, key] of [["v-prompt-field", "prompt_field"], ["v-model-field", "model_field"], ["v-reference-field", "reference_field"], ["v-reference-mime", "reference_mime_field"], ["v-models-response", "models_response_path"]]) set(id, p[key]);
   set("v-reference-format", p.reference_format || "data_url"); set("v-supported-sizes", Array.isArray(p.supported_sizes) ? p.supported_sizes.join("\n") : p.supported_sizes || "");
   setCheck("v-seed", p.supports_seed); setCheck("v-sampler", p.supports_sampler); set("v-options", p.option_fields ? JSON.stringify(p.option_fields, null, 2) : ""); setCheck("v-allow-urls", p.allow_image_urls); setCheck("v-clear-key", false); set("v-image-hosts", Array.isArray(p.allowed_image_hosts) ? p.allowed_image_hosts.join("\n") : p.allowed_image_hosts || "");
+  set("v-workflow", p.workflow ? JSON.stringify(p.workflow, null, 2) : ""); set("v-workflow-fields", p.workflow_fields ? JSON.stringify(p.workflow_fields, null, 2) : ""); set("v-output-node", p.output_node); setText("v-workflow-import-status", "");
   renderProviderFields(providerNegativeMode(p));
   $("v-name").readOnly = model.providers.some(x => x.name === p.name); available("delete-provider", model.providers.length > 1 && model.providers.some(x => x.name === p.name));
   $("image-model-options").replaceChildren(); $("provider-test-result").replaceChildren(); if (p.error) $("provider-test-result").append(node("p", "danger-text", `当前配置无法使用，请修正后保存：${p.error}`)); markDirty("provider-form", false); renderProviders();
 }
 function readProvider() {
   let extra;
-  try { extra = JSON.parse(value("v-extra") || "{}"); } catch { throw new Error("附加请求体需要是有效 JSON"); }
+  try { extra = value("v-kind") === "comfyui" ? {} : JSON.parse(value("v-extra") || "{}"); } catch { throw new Error("附加请求体需要是有效 JSON"); }
   if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("附加请求体需要是 JSON 对象");
   const kind = value("v-kind"), mode = kind === "novelai" ? "field" : value("v-negative-mode");
   let fields;
@@ -244,7 +257,26 @@ function readProvider() {
     data.reference_format = value("v-reference-format");
   }
   if (kind === "openai" || kind === "custom") { const sizes = $("v-supported-sizes").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean); if (sizes.length) data.supported_sizes = sizes; else if (Object.hasOwn(selection.provider || {}, "supported_sizes")) data.supported_sizes = null; }
+  if (kind === "comfyui") {
+    data.workflow = parseWorkflow(value("v-workflow"));
+    data.workflow_fields = parseJsonObject(value("v-workflow-fields"), "工作流字段映射");
+    if (typeof data.workflow_fields.prompt !== "string" || !data.workflow_fields.prompt.trim()) throw new Error("请填写 prompt 的工作流字段映射，例如 6.inputs.text；节点 ID 需要与导入的工作流一致");
+    data.output_node = value("v-output-node"); data.negative_mode = data.workflow_fields.negative_prompt ? "field" : "disabled"; data.negative_prompt = Boolean(data.workflow_fields.negative_prompt);
+    data.supports_image_edit = Boolean(data.workflow_fields.reference);
+    delete data.negative_prompt_field;
+  }
   return data;
+}
+function parseJsonObject(text, label) {
+  let result; try { result = JSON.parse(text || "{}"); } catch { throw new Error(`${label}需要是有效 JSON`); }
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error(`${label}需要是 JSON 对象`);
+  return result;
+}
+function parseWorkflow(text) {
+  const workflow = parseJsonObject(text, "API 工作流");
+  if (Array.isArray(workflow.nodes) || Array.isArray(workflow.links)) throw new Error("这是 ComfyUI 前端画布格式，请在 ComfyUI 中导出 API 格式工作流 JSON");
+  if (!Object.keys(workflow).length || !Object.values(workflow).every(item => item && typeof item === "object" && typeof item.class_type === "string" && item.inputs && typeof item.inputs === "object" && !Array.isArray(item.inputs))) throw new Error("API 工作流应以节点 ID 为键，每个节点包含 class_type 和 inputs");
+  return workflow;
 }
 function renderLlmOptions(selected) {
   fillSelect("l-provider", model.llms.map(p => ({ value: p.id, label: `${p.id} · ${p.model || p.type || "聊天模型"}` })), selected ?? null, "沿用当前会话模型");
@@ -262,22 +294,40 @@ function fillActive() {
   setCheck("a-enabled", a.enabled); set("a-timezone", a.timezone || "Asia/Shanghai"); set("a-start", a.default_start || "09:00"); set("a-end", a.default_end || "22:00"); set("a-interval", a.check_interval_sec ?? 30); set("a-gap", a.min_gap_sec ?? 3600); set("a-idle", a.min_idle_sec ?? 1800); set("a-silence", a.silence_after ?? 3); set("a-silence-hours", a.silence_hours ?? 24); set("a-concurrency", a.max_concurrent_targets ?? 3);
   setCheck("m-enabled", m.enabled); set("m-timezone", m.timezone || "Asia/Shanghai"); set("m-start", m.start || "07:00"); set("m-end", m.end || "10:00"); set("a-jitter", a.jitter_percent ?? 15); const b = model.state.settings?.proactive_budget || {}; for (const [key, fallback] of [["messages", 10], ["photos", 2], ["llm", 24]]) set(`b-${key}`, b[key] ?? fallback); set("b-timezone", b.timezone || "Asia/Shanghai"); markDirty("active-form", false);
 }
+function fillReplyImages() {
+  const config = model.state.settings?.reply_images || {};
+  setCheck("r-enabled", config.enabled); set("r-probability", config.default_probability ?? 20); set("r-interval", config.min_interval_sec ?? 300);
+  fillSelect("r-provider", model.providers.map(p => ({ value: p.name, label: p.name })), config.provider || "", "使用默认绘画接口");
+  if (config.provider && !model.providers.some(p => p.name === config.provider)) { const option = node("option", "", `${config.provider}（接口已移除，请重新选择）`); option.value = config.provider; $("r-provider").append(option); $("r-provider").value = config.provider; }
+  markDirty("reply-images-form", false);
+}
+const targetScope = t => t?.scope === "group" || (!t?.scope && /:GroupMessage:/.test(t?.umo || "")) ? "group" : "private";
 function renderTargets() {
   const container = $("target-list"); container.replaceChildren();
-  if (!model.targets.length) return empty(container, "尚未发现私聊目标。");
-  for (const t of model.targets) { const el = button("", async () => { if (await canReplace("target-form")) fillTarget(t); }, `select-item${t.umo === selection.target?.umo ? " active" : ""}`); el.replaceChildren(node("strong", "", t.name || t.sender_id || t.umo), node("small", "", `${t.enabled ? "已启用" : "已停用"} · 未回复 ${t.unanswered || 0} 次`)); container.append(el); }
+  const filter = value("target-scope-filter"), targets = model.targets.filter(t => filter === "all" || targetScope(t) === filter);
+  if (!targets.length) return empty(container, model.targets.length ? "这个范围下暂无聊天目标。" : "尚未发现聊天目标，先让机器人在所需私聊或群聊中回复一次。");
+  for (const t of targets) { const group = targetScope(t) === "group", el = button("", async () => { if (await canReplace("target-form")) fillTarget(t); }, `select-item${t.umo === selection.target?.umo ? " active" : ""}`); el.replaceChildren(node("strong", "", t.name || t.sender_id || t.umo), node("small", "", `${group ? "群聊" : "私聊"} · 配图${t.reply_image_enabled ? ` ${t.reply_image_probability ?? model.state.settings?.reply_images?.default_probability ?? 20}%` : "关闭"}${group ? "" : ` · 主动${t.enabled ? "开启" : "关闭"}`}`)); container.append(el); }
 }
 function fillTarget(t) {
-  selection.target = structuredClone(t); const a = model.state.settings?.active || {}, m = model.state.settings?.good_morning || {};
+  selection.target = structuredClone(t); const a = model.state.settings?.active || {}, m = model.state.settings?.good_morning || {}, group = targetScope(t) === "group";
   set("t-umo", t.umo); $("t-umo").readOnly = true;
   fillSelect("t-persona", model.personas.map(p => ({ value: p.id, label: p.name || p.id })), t.persona_id || "", "默认视觉人设");
   set("t-timezone", t.timezone || a.timezone || "Asia/Shanghai"); set("t-start", t.start || a.default_start || "09:00"); set("t-end", t.end || a.default_end || "22:00"); set("t-gap", t.min_gap_sec ?? a.min_gap_sec ?? 3600); set("t-idle", t.min_idle_sec ?? a.min_idle_sec ?? 1800); set("t-silence", t.silence_after ?? a.silence_after ?? 3);
-  setCheck("t-enabled", t.enabled); setCheck("t-image", t.with_image); setCheck("t-morning", t.morning_enabled !== false); set("t-morning-start", t.morning_start || m.start || "07:00"); set("t-morning-end", t.morning_end || m.end || "10:00");
-  setText("target-status", !t.umo ? "等待私聊会话" : t.silent_until && t.silent_until > Date.now() / 1000 ? `静默至 ${date(t.silent_until)}` : t.enabled ? "已启用" : "未启用");
-  const exists = model.targets.some(x => x.umo === t.umo); available("delete-target", exists); available("test-target", exists); const save = $("target-form").querySelector('[type="submit"]'); save.disabled = !exists; save.dataset.unavailable = exists ? "false" : "true";
+  setCheck("t-enabled", !group && t.enabled); setCheck("t-image", !group && t.with_image); setCheck("t-morning", !group && t.morning_enabled !== false); set("t-morning-start", t.morning_start || m.start || "07:00"); set("t-morning-end", t.morning_end || m.end || "10:00");
+  setCheck("t-reply-enabled", t.reply_image_enabled); set("t-reply-probability", t.reply_image_probability ?? model.state.settings?.reply_images?.default_probability ?? 20);
+  setText("target-status", !t.umo ? "等待发现会话" : group ? "群聊 · 回复配图" : t.silent_until && t.silent_until > Date.now() / 1000 ? `静默至 ${date(t.silent_until)}` : t.enabled ? "私聊 · 主动已开启" : "私聊 · 主动未开启");
+  setText("t-scope-help", group ? "群聊：仅在机器人正常回复时才可能配图；不会主动联系或发送早安。" : "私聊：可分别开启回复配图、主动联系和早安。使用 AstrBot 完整 unified_msg_origin。");
+  setText("t-proactive-help", group ? "群聊不支持主动联系与每日早安。以下设置已停用，不影响上方回复配图。" : "仅在开启私聊主动联系后执行，早安与普通主动策略分别控制。");
+  $("target-proactive-fields").querySelectorAll("input,select,textarea").forEach(input => { input.disabled = group; });
+  setText("t-reply-help", model.state.settings?.reply_images?.enabled ? "全局配图已开启；开启本聊天后按这里的概率抽取，再由角色决定是否配图。" : "全局配图当前关闭。可以先保存本聊天设置，再打开上方全局开关。");
+  const exists = model.targets.some(x => x.umo === t.umo); available("delete-target", exists); available("test-target", exists && !group); const save = $("target-form").querySelector('[type="submit"]'); save.disabled = !exists; save.dataset.unavailable = exists ? "false" : "true";
   $("target-test-result").replaceChildren(); markDirty("target-form", false); renderTargets();
 }
-function readTarget() { return { enabled: check("t-enabled"), persona_id: value("t-persona"), timezone: value("t-timezone"), start: value("t-start"), end: value("t-end"), min_gap_sec: num("t-gap"), min_idle_sec: num("t-idle"), silence_after: num("t-silence"), with_image: check("t-image"), morning_enabled: check("t-morning"), morning_start: value("t-morning-start"), morning_end: value("t-morning-end") }; }
+function readTarget() {
+  const patch = { persona_id: value("t-persona"), reply_image_enabled: check("t-reply-enabled"), reply_image_probability: num("t-reply-probability") };
+  if (targetScope(selection.target) === "group") return { ...patch, enabled: false, with_image: false, morning_enabled: false };
+  return { ...patch, enabled: check("t-enabled"), timezone: value("t-timezone"), start: value("t-start"), end: value("t-end"), min_gap_sec: num("t-gap"), min_idle_sec: num("t-idle"), silence_after: num("t-silence"), with_image: check("t-image"), morning_enabled: check("t-morning"), morning_start: value("t-morning-start"), morning_end: value("t-morning-end") };
+}
 function fillSettings() {
   const s = model.state.settings || {}, c = s.integration || {}, d = s.dialogue || {}, q = s.moderation || {}, g = s.generation || {};
   setCheck("c-enabled", c.enabled !== false); set("c-mode", c.mode || "native_tools"); setCheck("c-strict", true); set("c-timeout", d.timeout_sec ?? 60); set("c-context", d.context_turns ?? 12); set("c-confirmation", d.confirmation_ttl_sec ?? 1800);
@@ -297,7 +347,7 @@ function fillGenerationDefaults() {
 function renderGenerationCapabilities() {
   const provider = model.providers.find(p => p.name === value("g-provider")), cap = provider?.capabilities || {};
   const override = check("g-override"), dimensions = provider?.kind !== "gemini";
-  const mapped = key => provider?.kind !== "custom" || !provider.option_fields || Boolean(provider.option_fields[key]);
+  const mapped = key => provider?.kind === "comfyui" ? Boolean(provider.workflow_fields?.[key]) : provider?.kind !== "custom" || !provider.option_fields || Boolean(provider.option_fields[key]);
   for (const id of ["g-width", "g-height"]) { $(id).disabled = !override || !dimensions || !mapped(id.slice(2)); $(id).step = provider?.kind === "openai" ? "16" : "64"; $(id).closest("label").hidden = !dimensions; }
   for (const id of ["g-steps", "g-scale"]) $(id).disabled = !override || !cap.sampler || !mapped(id.slice(2));
   $("g-seed").disabled = !override || !cap.seed || !mapped("seed");
@@ -403,7 +453,7 @@ async function reload() {
     if (!dirty.has("persona-form")) fillPersona(model.personas.find(p => p.id === selection.persona?.id) || model.personas.find(p => p.id === state.settings?.current_persona) || model.personas[0] || { id: `persona-${Date.now()}`, state: {} });
     if (!dirty.has("provider-form")) fillProvider(model.providers.find(p => p.name === selection.provider?.name) || model.providers.find(p => p.name === state.settings?.default_provider) || model.providers[0] || { name: "default", kind: "openai" });
     if (!dirty.has("target-form")) fillTarget(model.targets.find(t => t.umo === selection.target?.umo) || model.targets[0] || {});
-    if (!dirty.has("active-form")) fillActive(); if (!dirty.has("settings-form")) fillSettings(); if (!dirty.has("llm-form")) fillLlm(); fillGenerationDefaults();
+    if (!dirty.has("active-form")) fillActive(); if (!dirty.has("reply-images-form")) fillReplyImages(); if (!dirty.has("settings-form")) fillSettings(); if (!dirty.has("llm-form")) fillLlm(); fillGenerationDefaults();
     renderPersonas(); renderProviders(); renderTargets(); renderOverview(); renderJobs(); renderHistory(); renderDiagnostics(); connection(true, bridge ? "AstrBot 已连接" : "兼容控制台已连接");
   } finally { loading = false; }
 }
@@ -457,6 +507,18 @@ $("p-reference-file").addEventListener("change", async event => {
   } catch (error) { notice(error.message || "上传失败", true); } finally { event.target.value = ""; }
 });
 bind("new-provider", async () => { if (await canReplace("provider-form")) fillProvider({ name: "", kind: "openai", extra_body: {} }); });
+$("v-workflow-file").addEventListener("change", async event => {
+  const file = event.target.files?.[0]; if (!file) return;
+  const provider = selection.provider;
+  try {
+    if (file.size > 2 * 1024 * 1024) throw new Error("工作流 JSON 不能超过 2 MB");
+    const text = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error("工作流文件读取失败")); reader.readAsText(file, "utf-8"); });
+    const workflow = parseWorkflow(text.replace(/^\uFEFF/, ""));
+    if (selection.provider !== provider) throw new Error("读取期间切换了接口，请在所需接口重新导入");
+    set("v-workflow", JSON.stringify(workflow, null, 2)); setText("v-workflow-import-status", `已读取 ${file.name}，共 ${Object.keys(workflow).length} 个节点。请填写字段映射并保存接口。`); markDirty("provider-form");
+  } catch (error) { setText("v-workflow-import-status", error.message || "导入失败"); notice(error.message || "导入失败", true); }
+  finally { event.target.value = ""; }
+});
 bind("restore-provider", async () => fillProvider(model.providers.find(p => p.name === selection.provider?.name) || selection.provider || { kind: "openai" }));
 bind("reset-provider-options", async () => { set("v-options", ""); markDirty("provider-form"); notice("已选择恢复默认参数映射，请保存接口使其生效。"); });
 bindForm("provider-form", async () => { const saved = await api("providers", "POST", readProvider()); selection.provider = saved; set("v-key", ""); markDirty("provider-form", false); await reload(); notice("绘画接口已保存"); });
@@ -472,10 +534,12 @@ bind("use-persona-reference", async () => { const p = model.personas.find(x => x
 bind("refresh-jobs", refreshJobs);
 bindForm("simulate-form", async () => { setText("simulate-result", "正在读取角色判断…"); const result = await api("simulate", "POST", { text: value("s-text"), umo: value("s-umo"), persona_id: value("s-persona"), execute: false }); setText("simulate-result", JSON.stringify(result, null, 2)); });
 bindForm("active-form", async () => { await api("settings", "POST", { active: { enabled: check("a-enabled"), timezone: value("a-timezone"), default_start: value("a-start"), default_end: value("a-end"), check_interval_sec: num("a-interval"), min_gap_sec: num("a-gap"), min_idle_sec: num("a-idle"), silence_after: num("a-silence"), silence_hours: num("a-silence-hours"), jitter_percent: num("a-jitter"), max_concurrent_targets: num("a-concurrency") }, proactive_budget: { messages: num("b-messages"), photos: num("b-photos"), llm: num("b-llm"), timezone: value("b-timezone") }, good_morning: { enabled: check("m-enabled"), timezone: value("m-timezone"), start: value("m-start"), end: value("m-end") } }); markDirty("active-form", false); await reload(); notice("主动消息策略已保存"); });
+bindForm("reply-images-form", async () => { await api("settings", "POST", { reply_images: { enabled: check("r-enabled"), default_probability: num("r-probability"), min_interval_sec: num("r-interval"), provider: value("r-provider") } }); markDirty("reply-images-form", false); await reload(); notice("对话配图设置已保存"); });
+bind("restore-reply-images", async () => fillReplyImages()); $("target-scope-filter").addEventListener("change", renderTargets);
 bind("restore-active", async () => fillActive()); bind("restore-target", async () => fillTarget(model.targets.find(t => t.umo === selection.target?.umo) || selection.target || {}));
 bindForm("target-form", async () => { const umo = value("t-umo"), patch = readTarget(); await api("targets", "POST", { action: "save", umo, patch, ...patch }); selection.target = { umo }; markDirty("target-form", false); await reload(); notice("会话目标已保存"); });
 bind("test-target", async () => { const umo = value("t-umo"); if (!model.targets.some(t => t.umo === umo)) throw new Error("请先保存目标会话"); if (await confirmAction("发送测试消息？", `这会向会话 ${umo} 立即发送一条测试消息。`)) { await api("targets", "POST", { action: "test", umo }); setText("target-test-result", "测试消息已发送，请在目标会话中查看。"); } });
-bind("delete-target", async () => { if (await confirmAction("移除这个目标？", "移除后不会再向该会话发送主动消息；再次收到私聊消息时可重新发现它。")) { await api("targets", "POST", { action: "remove", umo: value("t-umo") }); selection.target = null; markDirty("target-form", false); await reload(); notice("主动目标已移除"); } });
+bind("delete-target", async () => { if (await confirmAction("移除这个目标？", "移除后停用这个聊天的主动消息与回复配图；再次收到该聊天消息时会重新发现，默认停用。")) { await api("targets", "POST", { action: "remove", umo: value("t-umo") }); selection.target = null; markDirty("target-form", false); await reload(); notice("聊天目标已移除"); } });
 bind("refresh-diagnostics", async () => { model.diagnostics = await api("diagnostics"); renderDiagnostics(); }); $("diagnostic-filter").addEventListener("input", renderDiagnostics);
 bind("reload-history", refreshJobs); $("history-filter").addEventListener("change", renderHistory);
 bindForm("settings-form", async () => { await api("settings", "POST", { integration: { enabled: check("c-enabled"), mode: value("c-mode"), strict_trigger: true }, dialogue: { timeout_sec: num("c-timeout"), context_turns: num("c-context"), confirmation_ttl_sec: num("c-confirmation") }, state_lifetimes: Object.fromEntries(["outfit", "pose", "expression", "scene"].map(key => [key + "_sec", num(`s-${key}-life`)])), moderation: { enabled: check("q-enabled"), daily_limit: num("q-daily"), min_interval_sec: num("q-interval"), max_concurrency: num("q-concurrency"), timezone: value("q-timezone") }, generation: { width: num("d-width"), height: num("d-height"), steps: num("d-steps"), scale: num("d-scale"), sampler: value("d-sampler"), seed: num("d-seed"), max_history: num("d-history"), max_concurrency: num("d-concurrency"), timeout_sec: num("d-timeout") } }); markDirty("settings-form", false); await reload(); notice("运行设置已保存"); });
@@ -485,6 +549,7 @@ bind("theme-toggle", async () => { const html = document.documentElement; html.d
 $("g-provider").addEventListener("change", renderGenerationCapabilities); $("g-override").addEventListener("change", renderGenerationCapabilities);
 $("v-kind").addEventListener("change", changeProviderKind); bind("default-provider-auth", async () => defaultProviderAuth());
 $("v-negative-mode").addEventListener("change", () => renderProviderFields()); $("v-timeout").addEventListener("input", renderProviderTimeout);
+$("v-workflow-fields").addEventListener("input", () => { if (value("v-kind") === "comfyui") renderProviderFields(); });
 $("token-form").addEventListener("submit", event => { event.preventDefault(); run($("token-form").querySelector('[type="submit"]'), async () => { token = value("access-token"); try { await reload(); $("token-dialog").close(); set("access-token", ""); setText("token-error", ""); notice(""); try { await loadLlm(); } catch (error) { notice(`主体已连接，模型列表读取失败：${error.message}`, true); } } catch (error) { token = ""; setText("token-error", error.message); throw error; } }); });
 $("token-dialog").addEventListener("cancel", event => event.preventDefault()); bind("change-token", async () => { token = ""; connection(false, "等待连接"); $("token-dialog").showModal(); });
 window.addEventListener("beforeunload", event => { if (Array.from(dirty).some(id => !["generate-form", "simulate-form"].includes(id))) { event.preventDefault(); event.returnValue = ""; } });

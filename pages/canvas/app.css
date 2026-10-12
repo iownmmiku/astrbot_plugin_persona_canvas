@@ -13,3 +13,4 @@ html[data-theme="dark"]{color-scheme:dark;--bg:#19191f;--panel:#22222c;--sidebar
 
 .badge.delivery_failed,.badge.uncertain{color:var(--danger);background:var(--danger-bg)}
 #reset-provider-options{align-self:flex-start}#confirm-uncertain-row{align-items:flex-start;line-height:1.8}#confirm-uncertain{margin-top:4px}
+#v-workflow,#v-workflow-fields{font-family:Consolas,"Microsoft YaHei",monospace;font-size:11px;tab-size:2}#comfy-workflow>.muted{overflow-wrap:anywhere}.workflow-import{width:max-content;max-width:100%;margin-bottom:8px}#v-workflow-import-status{overflow-wrap:anywhere}#target-scope-filter{margin-bottom:15px}#t-proactive-help{margin-top:0}#reply-images-form .badge{color:var(--accent);background:var(--accent-bg)}fieldset:has(input:disabled) legend{color:var(--muted)}textarea:disabled{color:var(--muted);opacity:.65;cursor:not-allowed}

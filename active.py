@@ -20,11 +20,19 @@ class ActiveScheduler:
         umo = str(event.unified_msg_origin or "")
         if not umo:
             return
+        private = bool(event.is_private_chat())
+        scope = "private" if private else "group"
         targets = self.plugin.storage.targets["items"]
         target = next((t for t in targets if t.get("umo") == umo), None)
         if target is None:
-            target = {"umo": umo, "sender_id": str(event.get_sender_id()), "platform": str(event.get_platform_id()), "enabled": False, "morning_enabled": True, "with_image": True, "unanswered": 0, "last_active": 0, "silent_until": 0, "morning_date": ""}
+            target = {"umo": umo, "scope": scope, "sender_id": str(event.get_sender_id()), "platform": str(event.get_platform_id()), "enabled": False, "morning_enabled": private, "with_image": True, "unanswered": 0, "last_active": 0, "silent_until": 0, "morning_date": "", "reply_image_enabled": False, "reply_image_probability": self.plugin.storage.settings["reply_images"].get("default_probability", 20)}
             targets.append(target)
+        target["scope"] = scope
+        group_id = getattr(event, "get_group_id", lambda: "")() if not private else ""
+        display_name = getattr(event, "get_sender_name", lambda: "")() if private else ""
+        target["name"] = str(display_name or target.get("name") or ("群聊 " + str(group_id or umo.rsplit(":", 1)[-1]) if not private else "私聊 " + str(event.get_sender_id())))[:200]
+        if not private:
+            target["enabled"], target["morning_enabled"] = False, False
         target.update(last_inbound=time.time(), unanswered=0, silent_until=0, next_opportunity=0)
         self.plugin.storage.save_targets()
 
@@ -49,7 +57,7 @@ class ActiveScheduler:
     def _blocked(self, target, now):
         active = self.plugin.storage.settings["active"]
         exists = any(item.get("umo") == target.get("umo") for item in self.plugin.storage.targets["items"])
-        if not exists or not self.plugin.storage.settings["integration"].get("enabled", True) or not target.get("enabled") or now < float(target.get("silent_until", 0)):
+        if not exists or target.get("scope") == "group" or not self.plugin.storage.settings["integration"].get("enabled", True) or not target.get("enabled") or now < float(target.get("silent_until", 0)):
             return True
         if target.get("silent_until"):
             # A completed silence period starts a new unanswered cycle.

@@ -169,6 +169,9 @@ class ImageProvider:
                 raise ProviderError("绘画接口配置必须为对象")
             adapters = {"openai": OpenAIProvider, "gemini": GeminiProvider, "novelai": NovelAIProvider, "custom": CustomProvider}
             kind = str(config.get("kind") or "openai").strip().lower()
+            if kind == "comfyui":
+                from .comfyui import ComfyUIProvider
+                return object.__new__(ComfyUIProvider)
             if kind not in adapters:
                 raise ProviderError(f"不支持的绘画接口类型：{kind}")
             return object.__new__(adapters[kind])
@@ -876,6 +879,9 @@ def provider_from_config(name: str, config: dict[str, Any]) -> ImageProvider:
     if not isinstance(config, dict):
         raise ProviderError("绘画接口配置必须为对象")
     kind = str(config.get("kind") or "openai").strip().lower()
+    if kind == "comfyui":
+        from .comfyui import ComfyUIProvider
+        return ComfyUIProvider(name, config)
     adapters = {"openai": OpenAIProvider, "gemini": GeminiProvider, "novelai": NovelAIProvider, "custom": CustomProvider}
     if kind not in adapters:
         raise ProviderError(f"不支持的绘画接口类型：{kind}")
