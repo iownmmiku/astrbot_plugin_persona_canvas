@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.8"
+VERSION = "0.5.9"
 
 
 class DeliveryRejectedError(ValueError):
@@ -1186,6 +1186,8 @@ class PersonaCanvasPlugin(Star):
         ranges["max_concurrent_targets"] = (1, 16)
         ranges["min_interval_sec"] = (0, 86400)
         ranges["default_probability"] = (0, 100)
+        ranges["max_attempts"] = (1, 5)
+        ranges["retry_interval_sec"] = (60, 3600)
         allowed_groups = {"integration", "dialogue", "reply_images", "llm", "moderation", "generation", "active", "good_morning", "state_lifetimes", "proactive_budget"}
         candidate = copy.deepcopy(self.storage.settings)
         for group, patch in body.items():
@@ -1200,6 +1202,10 @@ class PersonaCanvasPlugin(Star):
                         high = 600
                     if isinstance(value, bool):
                         raise ValueError(f"{key} 必须为数值")
+                    if key in {"max_attempts", "retry_interval_sec"}:
+                        number = float(value)
+                        if not math.isfinite(number) or not number.is_integer():
+                            raise ValueError(f"{key} 必须为整数")
                     value = float(value) if key in {"scale", "default_probability"} else int(value)
                     if not math.isfinite(value) or not low <= value <= high:
                         raise ValueError(f"{key} 应在 {low} 到 {high} 之间")

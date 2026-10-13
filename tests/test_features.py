@@ -237,7 +237,8 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["messages"]["used"], 1)
         self.assertEqual(summary["messages"]["reserved"], 0)
         self.assertEqual(summary["llm"]["used"], 1)
-        self.assertIn("只允许文字或skip", self.context.llm.calls[0]["prompt"])
+        self.assertIn("不允许照片", self.context.llm.calls[0]["prompt"])
+        self.assertFalse(self.image_provider.calls)
         self.store.settings["good_morning"]["enabled"] = False
         first.update(last_active=0, next_opportunity=0)
         await scheduler.tick(wait=True)

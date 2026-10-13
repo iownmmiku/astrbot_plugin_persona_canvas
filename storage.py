@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -45,7 +46,7 @@ DEFAULT_SETTINGS = {
     "providers": {"default": DEFAULT_PROVIDER},
     "moderation": {"enabled": True, "daily_limit": 5, "min_interval_sec": 20, "max_concurrency": 1, "timezone": "Asia/Shanghai"},
     "active": {"enabled": False, "check_interval_sec": 30, "max_concurrent_targets": 3, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "min_idle_sec": 1800, "timezone": "Asia/Shanghai", "silence_after": 3, "silence_hours": 24, "jitter_percent": 15},
-    "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai"},
+    "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai", "max_attempts": 3, "retry_interval_sec": 900},
     "generation": {"width": 832, "height": 1216, "steps": 28, "scale": 5, "sampler": "k_euler_ancestral", "seed": -1, "max_history": 100, "max_concurrency": 2, "timeout_sec": 180},
 }
 JOB_STATUSES = frozenset({"queued", "deciding", "generating", "succeeded", "failed", "sending", "sent", "uncertain", "delivery_failed", "cancelled"})
@@ -672,6 +673,44 @@ class Storage:
             self._check_open()
             row = self._db.execute("SELECT payload FROM deliveries WHERE key=?", (key,)).fetchone()
             return _decoded(row["payload"], "delivery") if row else None
+
+    def claim_delivery_retry(self, key: str, *, now: float, max_attempts: int, allow_role_skip: bool = False) -> dict[str, Any] | None:
+        """Atomically reclaim a due failure or explicitly retryable role skip.
+
+        Sent, ambiguous, and definite delivery failures stay terminal. A role
+        skip needs all three opt-in markers so other skipped work is preserved.
+        """
+        key = _safe_text(key, 2000)
+        if not key:
+            raise StorageError("发送标识不能为空")
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise StorageError("重试时间无效")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise StorageError("重试次数上限无效")
+        with self._lock:
+            self._check_open()
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                row = self._db.execute("SELECT payload FROM deliveries WHERE key=?", (key,)).fetchone()
+                item = _decoded(row["payload"], "delivery") if row else None
+                eligible = item and (item.get("status") == "failed" or (
+                    item.get("status") == "skipped" and allow_role_skip
+                    and item.get("retryable") is True and item.get("skip_reason") == "role_skip"
+                ))
+                attempts = item.get("attempts", 1) if item else None
+                retry_at = item.get("retry_at") if item else None
+                valid_counter = isinstance(attempts, int) and not isinstance(attempts, bool) and 0 <= attempts < max_attempts
+                due = isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and math.isfinite(retry_at) and now >= retry_at
+                if not eligible or not valid_counter or not due:
+                    self._db.commit()
+                    return None
+                item.update(status="claimed", attempts=attempts + 1, retryable=False, updated_at=now)
+                self._db.execute("UPDATE deliveries SET status=?,updated_at=?,payload=? WHERE key=?", (item["status"], now, _json(item), key))
+                self._db.commit()
+                return copy.deepcopy(item)
+            except Exception:
+                self._db.rollback()
+                raise
 
     def update_delivery(self, key: str, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock, self._db:

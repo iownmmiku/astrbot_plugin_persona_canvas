@@ -194,9 +194,20 @@ async function main() {
 
     await page.locator("[data-page='active']").click();
     assert.equal(await get("a-concurrency").inputValue(), "3"); assert.equal(await get("a-concurrency").getAttribute("max"), "16");
-    await get("a-concurrency").fill("5"); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
+    assert.equal(await get("m-attempts").inputValue(), "3"); assert.equal(await get("m-attempts").getAttribute("max"), "5");
+    assert.equal(await get("m-retry-interval").inputValue(), "900"); assert.equal(await get("m-retry-interval").getAttribute("min"), "60"); assert.equal(await get("m-retry-interval").getAttribute("max"), "3600");
+    assert.match(await get("active-form").innerText(), /每天每个目标最多实际发送一次早安/);
+    await get("a-concurrency").fill("5"); await get("m-attempts").fill("4"); await get("m-retry-interval").fill("600"); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
     assert.equal((await lastPost("settings")).active.max_concurrent_targets, 5); assert.equal(await get("a-concurrency").inputValue(), "5");
+    assert.equal((await lastPost("settings")).good_morning.max_attempts, 4); assert.equal((await lastPost("settings")).good_morning.retry_interval_sec, 600);
+    assert.equal(await get("m-attempts").inputValue(), "4"); assert.equal(await get("m-retry-interval").inputValue(), "600");
+    const morningSavedCount = await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length);
+    for (const [id, invalid] of [["m-attempts", "6"], ["m-retry-interval", "59"], ["m-retry-interval", "3601"]]) {
+      await get(id).fill(invalid); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
+      assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length), morningSavedCount, "早安重试配置必须通过范围校验");
+      await get("restore-active").click();
+    }
 
     assert.equal(await get("r-enabled").isChecked(), false, "缺省全局配图关闭");
     assert.equal(await get("r-probability").inputValue(), "20"); assert.equal(await get("r-interval").inputValue(), "300");

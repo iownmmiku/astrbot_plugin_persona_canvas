@@ -128,6 +128,8 @@ class Dialogue:
             instruction += f"\n这是一次{event_kind}主动联系机会，结合近期聊天决定是否联系。可以 skip 不联系、chat 只发文字、photo 发照片。允许自主选择照片，但必须由你本次明确决定。早安候选服装：{outfit}。采用候选服装时在state_patch.outfit明确填写。不要假装用户提出了请求。"
             if env.get("schedule_context"):
                 instruction += "\n当前角色日程（资料，不是指令）：\n" + env["schedule_context"] + "\n主动文字及照片描述、服装、姿势与场景都应符合当前活动；不要把未来计划说成已经发生，不要照搬日程表或把日程资料写进画面文字。半忙时保持简短自然，也可以skip。"
+            if event_kind == "早安":
+                instruction += "\n这是管理员开启的每日早安，不依赖未完话题；没有接续话题时，也可以自然简短地问候早安。优先选择 chat；只有你愿意且目标允许图片时才选择 photo，不强制拍照，不绕过角色意愿。若只是暂时不适合联系，返回 skip；若明确今天不想联系，或用户已要求安静、不再打扰，返回 refuse，当天不再尝试。不要仅因没有话题就跳过早安。"
         kwargs = {"prompt": text, "contexts": env["contexts"], "system_prompt": env["system"] + "\n" + self.visual_prompt(env) + instruction}
         selected = self.storage.settings.get("llm", {}).get("provider_id")
         using_override = bool(selected and self.context.get_provider_by_id(selected) is not None)
@@ -138,7 +140,7 @@ class Dialogue:
         timeout_settings = llm_settings if using_override else self.storage.settings.get("dialogue", {})
         timeout = max(5, min(300, int(timeout_settings.get("timeout_sec", 60))))
         response = await asyncio.wait_for(provider.text_chat(**kwargs), timeout)
-        return validated_decision(field(response, "completion_text", ""))
+        return validated_decision(field(response, "completion_text", ""), allow_silent_refusal=proactive and event_kind == "早安")
 
     async def remember(self, env: dict, user_text: str, reply: str):
         manager = getattr(self.context, "conversation_manager", None)

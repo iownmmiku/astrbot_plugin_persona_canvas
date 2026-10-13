@@ -156,7 +156,7 @@ photo_records 是实际拍摄记录：queued/generating 仅为正在生成，suc
 工具返回后不要再次调用拍摄工具或把失败当成新的请求。不要向用户展示内部 JSON 或配置。
 """
 
-def validated_decision(text: str) -> dict:
+def validated_decision(text: str, *, allow_silent_refusal: bool = False) -> dict:
     value = parse_json(text)
     action = str(value.get("decision") or value.get("action") or "")
     if action not in {"photo", "scene", "edit", "state", "ask", "refuse", "chat", "skip"}:
@@ -165,7 +165,7 @@ def validated_decision(text: str) -> dict:
     prompt = str(value.get("prompt") or "").strip()[:5000]
     if action in {"photo", "scene", "edit"} and not prompt:
         raise ValueError("角色同意拍摄但没有给出完整描述")
-    if action != "skip" and not reply:
+    if action != "skip" and not (action == "refuse" and allow_silent_refusal) and not reply:
         raise ValueError("角色决策缺少回复")
     from .companion import requirements
     return {"decision": action, "reply": reply, "prompt": prompt, "state_patch": state_patch(value.get("state_patch")), "requirements": requirements(value.get("requirements")), "needs_reference": action == "edit" or bool(value.get("needs_reference"))}
