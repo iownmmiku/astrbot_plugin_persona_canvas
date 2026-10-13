@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.7"
+VERSION = "0.5.8"
 
 
 class DeliveryRejectedError(ValueError):
@@ -736,6 +736,8 @@ class PersonaCanvasPlugin(Star):
         persona = copy.deepcopy(env["persona"])
         intent = Intent(mode={"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}[mode], use_persona=mode == "persona", prompt_delta=prompt if mode == "persona" else "", scene_prompt=prompt if mode != "persona" else "", state_patch=patch, raw=raw, caption=caption)
         positive, negative = prompt_bundle(persona, intent)
+        if source in {"active", "morning"} and env.get("schedule_context"):
+            positive += "\nCurrent role schedule (scene context only; do not render this as text):\n" + env["schedule_context"] + "\nThe photo's setting, outfit and action should fit the current activity, not a future plan."
         visual_conditions = {k: agreed[k] for k in ("outfit", "camera", "pose", "expression", "scene") if agreed.get(k)}
         if visual_conditions:
             positive += "\nMandatory agreed shooting conditions: " + json.dumps(visual_conditions, ensure_ascii=False)

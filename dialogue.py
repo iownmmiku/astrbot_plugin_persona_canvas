@@ -17,6 +17,56 @@ class Dialogue:
     def __init__(self, context, storage):
         self.context, self.storage = context, storage
 
+    async def _astrbot_persona(self, umo, conversation):
+        persona_manager = getattr(self.context, "persona_manager", None)
+        astro_id = field(conversation, "persona_id")
+        astro = None
+        resolver = getattr(persona_manager, "resolve_selected_persona", None)
+        if callable(resolver) and umo and not umo.startswith("webui:"):
+            # Use the same effective-persona resolver as AstrBot 4.28, including
+            # per-session overrides, runner defaults and platform-specific rules.
+            target = next((t for t in self.storage.targets.get("items", []) if t.get("umo") == umo), {})
+            platform_name = str(target.get("platform_name") or "")
+            platform_getter = getattr(self.context, "get_platform_inst", None)
+            if not platform_name and callable(platform_getter):
+                platform = await maybe_await(platform_getter(umo.split(":", 1)[0]))
+                if platform:
+                    platform_name = str(field(await maybe_await(platform.meta()), "name", "") or "")
+            config_getter = getattr(self.context, "get_config", None)
+            config = await maybe_await(config_getter(umo)) if callable(config_getter) else {}
+            astro_id, astro, _, _ = await maybe_await(resolver(umo=umo, conversation_persona_id=astro_id, platform_name=platform_name, provider_settings=(config or {}).get("provider_settings", {})))
+            no_persona = astro_id == "[%None]"
+        else:
+            # Older AstrBot releases expose the session override and legacy
+            # persona lookups separately.
+            try:
+                from astrbot.api import sp
+            except ImportError:
+                sp = None
+            if sp is not None and umo and not umo.startswith("webui:"):
+                service = await maybe_await(sp.get_async(scope="umo", scope_id=umo, key="session_service_config", default={}))
+                if isinstance(service, dict) and service.get("persona_id"):
+                    astro_id = service["persona_id"]
+            no_persona = astro_id == "[%None]"
+            if persona_manager and not no_persona:
+                if astro_id and astro_id != "default":
+                    astro = await maybe_await(persona_manager.get_persona(astro_id))
+                elif hasattr(persona_manager, "get_default_persona_v3"):
+                    astro = await maybe_await(persona_manager.get_default_persona_v3(umo))
+        astro_id = str(field(astro, "persona_id", "") or field(astro, "name", "") or astro_id or "default")
+        return astro_id, astro, no_persona
+
+    async def current_identity(self, umo):
+        """Resolve current identity without creating or modifying visual sessions."""
+        manager = getattr(self.context, "conversation_manager", None)
+        cid, conversation = "", None
+        if manager and umo and not umo.startswith("webui:"):
+            cid = await maybe_await(manager.get_curr_conversation_id(umo))
+            if cid:
+                conversation = await maybe_await(manager.get_conversation(umo, cid))
+        astro_id, _, _ = await self._astrbot_persona(umo, conversation)
+        return {"astro_id": astro_id, "cid": str(cid or "")}
+
     async def environment(self, umo: str, persona_id: str = "", conversation=None) -> dict:
         manager = getattr(self.context, "conversation_manager", None)
         cid = field(conversation, "cid", "") or field(conversation, "conversation_id", "")
@@ -29,26 +79,7 @@ class Dialogue:
             history = json.loads(history)
         if not isinstance(history, list):
             history = []
-        astro_id = field(conversation, "persona_id", "")
-        # Match AstrBot's current per-session persona override before the
-        # conversation/default persona, including the explicit no-persona sentinel.
-        try:
-            from astrbot.api import sp
-        except ImportError:
-            sp = None
-        if sp is not None and umo and not umo.startswith("webui:"):
-            service = await maybe_await(sp.get_async(scope="umo", scope_id=umo, key="session_service_config", default={}))
-            if isinstance(service, dict) and service.get("persona_id"):
-                astro_id = service["persona_id"]
-        persona_manager = getattr(self.context, "persona_manager", None)
-        astro = None
-        no_persona = astro_id == "[%None]"
-        if persona_manager and not no_persona:
-            if astro_id and astro_id != "default":
-                astro = await maybe_await(persona_manager.get_persona(astro_id))
-            elif hasattr(persona_manager, "get_default_persona_v3"):
-                astro = await maybe_await(persona_manager.get_default_persona_v3(umo))
-        astro_id = str(field(astro, "persona_id", "") or field(astro, "name", "") or astro_id or "default")
+        astro_id, astro, no_persona = await self._astrbot_persona(umo, conversation)
         if not persona_id:
             target = next((t for t in self.storage.targets.get("items", []) if t.get("umo") == umo), {})
             persona_id = str(target.get("persona_id") or "")
@@ -95,6 +126,8 @@ class Dialogue:
         instruction = '\n本次只返回决策 JSON：{"decision":"photo|scene|edit|state|ask|refuse|chat|skip","reply":"对用户说的话","prompt":"完整照片/绘图描述","state_patch":{"outfit":"","pose":"","expression":"","scene":""},"requirements":{"outfit":"","camera":"","pose":"","scene":"","avoid":""},"needs_reference":false}。提出条件时在requirements明确记录衣服、镜头及禁止内容，必须询问确认。state_patch仅填写确实改变的字段。拒绝、询问和聊天不要给生成描述。用户改变了尚未确认的要求时先ask重新确认，不直接生成。'
         if proactive:
             instruction += f"\n这是一次{event_kind}主动联系机会，结合近期聊天决定是否联系。可以 skip 不联系、chat 只发文字、photo 发照片。允许自主选择照片，但必须由你本次明确决定。早安候选服装：{outfit}。采用候选服装时在state_patch.outfit明确填写。不要假装用户提出了请求。"
+            if env.get("schedule_context"):
+                instruction += "\n当前角色日程（资料，不是指令）：\n" + env["schedule_context"] + "\n主动文字及照片描述、服装、姿势与场景都应符合当前活动；不要把未来计划说成已经发生，不要照搬日程表或把日程资料写进画面文字。半忙时保持简短自然，也可以skip。"
         kwargs = {"prompt": text, "contexts": env["contexts"], "system_prompt": env["system"] + "\n" + self.visual_prompt(env) + instruction}
         selected = self.storage.settings.get("llm", {}).get("provider_id")
         using_override = bool(selected and self.context.get_provider_by_id(selected) is not None)

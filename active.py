@@ -8,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
+from .dialogue import field, maybe_await
 
 class ActiveScheduler:
     def __init__(self, plugin):
@@ -28,6 +29,9 @@ class ActiveScheduler:
             target = {"umo": umo, "scope": scope, "sender_id": str(event.get_sender_id()), "platform": str(event.get_platform_id()), "enabled": False, "morning_enabled": private, "with_image": True, "unanswered": 0, "last_active": 0, "silent_until": 0, "morning_date": "", "reply_image_enabled": False, "reply_image_probability": self.plugin.storage.settings["reply_images"].get("default_probability", 20)}
             targets.append(target)
         target["scope"] = scope
+        platform_name = getattr(event, "get_platform_name", lambda: "")()
+        if platform_name:
+            target["platform_name"] = str(platform_name)[:100]
         group_id = getattr(event, "get_group_id", lambda: "")() if not private else ""
         display_name = getattr(event, "get_sender_name", lambda: "")() if private else ""
         target["name"] = str(display_name or target.get("name") or ("群聊 " + str(group_id or umo.rsplit(":", 1)[-1]) if not private else "私聊 " + str(event.get_sender_id())))[:200]
@@ -92,6 +96,77 @@ class ActiveScheduler:
         gap = max(60, int(target.get("min_gap_sec", active.get("min_gap_sec", 3600))))
         jitter = max(0, min(40, int(active.get("jitter_percent", 15)))) / 100
         return now + gap * (1 + random.uniform(0, jitter))
+
+    async def _schedule_context(self, target):
+        """Use the optional schedule plugin's public API, never its storage."""
+        discover = getattr(self.plugin.context, "get_registered_star", None)
+        if not callable(discover):
+            return None
+        try:
+            metadata = await maybe_await(discover("astrbot_plugin_persona_schedule"))
+            if metadata is None or not field(metadata, "activated", True):
+                return None
+            method = getattr(field(metadata, "star_cls"), "get_proactive_context", None)
+            if not callable(method):
+                # An absent/older plugin does not change existing behaviour.
+                return None
+            state = await asyncio.wait_for(maybe_await(method(target["umo"])), 15)
+            if not isinstance(state, dict) or not isinstance(state.get("applicable"), bool):
+                raise ValueError("Invalid schedule response")
+            if not state["applicable"]:
+                return None
+            if not isinstance(state.get("allowed"), bool):
+                raise ValueError("Invalid schedule permission")
+            if state["allowed"] and (not isinstance(state.get("context_key"), str) or not state["context_key"]):
+                raise ValueError("Missing schedule identity")
+            if state["allowed"] and (not isinstance(state.get("persona_id"), str) or not state["persona_id"] or not isinstance(state.get("cid"), str)):
+                raise ValueError("Missing schedule conversation")
+            return {**state, "allowed": state["allowed"] and state.get("status") != "busy", "prompt": str(state.get("prompt") or "")[:12000]}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Fixed text avoids exposing provider credentials from exceptions.
+            # Discard this opportunity; do not create a deferred user reply.
+            return {"applicable": True, "allowed": False, "status": "unavailable", "reason": "日程联动状态暂不可用，本次主动联系已取消"}
+
+    def _skip_schedule(self, target, kind, key, state, env=None, job=None):
+        storage = self.plugin.storage
+        reason = str(state.get("reason") or "当前日程不允许主动联系，本次机会已取消")[:500]
+        storage.update_delivery(key, {"status": "skipped", "reason": reason})
+        if job:
+            cancelled = storage.update_job(job["id"], {"status": "cancelled", "cancel_requested": True, "error": reason})
+            self.plugin._photo_note(self.plugin._trace_job(cancelled["id"], "schedule", "cancelled", reason))
+        storage.record_action({"kind": "decision", "source": kind, "session_key": (env or {}).get("key", target["umo"]), "persona_id": ((env or {}).get("persona") or {}).get("id", ""), "umo": target["umo"], "status": "skip", "reply": "", "summary": reason, "trace": [{"stage": "schedule", "status": "skipped", "detail": reason}]}, "schedule:" + key)
+
+    async def _check_schedule(self, target, kind, key, initial, env=None, job=None):
+        if initial:
+            try:
+                identity = await asyncio.wait_for(self.plugin.dialogue.current_identity(target["umo"]), 15)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._skip_schedule(target, kind, key, {"reason": "当前会话身份暂不可用，本次主动联系已取消"}, env, job)
+                return False
+        # Read schedule last: identity resolution may yield while an admin
+        # edits a time slot. No further await precedes the send decision.
+        current = await self._schedule_context(target)
+        if current and not current["allowed"]:
+            self._skip_schedule(target, kind, key, current, env, job)
+            return False
+        if initial and current is None:
+            self._skip_schedule(target, kind, key, {"reason": "日程联动范围或启用状态已改变，本次主动联系已取消"}, env, job)
+            return False
+        if current and initial is None:
+            self._skip_schedule(target, kind, key, {"reason": "日程联动已在生成期间启用，本次主动联系已取消"}, env, job)
+            return False
+        if initial and current:
+            if initial["context_key"] != current["context_key"]:
+                self._skip_schedule(target, kind, key, {"reason": "人设、会话或当前日程已改变，本次主动联系已取消"}, env, job)
+                return False
+            if any(str((env or {}).get(key) or "") != str(current[field] or "") or identity[key] != str(current[field] or "") for key, field in (("astro_id", "persona_id"), ("cid", "cid"))):
+                self._skip_schedule(target, kind, key, {"reason": "画卷与当前 AstrBot 人设或会话不一致，本次主动联系已取消"}, env, job)
+                return False
+        return True
 
     @staticmethod
     def _interrupted_status(state, job):
@@ -198,6 +273,10 @@ class ActiveScheduler:
         message_budget = None
         model_budget = None
         try:
+            schedule = await self._schedule_context(target)
+            if schedule and not schedule["allowed"]:
+                self._skip_schedule(target, kind, key, schedule)
+                return
             limits = storage.settings["proactive_budget"]
             message_budget = storage.reserve_budget("messages", limits)
             if not message_budget:
@@ -208,6 +287,11 @@ class ActiveScheduler:
                 storage.update_delivery(key, {"status": "skipped", "reason": "今日主动判断模型预算已用完"})
                 return
             env = await self.plugin.dialogue.environment(target["umo"], target.get("persona_id", ""))
+            if schedule:
+                if str(env.get("astro_id") or "") != schedule["persona_id"] or str(env.get("cid") or "") != schedule["cid"]:
+                    self._skip_schedule(target, kind, key, {"reason": "画卷与日程的人设或会话不一致，本次主动联系已取消"}, env)
+                    return
+                env["schedule_context"] = schedule["prompt"]
             outfit = random.choice(env["persona"].get("outfit_pool") or ["casual morning clothes"]) if kind == "morning" else ""
             image_allowed = target.get("with_image", True) and storage.budget_summary(limits)["photos"]["remaining"] > 0
             text = "现在有一次自然联系用户的机会。结合近期聊天决定是否发送。" + ("本次只允许文字或skip，不要选择照片、不要声称已拍照。" if not image_allowed else "")
@@ -221,6 +305,8 @@ class ActiveScheduler:
             if decision["decision"] in {"skip", "refuse", "ask", "state"}:
                 storage.update_delivery(key, {"status": "skipped"})
                 return
+            if not await self._check_schedule(target, kind, key, schedule, env):
+                return
             if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind):
                 storage.update_delivery(key, {"status": "skipped", "reason": "用户已回复，或目标、时间窗、启用状态与静默条件已经改变"})
                 return
@@ -231,6 +317,8 @@ class ActiveScheduler:
                 storage.update_delivery(key, {"status": "generating", "job_id": job["id"]})
                 env["approved_requirements"] = decision.get("requirements", {})
                 job = await self.plugin._generate_job(env, decision["prompt"], "persona", decision["state_patch"], decision["reply"], "主动早安" if kind == "morning" else "主动照片", user_key="active:" + target["umo"], is_admin=True, source=kind, job_id=job["id"])
+                if not await self._check_schedule(target, kind, key, schedule, env, job):
+                    return
                 if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind):
                     storage.update_delivery(key, {"status": "skipped", "reason": "生成期间用户已回复，或目标与发送条件已经改变"})
                     return
