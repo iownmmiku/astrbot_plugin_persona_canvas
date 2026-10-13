@@ -213,10 +213,10 @@ class NativeFailureNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_image_delivery_keeps_saved_asset_and_delivery_state(self):
         event = Event("看看自拍")
         event.message_obj = types.SimpleNamespace(message_id="rejected-image-notice")
-        async def rejected_image(chain):
-            event.sent.append(chain)
-            return False
-        event.send = rejected_image
+        async def rejected_image(umo, chain):
+            self.context.sent.append((umo, chain))
+            return not any(kind == "image" for kind, _ in chain.chain)
+        self.context.send_message = rejected_image
         _, job = await self.native(event)
         self.assertEqual(job["status"], "delivery_failed")
         self.assertEqual(job["failure_stage"], "delivery")
@@ -224,9 +224,13 @@ class NativeFailureNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.delivery(job["delivery_key"])["status"], "delivery_failed")
         self.assertEqual(job["notification_state"], "accepted")
         self.assertEqual(job["notification_channel"], "context")
-        self.assertEqual(len(event.sent), 1)
-        self.assertEqual(len(self.context.sent), 1)
-        self.assertIn("照片已保留", str(self.context.sent[0][1].chain))
+        self.assertFalse(event.sent)
+        self.assertEqual(len(self.context.sent), 2)
+        self.assertEqual([umo for umo, _ in self.context.sent], [event.unified_msg_origin] * 2)
+        self.assertTrue(any(kind == "image" for kind, _ in self.context.sent[0][1].chain))
+        self.assertFalse(any(kind == "image" for kind, _ in self.context.sent[1][1].chain))
+        self.assertIn("原图已保留", str(self.context.sent[1][1].chain))
+        self.assertEqual(len(self.image_provider.calls), 1)
 
     async def test_local_image_message_preparation_failure_keeps_generation_result(self):
         with patch.object(fixtures.main.MessageChain, "file_image", side_effect=ValueError("local message preparation failed")):
@@ -244,16 +248,25 @@ class NativeFailureNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_image_delivery_keeps_saved_asset_and_uncertainty(self):
         event = Event("看看自拍")
         event.message_obj = types.SimpleNamespace(message_id="uncertain-image-notice")
-        async def uncertain_image(_chain):
-            raise ConnectionError("adapter connection lost")
-        event.send = uncertain_image
+        async def uncertain_image(umo, chain):
+            self.context.sent.append((umo, chain))
+            if any(kind == "image" for kind, _ in chain.chain):
+                raise ConnectionError("adapter connection lost")
+            return True
+        self.context.send_message = uncertain_image
         _, job = await self.native(event)
         self.assertEqual(job["status"], "uncertain")
         self.assertTrue(self.store.asset(job["asset"]).is_file())
         self.assertEqual(self.store.delivery(job["delivery_key"])["status"], "uncertain")
         self.assertEqual(job["notification_state"], "accepted")
+        self.assertEqual(job["notification_channel"], "context")
         self.assertEqual(len(self.image_provider.calls), 1)
-        self.assertIn("发送结果不确定", str(self.context.sent[0][1].chain))
+        self.assertFalse(event.sent)
+        self.assertEqual(len(self.context.sent), 2)
+        self.assertEqual([umo for umo, _ in self.context.sent], [event.unified_msg_origin] * 2)
+        self.assertTrue(any(kind == "image" for kind, _ in self.context.sent[0][1].chain))
+        self.assertFalse(any(kind == "image" for kind, _ in self.context.sent[1][1].chain))
+        self.assertIn("发送结果不确定", str(self.context.sent[1][1].chain))
 
 
 if __name__ == "__main__":

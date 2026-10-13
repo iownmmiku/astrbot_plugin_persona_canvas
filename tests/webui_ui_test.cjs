@@ -34,13 +34,20 @@ const fixtures = {
   ] },
   targets: { items: [{ umo: "offline:FriendMessage:friend", name: "私聊测试", scope: "private", enabled: false, morning_enabled: false, reply_image_enabled: false }, { umo: "offline:GroupMessage:group", name: "群聊测试", scope: "group", enabled: false, morning_enabled: false, reply_image_enabled: false }] }, sessions: { items: [] },
   jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", notification_state: "failed", notification_error: "<img src=x onerror=alert(1)> 平台未接受通知", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", notification_state: "uncertain", notification_error: "传输结果未知", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
-    { id: "job-delivery-failed", status: "delivery_failed", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
+    { id: "job-delivery-failed", status: "delivery_failed", source: "chat", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
     { id: "job-uncertain", status: "uncertain", caption: "已生成发送待确认", asset: "original-uncertain.png", umo: "offline:FriendMessage:test", created_at: 1725000000 },
     { id: "job-sending", status: "sending", caption: "原图正在发送", asset: "sending.png", umo: "offline:FriendMessage:test", created_at: 1724000000 },
     { id: "job-local", status: "queued", phase: "local_queued", caption: "离线本地排队", created_at: 1723000000 },
+    { id: "job-sent", status: "sent", source: "chat", caption: "旧版已发送但尚未收到", asset: "old-sent.png", umo: "offline:FriendMessage:test", delivery_evidence: "unverified", created_at: 1722000000 },
+    { id: "job-sent-noasset", status: "sent", source: "chat", caption: "已发送但没有原图", umo: "offline:FriendMessage:test", created_at: 1721000000 },
+    { id: "job-sent-webui", status: "sent", source: "webui", caption: "工作台原图没有聊天目标", asset: "webui.png", umo: "webui:test", created_at: 1720000000 },
+    { id: "job-sent-unknown", status: "sent", source: "unknown", caption: "来源不明的旧记录", asset: "unknown.png", umo: "offline:FriendMessage:test", created_at: 1719000000 },
+    { id: "job-sent-cancelled", status: "sent", source: "active", caption: "用户已撤回的已发送照片", asset: "cancelled.png", umo: "offline:FriendMessage:test", cancel_requested: true, created_at: 1718000000 },
+    { id: "job-succeeded", status: "succeeded", source: "webui", caption: "仅工作台生成完成", asset: "succeeded.png", created_at: 1717000000 },
+    { id: "job-call-completed", status: "sent", source: "morning", caption: "发送调用已经完成", asset: "call-completed.png", umo: "offline:FriendMessage:test", delivery_evidence: "call_completed", created_at: 1716000000 },
   ] },
   history: { items: [{ job_id: "job-failed", ok: false, caption: "离线失败测试", provider: "default", model: "offline-image", error: "绘图接口超时", request_summary: requestSummary, state_patch: { outfit: "white dress" }, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] },
-    { job_id: "job-delivery-failed", ok: true, caption: "已生成平台拒收" }, { job_id: "job-uncertain", ok: true, caption: "已生成发送待确认" },
+    { job_id: "job-delivery-failed", ok: true, caption: "已生成平台拒收" }, { job_id: "job-uncertain", ok: true, caption: "已生成发送待确认" }, { job_id: "job-sent", ok: true, caption: "旧版已发送但尚未收到" },
   ] },
   diagnostics: { setup: [], budget: {}, items: [{ status: "failed", summary: "离线失败测试", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }] },
   "llm/providers": { items: [], personas: [] },
@@ -85,7 +92,8 @@ async function main() {
             const job = data.jobs.items.find(item => item.id === body.id);
             job.status = "sending";
             await new Promise(resolve => { window.__releaseResend = resolve; });
-            job.status = window.__resendFailure ? "delivery_failed" : "sent";
+            job.status = window.__resendFailure ? "delivery_failed" : job.delivery_evidence === "unverified" ? "uncertain" : "sent";
+            if (job.status === "uncertain") return { ok: false, error: "发送调用已完成，终端送达未知", status: "uncertain", generated: false, job_id: job.id };
             return window.__resendFailure ? { ok: false, error: "离线平台明确拒收" } : { ok: true, message: "原图已补发", job_id: job.id };
           }
           if (route === "settings") { for (const [key, patch] of Object.entries(body)) data.state.settings[key] = { ...data.state.settings[key], ...patch }; return { ok: true }; }
@@ -278,8 +286,13 @@ async function main() {
     const deliveryRow = get("job-list").locator("article").filter({ hasText: "已生成平台拒收" });
     const uncertainRow = get("job-list").locator("article").filter({ hasText: "已生成发送待确认" });
     const sendingRow = get("job-list").locator("article").filter({ hasText: "原图正在发送" });
+    const sentRow = get("job-list").locator("article").filter({ hasText: "旧版已发送但尚未收到" });
     assert.equal(await deliveryRow.getByRole("button", { name: "重试", exact: true }).count(), 0, "发送失败不能安排重新绘图");
     assert.equal(await sendingRow.getByRole("button", { name: "正在发送原图…", exact: true }).isDisabled(), true);
+    for (const caption of ["已发送但没有原图", "工作台原图没有聊天目标", "来源不明的旧记录", "用户已撤回的已发送照片", "仅工作台生成完成"]) assert.equal(await get("job-list").locator("article").filter({ hasText: caption }).getByRole("button", { name: /补发/ }).count(), 0, `${caption}不能开放补发`);
+    assert.match(await sentRow.innerText(), /平台未提供可核对的发送回执/);
+    assert.match(await get("job-list").locator("article").filter({ hasText: "发送调用已经完成" }).innerText(), /发送调用已完成，终端送达未知/);
+    assert.equal(await sentRow.getByRole("button", { name: "查看画面", exact: true }).count(), 1, "历史已发送记录仍可查看原图");
     await deliveryRow.getByRole("button", { name: "补发原图", exact: true }).click();
     await page.waitForFunction(() => Boolean(window.__releaseResend));
     assert.equal(await deliveryRow.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true);
@@ -290,12 +303,33 @@ async function main() {
     await page.evaluate(() => { window.__releaseResend(); window.__releaseResend = null; });
     await page.waitForFunction(() => window.__canvasFixtures.jobs.items.find(job => job.id === "job-delivery-failed").status === "sent");
     await page.waitForFunction(() => !Array.from(document.querySelectorAll("#history-list button")).some(button => button.textContent === "正在补发原图…"));
-    assert.equal(await deliveryHistory.getByRole("button", { name: /补发/ }).count(), 0, "已发送任务不保留重复补发入口");
+    assert.equal(await deliveryHistory.getByRole("button", { name: "确认未收到后补发原图", exact: true }).count(), 1, "已发送记录仅开放明确核对后的补发入口");
     await page.locator("[data-page='studio']").click();
+    await sentRow.getByRole("button", { name: "确认未收到后补发原图", exact: true }).click();
+    assert.equal(await get("confirm-ok").isDisabled(), true); assert.equal(await get("confirm-uncertain-row").isVisible(), true);
+    assert.match(await get("confirm-message").innerText(), /状态已发送不保证实际收到/); assert.match(await get("confirm-message").innerText(), /可能造成重复/);
+    await get("confirm-cancel").click();
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 1, "取消历史已发送补发确认不调用接口");
+    await page.locator("[data-page='history']").click();
+    const sentHistory = get("history-list").locator("article").filter({ hasText: "旧版已发送但尚未收到" });
+    await sentHistory.getByRole("button", { name: "确认未收到后补发原图", exact: true }).click();
+    await get("confirm-uncertain").check(); await get("confirm-ok").click();
+    await page.waitForFunction(() => Boolean(window.__releaseResend));
+    assert.deepEqual(await lastPost("jobs/resend"), { id: "job-sent", confirm_uncertain: true });
+    assert.equal(await sentHistory.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true);
+    await page.locator("[data-page='studio']").click();
+    const sentPending = sentRow.getByRole("button", { name: "正在补发原图…", exact: true });
+    assert.equal(await sentPending.isDisabled(), true, "任务与历史共用历史已发送补发状态");
+    await sentPending.dispatchEvent("click");
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 2, "补发中的重复点击不重复发送");
+    await page.evaluate(() => { window.__releaseResend(); window.__releaseResend = null; });
+    await page.waitForFunction(() => !Array.from(document.querySelectorAll("#job-list button")).some(button => button.textContent === "正在补发原图…"));
+    assert.match(await get("notice").innerText(), /发送调用已完成，终端送达未知/);
+    assert.equal(await sentRow.getByRole("button", { name: "核对后补发原图", exact: true }).count(), 1, "没有发送回执的补发结果仍需核对");
     await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
     assert.equal(await get("confirm-ok").isDisabled(), true); assert.equal(await get("confirm-uncertain-row").isVisible(), true);
     await get("confirm-cancel").click();
-    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 1, "未明确核对不能补发结果不明的任务");
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 2, "未明确核对不能补发结果不明的任务");
     await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
     await get("confirm-uncertain").check(); assert.equal(await get("confirm-ok").isDisabled(), false); await get("confirm-ok").click();
     await page.waitForFunction(() => Boolean(window.__releaseResend));
@@ -329,15 +363,15 @@ async function main() {
     assert.equal(await get("v-workflow").isVisible(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动工作流编辑器不应横向溢出");
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-comfy-mobile.png"), fullPage: true });
-    await page.evaluate(() => { window.__canvasFixtures.jobs.items.find(job => job.id === "job-uncertain").status = "uncertain"; });
+    await page.evaluate(() => { window.__canvasFixtures.jobs.items.find(job => job.id === "job-sent").status = "sent"; });
     await page.locator("[data-page='studio']").click(); await get("refresh-jobs").click();
-    await uncertainRow.getByRole("button", { name: "核对后补发原图", exact: true }).click();
+    await sentRow.getByRole("button", { name: "确认未收到后补发原图", exact: true }).click();
     assert.equal(await get("confirm-ok").isDisabled(), true);
     assert.equal(await page.evaluate(() => { const box = document.getElementById("confirm-dialog").getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth; }), true, "移动补发确认框应完整显示");
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-resend-mobile.png"), fullPage: true });
     await get("confirm-cancel").click();
     assert.deepEqual(browserErrors, [], "页面运行不应有未捕获的 JavaScript 异常");
-    console.log("PASS: WebUI offline Chrome checks (ComfyUI workflow import and mapping, per-chat reply images and probability, private/group scopes, negative modes, mapping reset, Gemini options, failed test summaries, resend confirmation, target concurrency, escaping, mobile layout).");
+    console.log("PASS: WebUI offline Chrome checks (ComfyUI workflow import and mapping, per-chat reply images and probability, private/group scopes, negative modes, mapping reset, Gemini options, failed test summaries, uncertain and historical sent resend confirmation, delivery evidence, target concurrency, escaping, mobile layout).");
   } finally {
     if (browser) await browser.close();
     await new Promise(resolve => server.close(resolve));

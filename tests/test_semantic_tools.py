@@ -35,7 +35,10 @@ class SemanticToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(job["status"], "sent")
                 self.assertEqual(job["request_basis"]["source"], "model_tool")
                 self.assertIn("语义判断", job["trace"][0]["detail"])
-                self.assertTrue(event.sent)
+                self.assertEqual(len(self.context.sent), index + 1)
+                self.assertEqual(self.context.sent[-1][0], event.unified_msg_origin)
+                self.assertTrue(any(kind == "image" for kind, _ in self.context.sent[-1][1].chain))
+                self.assertFalse(event.sent)
         self.assertEqual(len(self.image_provider.calls), 2)
         self.assertFalse(self.context.llm.calls, "Native tools must not spend an extra classification call")
 

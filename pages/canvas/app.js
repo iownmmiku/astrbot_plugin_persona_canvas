@@ -385,14 +385,20 @@ function renderSessions() {
 }
 function safeImage(source) { return typeof source === "string" && /^data:image\/(png|jpeg|webp|gif|avif);base64,/i.test(source) ? source : ""; }
 function jobImage(job) { return safeImage(job.image || job.image_url || job.result?.image || model.history.find(h => h.job_id === jobId(job) || h.id === jobId(job))?.image); }
+function canResendImage(job) {
+  if (!jobId(job) || !job.asset || job.cancel_requested || typeof job.umo !== "string" || !/^[^:\s]+:[^:\s]+:.+$/.test(job.umo) || job.umo.startsWith("webui:")) return false;
+  if (["delivery_failed", "uncertain"].includes(job.status)) return true;
+  return job.status === "sent" && ["chat", "active", "morning", "reply_image"].includes(job.source);
+}
 async function resendImage(job) {
   const id = jobId(job);
-  if (resending.has(id)) return;
+  if (resending.has(id) || !canResendImage(job)) return;
   resending.add(id); renderJobs(); renderHistory();
   try {
-    const uncertain = job.status === "uncertain";
-    if (uncertain && !await confirmAction("核对后补发原图", "先检查目标聊天记录。确认没有收到这张图片后，再补发同一张原图。", { requireUncertainCheck: true })) return;
-    const result = await api("jobs/resend", "POST", { id, confirm_uncertain: uncertain });
+    const needsConfirmation = ["uncertain", "sent"].includes(job.status);
+    const message = job.status === "sent" ? "状态已发送不保证实际收到。请先检查目标聊天记录，确认未收到后再补发同一张原图；补发可能造成重复消息。" : "先检查目标聊天记录。确认没有收到这张图片后，再补发同一张原图；补发可能造成重复消息。";
+    if (needsConfirmation && !await confirmAction(job.status === "sent" ? "确认未收到后补发原图" : "核对后补发原图", message, { requireUncertainCheck: true })) return;
+    const result = await api("jobs/resend", "POST", { id, confirm_uncertain: needsConfirmation });
     notice(result.message || result.error || "原图补发操作已完成，请查看任务的发送状态。", result.ok === false);
     await refreshJobs();
   } finally { resending.delete(id); renderJobs(); renderHistory(); }
@@ -400,7 +406,9 @@ async function resendImage(job) {
 function deliveryActions(actions, body, job) {
   if (job.status === "delivery_failed") body.append(node("p", "danger-text", "图片已生成并保存，补发将发送同一张原图，不会重新生图。"));
   if (job.status === "uncertain") body.append(node("p", "danger-text", "请先检查目标聊天记录，确认原图尚未收到，再补发。"));
-  if (["delivery_failed", "uncertain"].includes(job.status) && !job.cancel_requested) { const resend = button(resending.has(jobId(job)) ? "正在补发原图…" : job.status === "uncertain" ? "核对后补发原图" : "补发原图", () => resendImage(job)); resend.disabled = resending.has(jobId(job)); actions.append(resend); }
+  if (job.delivery_evidence === "unverified") body.append(node("p", "danger-text", "平台未提供可核对的发送回执，发送状态不保证实际收到，请检查目标聊天记录。"));
+  if (job.delivery_evidence === "call_completed") body.append(node("p", "muted", "发送调用已完成，终端送达未知；请核对目标聊天记录。"));
+  if (canResendImage(job)) { const resend = button(resending.has(jobId(job)) ? "正在补发原图…" : job.status === "sent" ? "确认未收到后补发原图" : job.status === "uncertain" ? "核对后补发原图" : "补发原图", () => resendImage(job)); resend.disabled = resending.has(jobId(job)); actions.append(resend); }
   if (job.status === "sending") { const pending = button("正在发送原图…", () => {}); pending.disabled = true; actions.append(pending); }
 }
 function renderJobs() {
@@ -411,7 +419,7 @@ function renderJobs() {
     body.append(node("span", `badge ${job.status}`, statusNames[job.status] || job.status), node("p", "", job.caption || job.request?.text || job.text || "生成任务"), node("small", "", `${jobId(job)} · ${job.provider || job.request?.provider || "默认接口"} · ${date(job.created_at || job.at)}`));
     if (job.error) body.append(node("pre", "", job.error));
     if (job.status === "queued" && job.phase === "local_queued") body.append(node("p", "muted", "本地预检通过，等待后台提交，尚无上游受理凭据。"));
-    if (job.notification_state) { const labels = { sending: "正在发送失败通知", accepted: "平台已接受失败通知，终端送达未知", failed: "失败通知未发送", uncertain: "失败通知结果不确定" }; body.append(node("p", ["failed", "uncertain"].includes(job.notification_state) ? "danger-text" : "muted", `${labels[job.notification_state] || job.notification_state}${job.notification_error ? `：${job.notification_error}` : ""}`)); }
+    if (job.notification_state) { const labels = { sending: "正在发送失败通知", accepted: "失败通知发送调用已完成，终端送达未知", failed: "失败通知未发送", uncertain: "失败通知结果不确定" }; body.append(node("p", ["failed", "uncertain"].includes(job.notification_state) ? "danger-text" : "muted", `${labels[job.notification_state] || job.notification_state}${job.notification_error ? `：${job.notification_error}` : ""}`)); }
     if (finished(job) || job.asset || jobImage(job)) actions.append(button("查看画面", async () => { selection.previewJob = jobId(job); renderPreview(job); }));
     if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
     deliveryActions(actions, body, job);

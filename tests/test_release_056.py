@@ -118,7 +118,9 @@ class Release056Tests(unittest.IsolatedAsyncioTestCase):
         event = Event("不用重新生成，把刚才那张发我")
         result = json.loads(await self.plugin.tool_control(event, "resend", "用户明确要求原图补发而非重新绘制", job_id=job["id"]))
         self.assertTrue(result["ok"], result)
-        self.assertEqual(len(event.sent), 1)
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertEqual(self.context.sent[0][0], job["umo"])
+        self.assertFalse(event.sent)
         self.assertEqual(len(self.image_provider.calls), 1)
 
     async def test_resend_refuses_cancelled_changed_persona_and_studio_destination(self):

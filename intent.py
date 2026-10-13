@@ -150,7 +150,7 @@ DECISION_RULES = """
 固定长相不可被临时衣服/场景覆盖；害羞、姿势和镜头选择要落实进照片描述。
 单独换装可以调用 persona_canvas_state，不会自动拍照。图片编辑必须提供实际参考图。
 提拍摄条件时使用 persona_canvas_conditions 记录具体衣服、镜头和禁止内容。待确认要求被修改后重新询问，不得直接拍。
-photo_records 是实际拍摄记录：queued 为本地等待，generating/dispatching 为请求处理中，不证明上游已受理；succeeded 仅表示图片生成完成，sent 才表示平台接受发图，cancelled 不得继续发送。submitted 只标记开始请求尝试，不代表服务已经接受或用户已经收到；以记录为准，不声称看过未生成的画面。
+photo_records 是实际拍摄记录：queued 为本地等待，generating/dispatching 为请求处理中，不证明上游已受理；succeeded 仅表示图片生成完成，sent 表示发送调用已完成，不能证明终端收到。WebChat 缺少投递或历史保存确认时为 uncertain，不能声称用户已看到图片。cancelled 不得继续发送。submitted 只标记开始请求尝试，不代表服务已经接受或用户已经收到；以记录为准，不声称看过未生成的画面。
 记录中的 summary 和 visual_state 是生成时的描述与状态快照，不是视觉模型对图片的识别结论。mode 为 scene 时是普通绘图，不是你的自拍。
 一次请求只拍一次。工具返回失败时如实说明，不能声称图片已完成。工具已发送图片时简短回应即可。
 工具返回后不要再次调用拍摄工具或把失败当成新的请求。不要向用户展示内部 JSON 或配置。

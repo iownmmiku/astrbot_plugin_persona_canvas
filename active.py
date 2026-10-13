@@ -29,6 +29,12 @@ class ActiveScheduler:
             target = {"umo": umo, "scope": scope, "sender_id": str(event.get_sender_id()), "platform": str(event.get_platform_id()), "enabled": False, "morning_enabled": private, "with_image": True, "unanswered": 0, "last_active": 0, "silent_until": 0, "morning_date": "", "reply_image_enabled": False, "reply_image_probability": self.plugin.storage.settings["reply_images"].get("default_probability", 20)}
             targets.append(target)
         target["scope"] = scope
+        platform_name = getattr(event, "get_platform_name", None)
+        if callable(platform_name):
+            try:
+                target["platform_type"] = str(platform_name() or "")[:100]
+            except Exception:
+                pass
         platform_name = getattr(event, "get_platform_name", lambda: "")()
         if platform_name:
             target["platform_name"] = str(platform_name)[:100]
@@ -356,10 +362,12 @@ class ActiveScheduler:
             if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind):
                 storage.update_delivery(key, {"status": "skipped", "reason": "用户已回复，或目标、时间窗、启用状态与静默条件已经改变"})
                 return
+            webchat_delivery = self.plugin._is_webchat(target["umo"], job={"delivery_platform": target.get("platform_type", "")})
+            delivery_unconfirmed = False
             if decision["decision"] in {"photo", "scene", "edit"}:
                 if not image_allowed or decision["decision"] != "photo":
                     raise ValueError("主动照片只支持已启用的人设拍摄")
-                job = storage.create_job({"status": "queued", "source": kind, "delivery_key": key, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "caption": decision["reply"], "mode": "persona"})
+                job = storage.create_job({"status": "queued", "source": kind, "delivery_platform": target.get("platform_type", ""), "delivery_key": key, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "caption": decision["reply"], "mode": "persona"})
                 storage.update_delivery(key, {"status": "generating", "job_id": job["id"]})
                 env["approved_requirements"] = decision.get("requirements", {})
                 job = await self.plugin._generate_job(env, decision["prompt"], "persona", decision["state_patch"], decision["reply"], "主动早安" if kind == "morning" else "主动照片", user_key="active:" + target["umo"], is_admin=True, source=kind, job_id=job["id"])
@@ -370,7 +378,8 @@ class ActiveScheduler:
                     return
                 storage.update_delivery(key, {"status": "sending"})
                 storage.finish_budget(message_budget, used=True)
-                await self.plugin._send_job(job, umo=target["umo"])
+                delivered = await self.plugin._send_job(job, umo=target["umo"])
+                delivery_unconfirmed = (delivered or storage.job(job["id"]) or {}).get("status") == "uncertain"
             else:
                 storage.update_delivery(key, {"status": "sending"})
                 storage.finish_budget(message_budget, used=True)
@@ -378,6 +387,13 @@ class ActiveScheduler:
                 if accepted is False:
                     storage.update_delivery(key, {"status": "delivery_failed"})
                     raise ValueError("平台没有接受主动消息")
+            if delivery_unconfirmed or webchat_delivery:
+                note = "WebChat 会话发送调用已完成，但实时投递或历史保存未确认；不自动补发"
+                storage.update_delivery(key, {"status": "uncertain", "error": note, "delivery_evidence": "unverified"})
+                target.update(last_active=time.time(), unanswered=int(target.get("unanswered", 0)) + 1, last_error=note, next_opportunity=self._next_opportunity(target, time.time()))
+                storage.save_targets()
+                storage.record_action({"kind": "delivery", "source": kind, "umo": target["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "status": "uncertain", "summary": note, "trace": [{"stage": "delivery", "status": "uncertain", "detail": note}]})
+                return
             storage.update_delivery(key, {"status": "sent"})
             target.update(last_active=time.time(), unanswered=int(target.get("unanswered", 0)) + 1, last_error="", next_opportunity=self._next_opportunity(target, time.time()))
             if date:

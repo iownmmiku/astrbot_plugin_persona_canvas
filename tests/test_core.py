@@ -254,7 +254,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.plugin._tasks))
         self.assertEqual(len(self.image_provider.calls), 1)
         self.assertEqual(self.store.job(result["job_id"])["status"], "sent")
-        self.assertEqual([kind for kind, _ in event.sent[0].chain], ["text", "image"])
+        self.assertEqual(self.context.sent[0][0], event.unified_msg_origin)
+        self.assertEqual([kind for kind, _ in self.context.sent[0][1].chain], ["text", "image"])
+        self.assertFalse(event.sent)
 
     async def test_short_selfie_compatibility_respects_refusal_and_consent(self):
         self.store.settings["integration"]["mode"] = "compatibility"
@@ -275,9 +277,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_delivery_failure_stays_uncertain_and_replay_does_not_generate(self):
         event = Event("给我拍一张你的自拍")
         event.message_obj = types.SimpleNamespace(message_id="native-123")
-        async def failed_send(_chain):
-            raise ConnectionError("adapter connection lost")
-        event.send = failed_send
+        async def failed_send(umo, chain):
+            if any(kind == "image" for kind, _ in chain.chain):
+                raise ConnectionError("adapter connection lost")
+            self.context.sent.append((umo, chain))
+            return True
+        self.context.send_message = failed_send
         result = json.loads(await self.plugin.tool_photo(event, "white dress"))
         await asyncio.gather(*list(self.plugin._tasks))
         job = self.store.job(result["job_id"])

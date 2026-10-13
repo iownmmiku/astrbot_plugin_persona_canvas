@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.10"
+VERSION = "0.5.11"
 
 
 class DeliveryRejectedError(ValueError):
@@ -151,7 +151,8 @@ class PersonaCanvasPlugin(Star):
         context_send = getattr(self.context, "send_message", None)
         event_send = getattr(event, "send", None)
         umo = str(current.get("umo") or "")
-        channel = "context" if umo and callable(context_send) else "event" if callable(event_send) else "none"
+        webchat = self._is_webchat(umo, event=event, job=current)
+        channel = "context" if umo and callable(context_send) else "event" if not webchat and callable(event_send) else "none"
         message = str(current.get("error") or "照片任务未完成")
         if current.get("status") == "failed":
             message = "这次照片没能完成：" + message
@@ -163,6 +164,8 @@ class PersonaCanvasPlugin(Star):
                 chain = MessageChain().message(message)
                 accepted = await context_send(umo, chain) if channel == "context" else await event_send(chain)
                 state, error = ("failed", "平台未接受失败通知") if accepted is False else ("accepted", "")
+                if webchat and accepted is not False:
+                    state, error = "uncertain", "WebChat 会话发送调用已完成，但未提供通知投递或历史保存确认"
         except asyncio.CancelledError:
             self.storage.update_job(current["id"], {"notification_state": "uncertain", "notification_error": "通知发送被停止，结果不确定"})
             self._photo_note(self._trace_job(current["id"], "notification", "uncertain", "通知发送被停止，结果不确定"))
@@ -173,7 +176,7 @@ class PersonaCanvasPlugin(Star):
             state, error = "uncertain", self._error(exc)
         updated = self.storage.update_job(current["id"], {"notification_state": state, "notification_error": error})
         safe_error = updated.get("notification_error", "")
-        updated = self._trace_job(current["id"], "notification", state, safe_error or "平台已接受失败通知，终端送达未知")
+        updated = self._trace_job(current["id"], "notification", state, safe_error or "失败通知发送调用已完成，终端送达未知")
         self._photo_note(updated)
         if state != "accepted":
             logger.warning("[随想画卷] 照片任务 %s 失败通知%s（%s）：%s", current["id"], "结果不确定" if state == "uncertain" else "未发送", channel, safe_error)
@@ -318,6 +321,30 @@ class PersonaCanvasPlugin(Star):
         provider = provider_from_config(key, copy.deepcopy(config))
         provider.validate_config()
         return provider
+
+    def _is_webchat(self, umo, *, event=None, job=None):
+        """Use the platform type, because a UMO starts with an instance ID."""
+        if (job or {}).get("delivery_platform") == "webchat":
+            return True
+        if event is not None and str(getattr(event, "unified_msg_origin", "") or "") == str(umo):
+            name = getattr(event, "get_platform_name", None)
+            try:
+                if callable(name) and str(name()).lower() == "webchat":
+                    return True
+            except Exception:
+                pass
+        lookup = getattr(self.context, "get_platform_inst", None)
+        if callable(lookup):
+            try:
+                platform = lookup(str(umo).split(":", 1)[0])
+                meta = platform.meta() if platform is not None else None
+                name = getattr(meta, "name", None)
+                if isinstance(name, str) and name:
+                    return name.lower() == "webchat"
+            except Exception:
+                pass
+        # Compatibility for older contexts without platform-instance discovery.
+        return str(umo).split(":", 1)[0].lower() == "webchat"
 
     @asynccontextmanager
     async def _generation_slot(self):
@@ -522,7 +549,7 @@ class PersonaCanvasPlugin(Star):
             reply (string): revise 时对用户说的更新条件与确认问题。
             updates (object): revise 的结构化新条件，支持 outfit/camera/pose/expression/scene/avoid/notes。confirm 可填写重复的原条件，不得改变值。
             remove_fields (array[string]): revise 要移除的条件字段；updates 中空字符串或 null 同样表示移除。修改后需重新询问。
-            confirm_uncertain (boolean): resend 时仅在用户已检查聊天记录并明确要求补发结果不确定的消息后设为 true。
+            confirm_uncertain (boolean): 用户已检查聊天记录并明确确认未收到时为 true；用于补发 uncertain 照片，或恢复旧版误记 sent 的原图。没有明确核对时不得设置。
         """
         self._track_current()
         _extra(event, "native_tool_seen", True, set_value=True)
@@ -707,6 +734,8 @@ class PersonaCanvasPlugin(Star):
             prepared = self._prepare_generation(env, prompt, mode, patch, caption, _text(event), reference_asset=reference, source="chat", reference_source=reference_source)
             selected_provider = prepared["provider"].name
             job = self.storage.create_job({"status": "queued", "phase": "local_queued", "preflight_checked": True, "provider": selected_provider, "request_summary": self._request_summary(prepared["provider"], prepared["positive"], prepared["negative"], prepared["options"], len(prepared["reference_names"]), reference_source), "source": "chat", "caption": caption, "raw": _text(event), "mode": mode, "reference_asset": reference, "reference_assets": reference_assets, "reference_source": reference_source, "request_basis": copy.deepcopy(env.get("request_basis", {})), "delivery_key": _extra(event, "delivery_key", ""), "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"]})
+            if self._is_webchat(env["umo"], event=event):
+                self.storage.update_job(job["id"], {"delivery_platform": "webchat"})
             if pending and env.get("approved_requirements") is not None:
                 claim = self.storage.claim_photo_request(env["key"], env["persona"]["id"], pending["request_id"], job["id"])
                 if not claim["claimed"]:
@@ -718,7 +747,7 @@ class PersonaCanvasPlugin(Star):
             async def run():
                 try:
                     generated = await self._generate_job(env, prompt, mode, patch, caption, _text(event), user_key=f"{event.get_platform_id()}:{event.get_sender_id()}", is_admin=_admin(event), reference_asset=reference, provider_name=selected_provider, source="chat", job_id=job["id"], reference_source=reference_source)
-                    await self._send_job(generated, event=event)
+                    await self._send_job(generated, umo=generated["umo"])
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -907,6 +936,10 @@ class PersonaCanvasPlugin(Star):
         current = self.storage.job(job["id"])
         if current.get("cancel_requested") or current.get("status") == "cancelled":
             raise asyncio.CancelledError()
+        destination = str(current.get("umo") or umo or "")
+        webchat = self._is_webchat(destination, event=event, job=current)
+        use_context = event is None or webchat
+        channel = "context" if use_context else "event"
         try:
             chain = MessageChain()
             if job.get("caption"):
@@ -918,25 +951,35 @@ class PersonaCanvasPlugin(Star):
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "delivery_failed", "error": self._error(exc)})
             raise
-        self.storage.update_job(job["id"], {"status": "sending", "phase": "sending"})
+        self.storage.update_job(job["id"], {"status": "sending", "phase": "sending", "delivery_channel": channel, "delivery_platform": "webchat" if webchat else current.get("delivery_platform", ""), "delivery_evidence": "unverified"})
         if job.get("delivery_key"):
             self.storage.update_delivery(job["delivery_key"], {"status": "sending", "job_id": job["id"]})
         try:
-            if event:
-                accepted = await event.send(chain)
-                if accepted is False:
-                    raise DeliveryRejectedError("平台没有接受图片消息")
+            if use_context:
+                send = getattr(self.context, "send_message", None)
+                if not destination or not callable(send):
+                    raise DeliveryRejectedError("原会话发送通道不可用，照片尚未发送")
+                accepted = await send(destination, chain)
             else:
-                result = await self.context.send_message(umo, chain)
-                if result is False:
-                    raise DeliveryRejectedError("平台没有接受主动消息")
-            sent = self.storage.update_job(job["id"], {"status": "sent", "phase": "sent", "error": "", "failure_stage": ""})
-            sent = self._trace_job(job["id"], "delivery", detail="平台已接受图片消息")
+                accepted = await event.send(chain)
+            if accepted is False:
+                raise DeliveryRejectedError("平台没有接受图片消息")
+            if webchat:
+                note = "图片已生成，WebChat 会话发送调用已完成，但无法确认实时投递或平台历史保存；请检查原会话后再决定是否补发"
+                sent = self.storage.update_job(job["id"], {"status": "uncertain", "phase": "uncertain", "error": note, "failure_stage": "delivery", "delivery_evidence": "unverified"})
+                sent = self._trace_job(job["id"], "delivery", "uncertain", note)
+                self._photo_note(sent)
+                if job.get("delivery_key"):
+                    self.storage.update_delivery(job["delivery_key"], {"status": "uncertain", "job_id": job["id"], "error": note})
+                return sent
+            sent = self.storage.update_job(job["id"], {"status": "sent", "phase": "sent", "error": "", "failure_stage": "", "delivery_evidence": "call_completed"})
+            sent = self._trace_job(job["id"], "delivery", detail="发送调用已完成，终端送达未知")
             self._photo_note(sent)
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "sent", "job_id": job["id"]})
+            return sent
         except DeliveryRejectedError as exc:
-            self.storage.update_job(job["id"], {"status": "delivery_failed", "phase": "delivery_failed", "failure_stage": "delivery", "error": "平台明确拒收，照片已保留，可补发原图：" + self._error(exc)})
+            self.storage.update_job(job["id"], {"status": "delivery_failed", "phase": "delivery_failed", "failure_stage": "delivery", "error": "发送未被接受，原图已保留，可补发：" + self._error(exc)})
             self._photo_note(self._trace_job(job["id"], "delivery", "delivery_failed", self._error(exc)))
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "delivery_failed", "error": self._error(exc)})
@@ -1333,6 +1376,8 @@ class PersonaCanvasPlugin(Star):
         prepared = self._prepare_generation(env, decision["prompt"], mode, decision["state_patch"], decision["reply"], text, reference_asset=reference, provider_name=str(body.get("provider") or ""), options=options, source=source, reference_source=reference_source, explicit_retry=bool(retry_old))
         selected_provider = prepared["provider"].name
         job = self.storage.create_job({"status": "queued", "phase": "local_queued", "preflight_checked": True, "provider": selected_provider, "request_summary": self._request_summary(prepared["provider"], prepared["positive"], prepared["negative"], prepared["options"], len(prepared["reference_names"]), reference_source), "source": source, "raw": text, "caption": decision["reply"], "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "reference_asset": reference, "reference_assets": env.get("approved_reference_assets", []), "reference_source": reference_source, "request_basis": env.get("request_basis", {})})
+        if self._is_webchat(env["umo"], event=event, job=retry_old):
+            self.storage.update_job(job["id"], {"delivery_platform": "webchat"})
         if retry_old:
             self.storage.update_job(job["id"], {"retry_of": retry_old["id"], "confirmed_request_id": retry_old.get("confirmed_request_id", "")})
             try:
@@ -1362,7 +1407,7 @@ class PersonaCanvasPlugin(Star):
             try:
                 generated = await self._generate_job(env, decision["prompt"], mode, decision["state_patch"], decision["reply"], text, reference_asset=reference, provider_name=selected_provider, options=options, source=source, is_admin=_admin(event) if event else True, user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui", job_id=job["id"], reference_source=reference_source)
                 if event:
-                    await self._send_job(generated, event=event)
+                    await self._send_job(generated, umo=generated["umo"])
             except Exception as exc:
                 self._fail_job(job["id"], exc)
                 if event:
@@ -1406,9 +1451,12 @@ class PersonaCanvasPlugin(Star):
             session = self.storage.read_session(job["session_key"])
             if not session or session.get("persona_id") != job.get("persona_id"):
                 raise ValueError("当前会话角色已改变，请重新由当前角色判断")
-            if job.get("status") == "sent":
+            recover_sent = job.get("status") == "sent" and body.get("confirm_uncertain") is True
+            if recover_sent and job.get("source") not in {"chat", "active", "morning", "reply_image"}:
+                raise ValueError("该任务没有可核对的聊天发送来源，不能恢复补发")
+            if job.get("status") == "sent" and not recover_sent:
                 return {"ok": True, "job_id": identifier, "status": "sent", "reused": True}
-            if job.get("status") not in {"delivery_failed", "uncertain"}:
+            if job.get("status") not in {"delivery_failed", "uncertain"} and not recover_sent:
                 raise ValueError("仅能补发明确拒收或发送结果不确定的照片，正在发送时请等待")
             if job["status"] == "uncertain" and body.get("confirm_uncertain") is not True:
                 raise ValueError("请先检查聊天记录，确认没有收到照片后再明确补发")
@@ -1417,13 +1465,14 @@ class PersonaCanvasPlugin(Star):
                 raise ValueError("工作台照片没有聊天发送目标，请直接查看或下载原图")
             self.storage.asset(job["asset"])
             self.storage.update_job(identifier, {"resend_count": int(job.get("resend_count", 0)) + 1})
-            self._trace_job(identifier, "resend", "requested", "用户明确补发已保存原图，不重新生成")
+            self._trace_job(identifier, "resend", "requested", "用户已检查聊天记录并确认未收到，恢复补发已保存原图" if recover_sent else "用户明确补发已保存原图，不重新生成")
             try:
-                await self._send_job(job, event=event, umo=destination)
+                await self._send_job(job, umo=destination)
             except Exception as exc:
                 current = self.storage.job(identifier)
                 return {"ok": False, "job_id": identifier, "status": current["status"], "error": current.get("error") or self._error(exc)}
-            return {"ok": True, "job_id": identifier, "status": "sent", "generated": False}
+            current = self.storage.job(identifier)
+            return {"ok": current["status"] == "sent", "job_id": identifier, "status": current["status"], "generated": False, "delivery_evidence": current.get("delivery_evidence", ""), "error": current.get("error", "")}
 
     async def _retry_job(self, body, *, event=None):
         old = self.storage.job(str(body.get("id") or ""))
