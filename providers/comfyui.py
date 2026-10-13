@@ -148,7 +148,7 @@ class ComfyUIProvider(ImageProvider):
             pass
 
     @staticmethod
-    def _option(key: str, value: Any) -> Any:
+    def _option(key: str, value: Any, *, randomize: bool = True) -> Any:
         if key in {"width", "height"}:
             return _integer(value, "图片尺寸", 64, 8192)
         if key == "seed":
@@ -161,7 +161,7 @@ class ComfyUIProvider(ImageProvider):
                     raise ProviderError("ComfyUI 随机种子超出支持范围")
             else:
                 number = _integer(value, "随机种子", -1, 2 ** 64 - 1)
-            return secrets.randbits(63) if number == -1 else number
+            return secrets.randbits(63) if randomize and number == -1 else number
         if key == "steps":
             return _integer(value, "采样步数", 1, 1000)
         if key == "scale":
@@ -199,7 +199,7 @@ class ComfyUIProvider(ImageProvider):
             raise ProviderError("ComfyUI 已完成但没有图片输出，请检查 SaveImage/PreviewImage 与 output_node")
         return None
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> dict:
         supplied = copy.deepcopy(options) if isinstance(options, dict) else options
         if isinstance(supplied, dict):
             explicit = supplied.get("_explicit", [])
@@ -217,7 +217,7 @@ class ComfyUIProvider(ImageProvider):
         notes = ["模型与未映射输入沿用 API 工作流；取消仅移除本次排队任务，已经运行的任务可能继续"]
         for key in self.supported_options:
             if key in options:
-                value = self._option(key, options[key])
+                value = self._option(key, options[key], randomize=randomize)
                 if key == "sampler" and key not in options["_explicit"] and value.startswith("k_"):
                     adapted = SHARED_SAMPLER_ALIASES.get(value)
                     if adapted is None:
@@ -234,7 +234,14 @@ class ComfyUIProvider(ImageProvider):
                 raise ProviderError("ComfyUI 映射的图片尺寸超过 3600 万像素限制")
         negative_field = str(fields.get("negative_prompt") or "")
         model = str(self.config.get("model") or self.name or "ComfyUI 工作流")
-        self._record_request(prompt, _path_get(workflow, negative_field) if negative_field else "", model, actual_options, reference, negative_field=negative_field, notes=notes)
+        return {"workflow": workflow, "fields": fields, "prompt": prompt, "model": model, "options": actual_options, "negative_field": negative_field, "notes": notes}
+
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
+        self.last_request = {}
+        prepared = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        workflow, fields, model = prepared["workflow"], prepared["fields"], prepared["model"]
+        negative_field = prepared["negative_field"]
+        self._record_request(prepared["prompt"], _path_get(workflow, negative_field) if negative_field else "", model, prepared["options"], reference, negative_field=negative_field, notes=prepared["notes"])
         self.last_request["submitted"] = False
         self.last_request["output_node"] = str(self.config.get("output_node") or "")
         state = {"prompt_id": ""}

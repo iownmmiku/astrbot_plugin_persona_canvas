@@ -10,13 +10,13 @@ const pageNames = {
   providers: ["模型接口", "管理绘画接口与动作判断模型。"], studio: ["生图工作台", "构图、预演与生成任务，集中在这里。"],
   active: ["聊天与主动消息", "按聊天设置回复配图，安排私聊主动联系与早安。"], history: ["生成历史", "回看画面与每次请求的执行结果。"], settings: ["运行设置", "控制对话集成、配额与默认生成参数。"]
 };
-const statusNames = { queued: "等待中", pending: "等待中", generating: "生成中", running: "生成中", processing: "生成中", sending: "发送中", sent: "已发送", delivery_failed: "生成成功，发送失败", uncertain: "发送结果待确认", succeeded: "已完成", success: "已完成", done: "已完成", completed: "已完成", failed: "失败", error: "失败", interrupted: "已中断", cancelled: "已取消" };
+const statusNames = { queued: "本地排队", pending: "等待中", generating: "请求处理中", running: "请求处理中", processing: "请求处理中", sending: "发送中", sent: "已发送", delivery_failed: "生成成功，发送失败", uncertain: "发送结果待确认", succeeded: "已完成", success: "已完成", done: "已完成", completed: "已完成", failed: "失败", error: "失败", interrupted: "已中断", cancelled: "已取消" };
 const finished = job => ["succeeded", "success", "done", "completed", "sent"].includes(job.status);
 const failed = job => ["failed", "error", "interrupted", "cancelled", "uncertain"].includes(job.status);
 const fullImages = new Map(), imageRequests = new Set();
 const referenceImages = new Map(), resending = new Set();
 const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截" };
-const stageNames = { request: "请求检查", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
+const stageNames = { request: "请求检查", preflight: "本地预检", notification: "失败通知", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
 const negativeModes = { disabled: "不自动发送人设负面词", natural_language: "自然语言约束", field: "独立负面字段" };
 const referenceSources = { persona: "角色参考图库", persona_gallery: "角色参考图库", explicit: "指定参考图", explicit_reference: "指定参考图", attachment: "聊天附件", message_attachment: "聊天附件", last_image: "上一张图片", none: "无参考图" };
@@ -156,6 +156,7 @@ function requestDetail(item) {
   const preparedOnly = request.submitted === false, submitted = request.submitted === true;
   const detail = node("details", "request-detail"); detail.append(node("summary", "", preparedOnly ? "查看请求准备摘要" : submitted ? "查看最终请求摘要" : "查看请求摘要（早期记录）"));
   if (request.notes) detail.append(node("p", "request-note", Array.isArray(request.notes) ? request.notes.join("\n") : String(request.notes)));
+  detail.append(node("p", "muted", preparedOnly ? "此摘要是本地准备阶段快照，记录时尚未发起绘图请求；当前执行以任务状态为准。" : submitted ? "已开始请求尝试，不代表上游已受理或图片已生成。" : "早期记录未标明请求是否已发起。"));
   const mode = request.negative_mode || "disabled";
   const negativeSource = request.negative_source === "extra_body" ? "手动附加请求体" : request.negative_source === "plugin" ? "插件独立负面字段" : mode === "natural_language" ? "插件自然语言约束，编入正面描述" : request.negative_prompt_field ? "独立字段，早期记录未标明来源" : "无独立负面字段";
   const rows = [["绘图模型", request.model || "接口默认"], ["负面处理", negativeModes[mode] || mode], ["负面来源", negativeSource], ["负面字段", request.negative_prompt_field || "未使用独立字段"], ["参考图", `${request.reference_count ?? 0} 张 · ${referenceSources[request.reference_source] || request.reference_source || "未记录来源"}`], ["接口超时", request.provider_timeout_sec != null ? `${request.provider_timeout_sec} 秒` : "未记录"], ["任务超时", request.task_timeout_sec != null ? `${request.task_timeout_sec} 秒` : "未记录"], ["有效生成超时", request.effective_timeout_sec != null ? `${request.effective_timeout_sec} 秒（两者取较短）` : "未记录"]];
@@ -409,6 +410,8 @@ function renderJobs() {
     const row = node("article", "task-row"), body = node("div"), actions = node("div", "actions");
     body.append(node("span", `badge ${job.status}`, statusNames[job.status] || job.status), node("p", "", job.caption || job.request?.text || job.text || "生成任务"), node("small", "", `${jobId(job)} · ${job.provider || job.request?.provider || "默认接口"} · ${date(job.created_at || job.at)}`));
     if (job.error) body.append(node("pre", "", job.error));
+    if (job.status === "queued" && job.phase === "local_queued") body.append(node("p", "muted", "本地预检通过，等待后台提交，尚无上游受理凭据。"));
+    if (job.notification_state) { const labels = { sending: "正在发送失败通知", accepted: "平台已接受失败通知，终端送达未知", failed: "失败通知未发送", uncertain: "失败通知结果不确定" }; body.append(node("p", ["failed", "uncertain"].includes(job.notification_state) ? "danger-text" : "muted", `${labels[job.notification_state] || job.notification_state}${job.notification_error ? `：${job.notification_error}` : ""}`)); }
     if (finished(job) || job.asset || jobImage(job)) actions.append(button("查看画面", async () => { selection.previewJob = jobId(job); renderPreview(job); }));
     if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
     deliveryActions(actions, body, job);
@@ -529,7 +532,7 @@ bind("test-image-generation", async () => { const name = await savedProvider(); 
 bind("refresh-llm", async () => { await loadLlm(); notice("已读取 AstrBot 聊天 Provider 和人格"); }); $("l-provider").addEventListener("change", renderLlmModels);
 bindForm("llm-form", async () => { await api("settings", "POST", { llm: { provider_id: value("l-provider"), model: value("l-model"), fallback_to_current: check("l-fallback"), timeout_sec: num("l-timeout") } }); markDirty("llm-form", false); await reload(); notice("动作判断模型设置已保存"); });
 bind("restore-llm", async () => fillLlm()); bind("test-llm", async () => { setText("llm-test-result", "正在测试…"); testResult("llm-test-result", await api("llm/test", "POST", { provider_id: value("l-provider"), model: value("l-model") })); });
-bindForm("generate-form", async () => { const result = await api("generate", "POST", { text: value("g-prompt"), mode: value("g-mode"), persona_id: value("g-persona"), provider: value("g-provider"), umo: value("g-umo"), reference_asset: value("g-reference"), ...readGenerationOptions() }); if (!result.job_id) { setText("generate-result", result.reply || "角色未安排生成动作，请查看预演或补充描述。"); await refreshJobs(); notice("角色判断已完成"); return; } selection.previewJob = result.job_id; setText("generate-result", `任务 ${result.job_id} 已提交，完成后自动显示结果。${result.caption ? `\n${result.caption}` : ""}`); await refreshJobs(); notice("生成任务已提交"); });
+bindForm("generate-form", async () => { const result = await api("generate", "POST", { text: value("g-prompt"), mode: value("g-mode"), persona_id: value("g-persona"), provider: value("g-provider"), umo: value("g-umo"), reference_asset: value("g-reference"), ...readGenerationOptions() }); if (!result.job_id) { setText("generate-result", result.reply || "角色未安排生成动作，请查看预演或补充描述。"); await refreshJobs(); notice("角色判断已完成"); return; } selection.previewJob = result.job_id; setText("generate-result", `本地任务 ${result.job_id} 已创建，等待后台提交；上游尚未确认受理。完成后自动显示结果。${result.caption ? `\n${result.caption}` : ""}`); await refreshJobs(); notice("本地生成任务已创建"); });
 bind("use-persona-reference", async () => { const p = model.personas.find(x => x.id === value("g-persona")); if (!p?.reference_asset) throw new Error("所选人设没有保存参考图，请在人设工作台上传并保存"); set("g-reference", ""); markDirty("generate-form"); notice(`已使用人设参考图库，共 ${p.reference_assets?.length || 1} 张；实际使用数量取决于接口。`); });
 bind("refresh-jobs", refreshJobs);
 bindForm("simulate-form", async () => { setText("simulate-result", "正在读取角色判断…"); const result = await api("simulate", "POST", { text: value("s-text"), umo: value("s-umo"), persona_id: value("s-persona"), execute: false }); setText("simulate-result", JSON.stringify(result, null, 2)); });

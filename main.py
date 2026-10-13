@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.9"
+VERSION = "0.5.10"
 
 
 class DeliveryRejectedError(ValueError):
@@ -135,11 +135,49 @@ class PersonaCanvasPlugin(Star):
             return current
         error = self._error(exc)
         stage = stage or current.get("preparation_stage") or "request"
-        self.storage.update_job(job_id, {"status": "failed", "error": error, "failure_stage": stage})
+        self.storage.update_job(job_id, {"status": "failed", "phase": "failed", "error": error, "failure_stage": stage})
         failed = self._trace_job(job_id, stage, "failed", error)
         self._photo_note(failed)
         self.storage.append_history({"ok": False, "job_id": job_id, "caption": failed.get("caption") or failed.get("raw", ""), "provider": failed.get("provider", ""), "mode": failed.get("mode", ""), "error": error, "failure_stage": stage, **{k: copy.deepcopy(failed[k]) for k in ("prompt", "negative_prompt", "state_patch", "requirements", "reference_source", "request_summary", "trace") if k in failed}})
         return failed
+
+    async def _notify_photo_failure(self, job, *, event=None):
+        """Notify independently of the original event, retaining uncertain sends."""
+        current = self.storage.job(job["id"]) or job
+        if self._closing or current.get("cancel_requested") or current.get("status") == "cancelled" or current.get("notification_state") in {"sending", "accepted", "failed", "uncertain"}:
+            return current
+        if current.get("status") not in {"failed", "delivery_failed", "uncertain"}:
+            return current
+        context_send = getattr(self.context, "send_message", None)
+        event_send = getattr(event, "send", None)
+        umo = str(current.get("umo") or "")
+        channel = "context" if umo and callable(context_send) else "event" if callable(event_send) else "none"
+        message = str(current.get("error") or "照片任务未完成")
+        if current.get("status") == "failed":
+            message = "这次照片没能完成：" + message
+        # Persist before awaiting: duplicate failure handlers must not send twice.
+        self.storage.update_job(current["id"], {"notification_state": "sending", "notification_channel": channel, "notification_error": ""})
+        state, error = "failed", "没有可用的失败通知发送通道"
+        try:
+            if channel != "none":
+                chain = MessageChain().message(message)
+                accepted = await context_send(umo, chain) if channel == "context" else await event_send(chain)
+                state, error = ("failed", "平台未接受失败通知") if accepted is False else ("accepted", "")
+        except asyncio.CancelledError:
+            self.storage.update_job(current["id"], {"notification_state": "uncertain", "notification_error": "通知发送被停止，结果不确定"})
+            self._photo_note(self._trace_job(current["id"], "notification", "uncertain", "通知发送被停止，结果不确定"))
+            raise
+        except Exception as exc:
+            # The platform may have accepted the message before a transport error.
+            # Retain ambiguity instead of sending a duplicate via another channel.
+            state, error = "uncertain", self._error(exc)
+        updated = self.storage.update_job(current["id"], {"notification_state": state, "notification_error": error})
+        safe_error = updated.get("notification_error", "")
+        updated = self._trace_job(current["id"], "notification", state, safe_error or "平台已接受失败通知，终端送达未知")
+        self._photo_note(updated)
+        if state != "accepted":
+            logger.warning("[随想画卷] 照片任务 %s 失败通知%s（%s）：%s", current["id"], "结果不确定" if state == "uncertain" else "未发送", channel, safe_error)
+        return updated
 
     def _prepare_request(self, env, text, *, explicit=False):
         pending = env["session"].get("pending") or {}
@@ -277,7 +315,9 @@ class PersonaCanvasPlugin(Star):
         config = self.storage.settings.get("providers", {}).get(key)
         if not isinstance(config, dict):
             raise ProviderError("找不到指定的生图接口，请在模型接口页配置")
-        return provider_from_config(key, copy.deepcopy(config))
+        provider = provider_from_config(key, copy.deepcopy(config))
+        provider.validate_config()
+        return provider
 
     @asynccontextmanager
     async def _generation_slot(self):
@@ -664,7 +704,9 @@ class PersonaCanvasPlugin(Star):
                 return rejected(reason, stage)
             pending = env["session"].get("pending") or {}
             reference_assets = [reference] if reference else list(dict.fromkeys(([env["persona"].get("reference_asset")] if env["persona"].get("reference_asset") else []) + env["persona"].get("reference_assets", []))) if mode == "persona" and env["persona"].get("reference_enabled") else []
-            job = self.storage.create_job({"status": "queued", "source": "chat", "caption": caption, "raw": _text(event), "mode": mode, "reference_asset": reference, "reference_assets": reference_assets, "reference_source": reference_source, "request_basis": copy.deepcopy(env.get("request_basis", {})), "delivery_key": _extra(event, "delivery_key", ""), "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"]})
+            prepared = self._prepare_generation(env, prompt, mode, patch, caption, _text(event), reference_asset=reference, source="chat", reference_source=reference_source)
+            selected_provider = prepared["provider"].name
+            job = self.storage.create_job({"status": "queued", "phase": "local_queued", "preflight_checked": True, "provider": selected_provider, "request_summary": self._request_summary(prepared["provider"], prepared["positive"], prepared["negative"], prepared["options"], len(prepared["reference_names"]), reference_source), "source": "chat", "caption": caption, "raw": _text(event), "mode": mode, "reference_asset": reference, "reference_assets": reference_assets, "reference_source": reference_source, "request_basis": copy.deepcopy(env.get("request_basis", {})), "delivery_key": _extra(event, "delivery_key", ""), "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"]})
             if pending and env.get("approved_requirements") is not None:
                 claim = self.storage.claim_photo_request(env["key"], env["persona"]["id"], pending["request_id"], job["id"])
                 if not claim["claimed"]:
@@ -675,7 +717,7 @@ class PersonaCanvasPlugin(Star):
             self._photo_note(job)
             async def run():
                 try:
-                    generated = await self._generate_job(env, prompt, mode, patch, caption, _text(event), user_key=f"{event.get_platform_id()}:{event.get_sender_id()}", is_admin=_admin(event), reference_asset=reference, source="chat", job_id=job["id"], reference_source=reference_source)
+                    generated = await self._generate_job(env, prompt, mode, patch, caption, _text(event), user_key=f"{event.get_platform_id()}:{event.get_sender_id()}", is_admin=_admin(event), reference_asset=reference, provider_name=selected_provider, source="chat", job_id=job["id"], reference_source=reference_source)
                     await self._send_job(generated, event=event)
                 except asyncio.CancelledError:
                     raise
@@ -685,17 +727,15 @@ class PersonaCanvasPlugin(Star):
                     self._photo_note(self.storage.job(job["id"]))
                     if current.get("delivery_key") and current.get("status") not in {"uncertain", "delivery_failed"}:
                         self.storage.update_delivery(current["delivery_key"], {"status": "failed", "error": self._error(exc)})
-                    try:
-                        message = current.get("error") if current.get("status") in {"uncertain", "delivery_failed"} else "这次照片没能完成：" + self._error(exc)
-                        await event.send(MessageChain().message(message))
-                    except Exception:
-                        pass
+                    await self._notify_photo_failure(self.storage.job(job["id"]), event=event)
             self._spawn(run(), "persona-canvas-chat-photo", job["id"])
-            return json.dumps({"ok": True, "job_id": job["id"], "status": "queued", "image_sent": False, "description": prompt, "instruction": "角色已同意，照片正在生成，完成后插件会发图。可以简短说正在拍；不能声称已完成，本轮不要重复调用。"}, ensure_ascii=False)
+            return json.dumps({"ok": True, "job_id": job["id"], "status": "queued", "phase": "local_queued", "provider": selected_provider, "preflight_checked": True, "submitted": False, "upstream_accepted": False, "image_sent": False, "description": prompt, "instruction": "本地配置与请求预检已通过，插件已创建本地任务，等待后台提交绘图接口；上游尚未确认受理。可以说明请求已交给插件；不能声称正在生成、上游已排队或照片已完成。本轮不要重复调用，后台失败会尝试通知。"}, ensure_ascii=False)
         except Exception as exc:
             if job and (self.storage.job(job["id"]) or {}).get("status") == "queued":
                 self.storage.update_job(job["id"], {"status": "failed", "error": self._error(exc)})
-            return json.dumps({"ok": False, "reason": self._error(exc), "instruction": "如实说明失败，不能声称已拍好；本轮不要重复调用。"}, ensure_ascii=False)
+            reason = self._error(exc)
+            self.storage.record_action({"kind": "decision", "source": "native_tool", "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "request": _text(event), "status": "blocked", "error": reason, "trace": [{"stage": "preflight", "status": "failed", "detail": reason}]})
+            return json.dumps({"ok": False, "phase": "preflight", "submitted": False, "upstream_accepted": False, "reason": reason, "instruction": "本地预检失败，未提交绘图接口。如实说明原因，不能声称正在生成或已拍好；本轮不要重复调用。"}, ensure_ascii=False)
         finally:
             if lease:
                 self.storage.release_asset(lease)
@@ -724,8 +764,8 @@ class PersonaCanvasPlugin(Star):
                 summary[name] = value
         return summary
 
-    async def _generate_job(self, env, prompt, mode="persona", patch=None, caption="", raw="", *, user_key="webui", is_admin=False, reference_asset="", provider_name="", options=None, source="webui", job_id="", reference_source=""):
-        self._track_current()
+    def _prepare_generation(self, env, prompt, mode="persona", patch=None, caption="", raw="", *, reference_asset="", provider_name="", options=None, source="webui", job_id="", reference_source="", explicit_retry=False):
+        """Local-only preparation, shared by admission and background dispatch."""
         if job_id and (self.storage.job(job_id) or {}).get("cancel_requested"):
             raise asyncio.CancelledError()
         if mode not in {"persona", "scene", "edit"} or not str(prompt).strip():
@@ -750,7 +790,7 @@ class PersonaCanvasPlugin(Star):
         if job_id:
             self.storage.update_job(job_id, {"preparation_stage": "provider"})
         provider = self._provider(provider_name)
-        explicit_retry = bool(job_id and (self.storage.job(job_id) or {}).get("retry_of"))
+        explicit_retry = explicit_retry or bool(job_id and (self.storage.job(job_id) or {}).get("retry_of"))
         if source in {"active", "morning", "reply_image"} and not explicit_retry and not getattr(provider.capabilities, "automated_generation", True):
             raise ValueError("此生图接口要求人工发起生成，不能用于定时主动照片或对话随机配图；请选择支持自动生成的接口")
         reference_names = env.get("approved_reference_assets") or ([reference_asset] if reference_asset else (list(dict.fromkeys(([persona["reference_asset"]] if persona.get("reference_asset") else []) + persona.get("reference_assets", []))) if persona.get("reference_enabled") and mode == "persona" else []))
@@ -759,6 +799,40 @@ class PersonaCanvasPlugin(Star):
         reference_names = reference_names[:reference_limit]
         reference_name = reference_names[0] if reference_names else ""
         reference_source = reference_source or ("explicit_reference" if reference_asset else "persona" if reference_names and mode == "persona" else "none")
+        if job_id:
+            self.storage.update_job(job_id, {"preparation_stage": "reference"})
+        if mode == "edit" and not reference_name:
+            raise ValueError("图片编辑需要上传参考图或选择上一张照片")
+        if reference_names and not provider.capabilities.image_to_image:
+            raise ValueError("当前接口不支持参考图，请选择支持图像输入的接口")
+        leases = []
+        try:
+            for name in reference_names:
+                leases.append(self.storage.lease_asset(name))
+            reference_data = [self.storage.asset(name).read_bytes() for name in reference_names]
+        finally:
+            for token in leases:
+                self.storage.release_asset(token)
+        reference = reference_data if len(reference_data) > 1 else reference_data[0] if reference_data else None
+        if job_id:
+            self.storage.update_job(job_id, {"preparation_stage": "provider"})
+        preflight = getattr(provider, "preflight", None)
+        if callable(preflight):
+            preflight(positive, negative, reference=reference, options=options)
+        return {"persona": persona, "patch": patch, "agreed": agreed, "positive": positive, "negative": negative, "options": options, "provider": provider, "reference_names": reference_names, "reference_name": reference_name, "reference": reference, "reference_source": reference_source, "reference_warning": reference_warning}
+
+    async def _generate_job(self, env, prompt, mode="persona", patch=None, caption="", raw="", *, user_key="webui", is_admin=False, reference_asset="", provider_name="", options=None, source="webui", job_id="", reference_source=""):
+        self._track_current()
+        try:
+            prepared = self._prepare_generation(env, prompt, mode, patch, caption, raw, reference_asset=reference_asset, provider_name=provider_name, options=options, source=source, job_id=job_id, reference_source=reference_source)
+        except Exception as exc:
+            if job_id:
+                self._fail_job(job_id, exc)
+            raise
+        persona, patch, agreed = prepared["persona"], prepared["patch"], prepared["agreed"]
+        positive, negative, options, provider = prepared["positive"], prepared["negative"], prepared["options"], prepared["provider"]
+        reference_names, reference_name, reference = prepared["reference_names"], prepared["reference_name"], prepared["reference"]
+        reference_source, reference_warning = prepared["reference_source"], prepared["reference_warning"]
         job_data = {"status": "queued", "source": source, "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": persona["id"], "persona_snapshot": persona, "session_revision": env["session"].get("revision", 0), "prompt": positive, "negative_prompt": negative, "request_prompt": prompt, "raw": raw, "caption": caption, "state_patch": patch, "provider": provider.name, "reference_asset": reference_name, "reference_assets": reference_names, "reference_source": reference_source, "reference_warning": reference_warning, "requirements": agreed, "options": options, "request_summary": self._request_summary(provider, positive, negative, options, len(reference_names), reference_source)}
         job = self.storage.update_job(job_id, job_data) if job_id else self.storage.create_job(job_data)
         self._bind_job_task(job["id"], asyncio.current_task())
@@ -771,19 +845,6 @@ class PersonaCanvasPlugin(Star):
         quota_token = None
         failure_stage = "reference"
         try:
-            if mode == "edit" and not reference_name:
-                raise ValueError("图片编辑需要上传参考图或选择上一张照片")
-            if reference_names and not provider.capabilities.image_to_image:
-                raise ValueError("当前接口不支持参考图，请选择支持图像输入的接口")
-            leases = []
-            try:
-                for name in reference_names:
-                    leases.append(self.storage.lease_asset(name))
-                reference_data = [self.storage.asset(name).read_bytes() for name in reference_names]
-            finally:
-                for token in leases:
-                    self.storage.release_asset(token)
-            reference = reference_data if len(reference_data) > 1 else reference_data[0] if reference_data else None
             self._trace_job(job["id"], "reference", "warning" if reference_warning else "ok", reference_warning or f"使用 {len(reference_names)} 张真实参考图")
             failure_stage = "quota"
             async with self._generation_slot():
@@ -798,7 +859,7 @@ class PersonaCanvasPlugin(Star):
                     if not budget:
                         raise ValueError("今日主动照片预算已用完")
                     self.storage.finish_budget(budget, used=True)
-                generating = self.storage.update_job(job["id"], {"status": "generating"})
+                generating = self.storage.update_job(job["id"], {"status": "generating", "phase": "dispatching"})
                 self._photo_note(generating)
                 self._trace_job(job["id"], "provider", "running", provider.name)
                 failure_stage = "provider"
@@ -823,14 +884,14 @@ class PersonaCanvasPlugin(Star):
                         session["pending"] = {}
                         session = self.storage.save_session(env["key"], session)
                         env["session"] = session
-                job = self.storage.update_job(job["id"], {"status": "succeeded", "failure_stage": "", "asset": asset.name, "model": result.model, "state_after": (session or {}).get("state", {}), "state_committed": state_committed, "elapsed_ms": int((time.time() - job.get("at", time.time())) * 1000)})
+                job = self.storage.update_job(job["id"], {"status": "succeeded", "phase": "generated", "failure_stage": "", "asset": asset.name, "model": result.model, "state_after": (session or {}).get("state", {}), "state_committed": state_committed, "elapsed_ms": int((time.time() - job.get("at", time.time())) * 1000)})
                 job = self._trace_job(job["id"], "generation", detail="图片已验证并保存；" + ("对话配图不修改持续视觉状态" if source == "reply_image" else "状态已提交" if state_committed else "较新状态保留，未覆盖"))
                 self._photo_note(job)
                 self.storage.append_history({"ok": True, "job_id": job["id"], "image": "/assets/" + asset.name, "caption": caption, "prompt": positive, "negative_prompt": negative, "request_summary": job["request_summary"], "state_patch": patch, "requirements": agreed, "reference_source": reference_source, "trace": job["trace"], "provider": provider.name, "model": result.model, "mode": mode})
                 self.storage.cleanup_history(int(options.get("max_history", 100)))
                 return job
         except asyncio.CancelledError:
-            cancelled = self.storage.update_job(job["id"], {"status": "cancelled", "error": "用户已撤回本次拍摄" if self.storage.job(job["id"]).get("cancel_requested") else "生成任务被停止"})
+            cancelled = self.storage.update_job(job["id"], {"status": "cancelled", "phase": "cancelled", "error": "用户已撤回本次拍摄" if self.storage.job(job["id"]).get("cancel_requested") else "生成任务被停止"})
             self._photo_note(cancelled)
             raise
         except Exception as exc:
@@ -846,11 +907,18 @@ class PersonaCanvasPlugin(Star):
         current = self.storage.job(job["id"])
         if current.get("cancel_requested") or current.get("status") == "cancelled":
             raise asyncio.CancelledError()
-        chain = MessageChain()
-        if job.get("caption"):
-            chain.message(job["caption"] + "\n")
-        chain.file_image(str(self.storage.asset(job["asset"])))
-        self.storage.update_job(job["id"], {"status": "sending"})
+        try:
+            chain = MessageChain()
+            if job.get("caption"):
+                chain.message(job["caption"] + "\n")
+            chain.file_image(str(self.storage.asset(job["asset"])))
+        except Exception as exc:
+            self.storage.update_job(job["id"], {"status": "delivery_failed", "phase": "delivery_failed", "failure_stage": "delivery", "error": "图片已生成，但消息准备失败，尚未发送：" + self._error(exc)})
+            self._photo_note(self._trace_job(job["id"], "delivery", "delivery_failed", "消息准备失败：" + self._error(exc)))
+            if job.get("delivery_key"):
+                self.storage.update_delivery(job["delivery_key"], {"status": "delivery_failed", "error": self._error(exc)})
+            raise
+        self.storage.update_job(job["id"], {"status": "sending", "phase": "sending"})
         if job.get("delivery_key"):
             self.storage.update_delivery(job["delivery_key"], {"status": "sending", "job_id": job["id"]})
         try:
@@ -862,25 +930,25 @@ class PersonaCanvasPlugin(Star):
                 result = await self.context.send_message(umo, chain)
                 if result is False:
                     raise DeliveryRejectedError("平台没有接受主动消息")
-            sent = self.storage.update_job(job["id"], {"status": "sent", "error": "", "failure_stage": ""})
+            sent = self.storage.update_job(job["id"], {"status": "sent", "phase": "sent", "error": "", "failure_stage": ""})
             sent = self._trace_job(job["id"], "delivery", detail="平台已接受图片消息")
             self._photo_note(sent)
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "sent", "job_id": job["id"]})
         except DeliveryRejectedError as exc:
-            self.storage.update_job(job["id"], {"status": "delivery_failed", "failure_stage": "delivery", "error": "平台明确拒收，照片已保留，可补发原图：" + self._error(exc)})
+            self.storage.update_job(job["id"], {"status": "delivery_failed", "phase": "delivery_failed", "failure_stage": "delivery", "error": "平台明确拒收，照片已保留，可补发原图：" + self._error(exc)})
             self._photo_note(self._trace_job(job["id"], "delivery", "delivery_failed", self._error(exc)))
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "delivery_failed", "error": self._error(exc)})
             raise
         except asyncio.CancelledError:
-            self.storage.update_job(job["id"], {"status": "uncertain", "error": "发送被中断，结果不确定，请先检查聊天记录"})
+            self.storage.update_job(job["id"], {"status": "uncertain", "phase": "uncertain", "error": "发送被中断，结果不确定，请先检查聊天记录"})
             self._photo_note(self._trace_job(job["id"], "delivery", "uncertain", "发送被中断"))
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "uncertain"})
             raise
         except Exception as exc:
-            self.storage.update_job(job["id"], {"status": "uncertain", "error": "图片已生成，发送结果不确定：" + self._error(exc)})
+            self.storage.update_job(job["id"], {"status": "uncertain", "phase": "uncertain", "error": "图片已生成，发送结果不确定：" + self._error(exc)})
             self._photo_note(self._trace_job(job["id"], "delivery", "uncertain", self._error(exc)))
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "uncertain", "error": self._error(exc)})
@@ -1262,7 +1330,9 @@ class PersonaCanvasPlugin(Star):
         source = "reply_image" if retry_old and retry_old.get("source") == "reply_image" else "chat" if event else "webui"
         reference = str(body.get("reference_asset") or (env["session"].get("last_image") if mode == "edit" else "") or "")
         reference_source = str(body.get("reference_source") or ("explicit_reference" if reference else "persona" if mode == "persona" else "none"))
-        job = self.storage.create_job({"status": "queued", "source": source, "raw": text, "caption": decision["reply"], "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "reference_asset": reference, "reference_assets": env.get("approved_reference_assets", []), "reference_source": reference_source, "request_basis": env.get("request_basis", {})})
+        prepared = self._prepare_generation(env, decision["prompt"], mode, decision["state_patch"], decision["reply"], text, reference_asset=reference, provider_name=str(body.get("provider") or ""), options=options, source=source, reference_source=reference_source, explicit_retry=bool(retry_old))
+        selected_provider = prepared["provider"].name
+        job = self.storage.create_job({"status": "queued", "phase": "local_queued", "preflight_checked": True, "provider": selected_provider, "request_summary": self._request_summary(prepared["provider"], prepared["positive"], prepared["negative"], prepared["options"], len(prepared["reference_names"]), reference_source), "source": source, "raw": text, "caption": decision["reply"], "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "reference_asset": reference, "reference_assets": env.get("approved_reference_assets", []), "reference_source": reference_source, "request_basis": env.get("request_basis", {})})
         if retry_old:
             self.storage.update_job(job["id"], {"retry_of": retry_old["id"], "confirmed_request_id": retry_old.get("confirmed_request_id", "")})
             try:
@@ -1290,20 +1360,15 @@ class PersonaCanvasPlugin(Star):
         self._photo_note(job)
         async def run():
             try:
-                generated = await self._generate_job(env, decision["prompt"], mode, decision["state_patch"], decision["reply"], text, reference_asset=reference, provider_name=str(body.get("provider") or ""), options=options, source=source, is_admin=_admin(event) if event else True, user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui", job_id=job["id"], reference_source=reference_source)
+                generated = await self._generate_job(env, decision["prompt"], mode, decision["state_patch"], decision["reply"], text, reference_asset=reference, provider_name=selected_provider, options=options, source=source, is_admin=_admin(event) if event else True, user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui", job_id=job["id"], reference_source=reference_source)
                 if event:
                     await self._send_job(generated, event=event)
             except Exception as exc:
                 self._fail_job(job["id"], exc)
                 if event:
-                    try:
-                        failed = self.storage.job(job["id"]) or {}
-                        message = failed.get("error") if failed.get("status") in {"delivery_failed", "uncertain"} else "这次照片没能完成：" + self._error(exc)
-                        await event.send(MessageChain().message(message))
-                    except Exception:
-                        pass
+                    await self._notify_photo_failure(self.storage.job(job["id"]), event=event)
         self._spawn(run(), "persona-canvas-web-job", job["id"])
-        return {"job_id": job["id"], "status": "queued", "decision": decision, "caption": decision["reply"]}
+        return {"job_id": job["id"], "status": "queued", "phase": "local_queued", "preflight_checked": True, "submitted": False, "upstream_accepted": False, "provider": selected_provider, "decision": decision, "caption": decision["reply"]}
 
     async def web_generate(self, body):
         text = str(body.get("text") or "").strip()

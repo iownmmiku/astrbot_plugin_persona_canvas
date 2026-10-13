@@ -41,6 +41,21 @@ class GeneratedImage:
 
 
 @dataclass
+class _PreparedGeneration:
+    """Local request preparation shared by preflight and actual submission."""
+    url: str
+    body: dict
+    model: str
+    prompt: str
+    negative: str
+    options: dict
+    reference: Any
+    negative_field: str = ""
+    notes: list[str] | None = None
+    files: dict | None = None
+
+
+@dataclass
 class ProviderCapabilities:
     text_to_image: bool = True
     image_to_image: bool = False
@@ -213,7 +228,7 @@ class ImageProvider:
                 self._url(route, "")
 
     def _record_request(self, prompt: Any, negative: Any, model: str, options: dict, reference: Any, *, negative_field: str = "", notes: list[str] | None = None) -> None:
-        """Keep only inspectable request values, never headers or image payloads."""
+        """Record an HTTP submission attempt, not proof of upstream acceptance."""
         allowed = {"width", "height", "size", "steps", "scale", "sampler", "seed", "strength", "noise", "quality", "background", "output_format", "input_fidelity", "aspect_ratio", "image_size", "params_version", "extra_noise_seed"}
         secret = str(self.config.get("api_key") or "")
         def safe(value):
@@ -326,6 +341,7 @@ class ImageProvider:
         parsed = urlsplit(endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ProviderError("接口地址必须为不含账号、查询参数的 HTTP(S) 基础地址")
+        self._origin(endpoint)  # Invalid numeric ports are a local configuration error.
         route = str(self.config.get(key) or "").strip()
         if not route and key == "generation_path":
             route = str(self.config.get("generate_path") or "").strip()
@@ -368,7 +384,6 @@ class ImageProvider:
         return result
 
     def _prepare(self, prompt: str, negative: str, reference: bytes | None, options: dict | None) -> tuple[str, dict]:
-        self.last_request = {}
         self.validate_config()
         if not isinstance(prompt, str) or not prompt.strip():
             raise ProviderError("生图描述不能为空")
@@ -401,6 +416,21 @@ class ImageProvider:
         if negative and self.capabilities.negative_mode == "natural_language":
             prompt = f"{prompt.strip()}\n\nAvoid these visual elements and defects: {str(negative).strip()}"
         return prompt.strip(), options
+
+    def preflight(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> None:
+        """Validate locally without networking, uploads, randomness or diagnostics mutation.
+
+        Success means the request is locally valid; credentials, remote models and
+        quota can only be checked by the upstream service during generation.
+        """
+        self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=False)
+
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> _PreparedGeneration:
+        raise ProviderError("此接口没有实现生图，请使用具体绘画适配器")
+
+    async def _submit_prepared(self, request: _PreparedGeneration) -> tuple[bytes, str]:
+        self._record_request(request.prompt, request.negative, request.model, request.options, request.reference, negative_field=request.negative_field, notes=request.notes)
+        return await self._post(request.url, request.body, files=request.files)
 
     async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
         raise ProviderError("此接口没有实现生图，请使用具体绘画适配器")
@@ -562,6 +592,8 @@ class OpenAIProvider(ImageProvider):
 
     def validate_config(self) -> None:
         super().validate_config()
+        if not str(self.config.get("model") or "").strip():
+            raise ProviderError("请配置绘画模型名称")
         if self.capabilities.negative_mode == "field":
             field = self.config.get("negative_prompt_field") or "negative_prompt"
             _validate_field_paths([("negative_prompt", field)] + [(key, key) for key in ("model", "prompt", "image", "image[]", "mask", "n", "stream", "size", "quality", "background", "output_format", "input_fidelity", "response_format")])
@@ -594,7 +626,7 @@ class OpenAIProvider(ImageProvider):
             raise ProviderError("模型不支持指定尺寸；可用尺寸：" + ", ".join(sizes))
         return min(sizes, key=lambda size: abs(math.log((int(size.split("x")[0]) / int(size.split("x")[1])) / (width / height))))
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> _PreparedGeneration:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
         model = str(self.config.get("model") or "").strip()
         if not model:
@@ -635,12 +667,17 @@ class OpenAIProvider(ImageProvider):
                 if model == "dall-e-2" and (extension != "png" or size[0] != size[1] or len(data) >= 4 * 1024 * 1024):
                     raise ProviderError("旧 DALL·E 2 编辑需要小于 4 MB 的正方形 PNG")
             files = {"image[]": refs} if len(refs) > 1 else {"image": refs[0]}
-            self._record_request(body["prompt"], _path_get(body, negative_field) if negative_field else "", body["model"], actual_options, reference, negative_field=negative_field)
-            raw, mime = await self._post(self._url("edit_path", "/v1/images/edits"), body, files=files)
+            url = self._url("edit_path", "/v1/images/edits")
         else:
-            self._record_request(body["prompt"], _path_get(body, negative_field) if negative_field else "", body["model"], actual_options, reference, negative_field=negative_field)
-            raw, mime = await self._post(self._url("generation_path", "/v1/images/generations"), body)
-        return await self._decode_response(raw, mime, model)
+            files = None
+            url = self._url("generation_path", "/v1/images/generations")
+        return _PreparedGeneration(url, body, model, body["prompt"], _path_get(body, negative_field) if negative_field else "", actual_options, reference, negative_field=negative_field, files=files)
+
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+        self.last_request = {}
+        request = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        raw, mime = await self._submit_prepared(request)
+        return await self._decode_response(raw, mime, request.model)
 
 
 class GeminiProvider(ImageProvider):
@@ -652,6 +689,11 @@ class GeminiProvider(ImageProvider):
         self.capabilities.identity_reference = "inlineData 图像参考，不保证固定身份"
         self.capabilities.max_reference_images = 14 if str(config.get("model", "")).startswith(("gemini-3-pro-image", "gemini-3.1-flash-image")) else 3
 
+    def validate_config(self) -> None:
+        super().validate_config()
+        if not str(self.config.get("model") or "").removeprefix("models/").strip():
+            raise ProviderError("请配置 Gemini 绘画模型")
+
     def _headers(self) -> dict[str, str]:
         if str(self.config.get("auth_header") or "").strip():
             return super()._headers()
@@ -660,7 +702,7 @@ class GeminiProvider(ImageProvider):
             result["x-goog-api-key"] = str(self.config["api_key"])
         return result
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> _PreparedGeneration:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
         model = str(self.config.get("model") or "").removeprefix("models/").strip()
         if not model:
@@ -698,8 +740,14 @@ class GeminiProvider(ImageProvider):
         negative_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
         if _path_get(body, negative_field) is None:
             negative_field = ""
-        self._record_request(prompt, _path_get(body, negative_field) if negative_field else "", model, actual_options, reference, negative_field=negative_field)
-        raw, _ = await self._post(self._url("generation_path", f"/models/{quote(model, safe='-._')}:generateContent"), body)
+        url = self._url("generation_path", f"/models/{quote(model, safe='-._')}:generateContent")
+        return _PreparedGeneration(url, body, model, prompt, _path_get(body, negative_field) if negative_field else "", actual_options, reference, negative_field=negative_field)
+
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+        self.last_request = {}
+        request = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        raw, _ = await self._submit_prepared(request)
+        model = request.model
         payload = self._json(raw)
         candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
         if not isinstance(candidates, list):
@@ -737,7 +785,7 @@ class NovelAIProvider(ImageProvider):
         super().__init__(name, config)
         self.capabilities = ProviderCapabilities(image_to_image=bool(config.get("supports_image_edit")), negative_prompt=True, negative_mode="field", seed=True, sampler=True, dimensions="宽高为 64 的倍数，支持范围取决于模型和账户", identity_reference="当前仅提供 img2img；未实现 Character Reference 或 Vibe Transfer", negative_prompt_mode="原生 negative_prompt / v4_negative_prompt", automated_generation=False)
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> _PreparedGeneration:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
         if isinstance(reference, list):
             reference = reference[0]
@@ -749,7 +797,7 @@ class NovelAIProvider(ImageProvider):
             raise ProviderError("strength / noise 仅用于携带参考图的图生图")
         model = str(self.config.get("model") or "nai-diffusion-4-5-full")
         seed = _integer(options.get("seed", -1), "随机种子", -1, 2 ** 32 - 1)
-        seed = secrets.randbelow(2 ** 32) if seed == -1 else seed
+        seed = secrets.randbelow(2 ** 32) if randomize and seed == -1 else seed
         params = {"width": width, "height": height, "steps": _integer(options.get("steps", 28), "采样步数", 1, 100), "scale": _number(options.get("scale", 5), "提示词引导值", 0, 100), "sampler": str(options.get("sampler") or "k_euler_ancestral"), "n_samples": 1, "negative_prompt": str(negative_prompt or ""), "seed": seed}
         protected = {"input", "model", "action", "parameters.image", "parameters.negative_prompt", "parameters.n_samples", "parameters.stream"}
         if "nai-diffusion-4" in model or "nai-diffusion-5" in model:
@@ -764,9 +812,13 @@ class NovelAIProvider(ImageProvider):
             _image_info(buffer.getvalue())
             params.update(image=base64.b64encode(buffer.getvalue()).decode("ascii"), strength=_number(options.get("strength", self.config.get("strength", 0.6)), "图生图强度", 0, 1), noise=_number(options.get("noise", self.config.get("noise", 0)), "图生图噪声", 0, 1), extra_noise_seed=seed)
         body = self._merge_extra({"input": prompt, "model": model, "action": "img2img" if reference is not None else "generate", "parameters": params}, protected)
-        self._record_request(body["input"], body["parameters"]["negative_prompt"], body["model"], body["parameters"], reference, negative_field="parameters.negative_prompt", notes=["同时发送 v4_negative_prompt.caption.base_caption"] if "v4_negative_prompt" in body["parameters"] else None)
-        raw, mime = await self._post(self._url("generation_path", "/ai/generate-image"), body)
-        return await self._decode_response(raw, mime, model)
+        return _PreparedGeneration(self._url("generation_path", "/ai/generate-image"), body, model, body["input"], body["parameters"]["negative_prompt"], body["parameters"], reference, negative_field="parameters.negative_prompt", notes=["同时发送 v4_negative_prompt.caption.base_caption"] if "v4_negative_prompt" in body["parameters"] else None)
+
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+        self.last_request = {}
+        request = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        raw, mime = await self._submit_prepared(request)
+        return await self._decode_response(raw, mime, request.model)
 
     async def list_models(self) -> dict:
         if self.config.get("models_path"):
@@ -806,7 +858,7 @@ class CustomProvider(ImageProvider):
         if str(self.config.get("reference_format") or "data_url") not in {"base64", "data_url"}:
             raise ProviderError("reference_format 仅支持 base64 或 data_url")
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> _PreparedGeneration:
         prompt, options = self._prepare(prompt, negative_prompt, reference, options)
         if isinstance(reference, list):
             reference = reference[0]
@@ -870,9 +922,13 @@ class CustomProvider(ImageProvider):
         negative_field = str(self.config.get("negative_prompt_field") or "negative_prompt")
         if _path_get(body, negative_field) is None:
             negative_field = ""
-        self._record_request(_path_get(body, prompt_field), _path_get(body, negative_field) if negative_field else "", str(_path_get(body, model_field)), actual_options, reference, negative_field=negative_field)
-        raw, mime = await self._post(self._url("edit_path" if reference is not None else "generation_path", ""), body)
-        return await self._decode_response(raw, mime, model)
+        return _PreparedGeneration(self._url("edit_path" if reference is not None else "generation_path", ""), body, model, _path_get(body, prompt_field), _path_get(body, negative_field) if negative_field else "", actual_options, reference, negative_field=negative_field)
+
+    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None) -> GeneratedImage:
+        self.last_request = {}
+        request = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        raw, mime = await self._submit_prepared(request)
+        return await self._decode_response(raw, mime, request.model)
 
 
 def provider_from_config(name: str, config: dict[str, Any]) -> ImageProvider:

@@ -33,10 +33,11 @@ const fixtures = {
     { name: "local-comfy", kind: "comfyui", endpoint: "http://127.0.0.1:8188", model: "角色本地工作流", timeout: 180, workflow: { "6": { class_type: "CLIPTextEncode", inputs: { text: "default" } } }, workflow_fields: { prompt: "6.inputs.text" }, capabilities: { ...capabilities, image_to_image: false, negative_mode: "disabled" } },
   ] },
   targets: { items: [{ umo: "offline:FriendMessage:friend", name: "私聊测试", scope: "private", enabled: false, morning_enabled: false, reply_image_enabled: false }, { umo: "offline:GroupMessage:group", name: "群聊测试", scope: "group", enabled: false, morning_enabled: false, reply_image_enabled: false }] }, sessions: { items: [] },
-  jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
+  jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", notification_state: "failed", notification_error: "<img src=x onerror=alert(1)> 平台未接受通知", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", notification_state: "uncertain", notification_error: "传输结果未知", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
     { id: "job-delivery-failed", status: "delivery_failed", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
     { id: "job-uncertain", status: "uncertain", caption: "已生成发送待确认", asset: "original-uncertain.png", umo: "offline:FriendMessage:test", created_at: 1725000000 },
     { id: "job-sending", status: "sending", caption: "原图正在发送", asset: "sending.png", umo: "offline:FriendMessage:test", created_at: 1724000000 },
+    { id: "job-local", status: "queued", phase: "local_queued", caption: "离线本地排队", created_at: 1723000000 },
   ] },
   history: { items: [{ job_id: "job-failed", ok: false, caption: "离线失败测试", provider: "default", model: "offline-image", error: "绘图接口超时", request_summary: requestSummary, state_patch: { outfit: "white dress" }, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] },
     { job_id: "job-delivery-failed", ok: true, caption: "已生成平台拒收" }, { job_id: "job-uncertain", ok: true, caption: "已生成发送待确认" },
@@ -159,6 +160,11 @@ async function main() {
     const jobDetail = get("job-list").locator(".request-detail").first(); await jobDetail.locator("summary").click();
     assert.match(await jobDetail.innerText(), /adult character/); assert.match(await jobDetail.innerText(), /abs, muscular female, extra toes/);
     assert.match(await jobDetail.innerText(), /角色参考图库/); assert.match(await jobDetail.innerText(), /60 秒（两者取较短）/);
+    assert.match(await jobDetail.innerText(), /不代表上游已受理/);
+    const localQueued = get("job-list").locator(".task-row").filter({ hasText: "离线本地排队" });
+    assert.match(await localQueued.innerText(), /本地排队/); assert.match(await localQueued.innerText(), /尚无上游受理凭据/);
+    assert.match(await get("job-list").innerText(), /失败通知未发送/); assert.match(await get("job-list").innerText(), /失败通知结果不确定/);
+    assert.equal(await get("job-list").locator("img").count(), 0, "通知错误必须作为文本显示");
     assert.equal(await jobDetail.locator("img").count(), 0, "提示词必须作为文本显示，避免 HTML 执行");
     assert.doesNotMatch(await page.locator("body").innerText(), /must-not-display/);
     const prepared = get("job-list").locator(".request-detail").nth(1); await prepared.locator("summary").click();

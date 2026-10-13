@@ -29,12 +29,12 @@ class RequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.settings, before)
 
     async def test_negative_modes_roundtrip_and_gemini_rejects_independent_field(self):
-        result = await self.plugin.web_save_provider({"name": "compat", "kind": "openai", "endpoint": "https://offline.invalid", "negative_mode": "field", "negative_prompt_field": "params.negative"})
+        result = await self.plugin.web_save_provider({"name": "compat", "kind": "openai", "endpoint": "https://offline.invalid", "model": "offline-image", "negative_mode": "field", "negative_prompt_field": "params.negative"})
         self.assertEqual(result["negative_mode"], "field")
         self.assertEqual(result["negative_prompt_field"], "params.negative")
         before = copy.deepcopy(self.store.settings)
         with self.assertRaises(ProviderError):
-            await self.plugin.web_save_provider({"name": "gemini", "kind": "gemini", "negative_mode": "field", "set_default": True})
+            await self.plugin.web_save_provider({"name": "gemini", "kind": "gemini", "model": "offline-gemini", "negative_mode": "field", "set_default": True})
         self.assertEqual(self.store.settings, before)
 
     async def test_generation_timeout_accepts_600_without_extending_chat_timeout(self):
@@ -94,7 +94,7 @@ class RequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(options["_explicit"]), {"aspect_ratio", "image_size"})
         self.assertEqual(self.store.job(result["job_id"])["status"], "succeeded")
 
-    async def test_reference_failure_keeps_prepared_request_and_accurate_stage(self):
+    async def test_reference_failure_is_reported_before_creating_or_running_a_job(self):
         asset = self.store.save_asset(fixtures.image_bytes(), "png").name
         persona = copy.deepcopy(self.store.persona())
         persona.update(reference_enabled=True, reference_asset=asset)
@@ -102,12 +102,13 @@ class RequestDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.image_provider.capabilities.image_to_image = False
         queued = json.loads(await self.plugin.tool_photo(fixtures.Event("拍一张自拍"), "portrait"))
         await asyncio.gather(*list(self.plugin._tasks), return_exceptions=True)
-        history = self.store.recent_history()[0]
-        self.assertFalse(history["ok"])
-        self.assertEqual(history["job_id"], queued["job_id"])
-        self.assertEqual(history["failure_stage"], "reference")
-        self.assertIn("尚未提交", history["request_summary"]["notes"])
-        self.assertIn("portrait", history["prompt"])
+        self.assertFalse(queued["ok"])
+        self.assertEqual(queued["phase"], "preflight")
+        self.assertFalse(queued["submitted"])
+        self.assertIn("不支持参考图", queued["reason"])
+        self.assertFalse(self.store.recent_jobs())
+        self.assertFalse(self.store.recent_history())
+        self.assertEqual(self.store.recent_actions()[0]["trace"][0]["stage"], "preflight")
         self.assertFalse(self.image_provider.calls)
 
 
