@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.11"
+VERSION = "0.5.12"
 
 
 class DeliveryRejectedError(ValueError):
@@ -1331,6 +1331,9 @@ class PersonaCanvasPlugin(Star):
                         raise ValueError("时间格式应为 HH:MM")
                 elif key == "mode" and value not in {"native_tools", "compatibility"}:
                     raise ValueError("聊天接入模式无效")
+                elif group == "good_morning" and key == "image_mode":
+                    if not isinstance(value, str) or value not in {"prefer_photo", "auto", "text_only"}:
+                        raise ValueError("早安配图模式无效")
                 elif group == "reply_images" and key == "provider":
                     if not isinstance(value, str) or (value and value not in candidate["providers"]):
                         raise ValueError("配图接口不存在，请重新选择")

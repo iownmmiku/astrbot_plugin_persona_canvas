@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import math
 import random
 import time
 from datetime import datetime
@@ -102,6 +103,55 @@ class ActiveScheduler:
         gap = max(60, int(target.get("min_gap_sec", active.get("min_gap_sec", 3600))))
         jitter = max(0, min(40, int(active.get("jitter_percent", 15)))) / 100
         return now + gap * (1 + random.uniform(0, jitter))
+
+    def _time_context(self, target, kind):
+        config = self.plugin.storage.settings["good_morning" if kind == "morning" else "active"]
+        timezone = str(target.get("timezone") or config.get("timezone", "Asia/Shanghai"))
+        now = datetime.now(ZoneInfo(timezone))
+        period = ("凌晨" if now.hour < 5 else "上午" if now.hour < 11 else "中午" if now.hour < 13 else "下午" if now.hour < 18 else "晚上" if now.hour < 22 else "深夜")
+        result = {"timezone": timezone, "now": now.isoformat(timespec="seconds"), "date": now.date().isoformat(), "weekday": "星期" + "一二三四五六日"[now.weekday()], "period": period, "last_inbound_at": None, "elapsed_seconds": None, "day_offset": None}
+        try:
+            inbound = float(target.get("last_inbound", 0))
+            if math.isfinite(inbound) and 0 < inbound <= now.timestamp():
+                previous = datetime.fromtimestamp(inbound, ZoneInfo(timezone))
+                result.update(last_inbound_at=previous.isoformat(timespec="seconds"), elapsed_seconds=int(now.timestamp() - inbound), day_offset=(now.date() - previous.date()).days)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+        return result
+
+    def _check_time_context(self, target, kind, key, env, job=None):
+        initial = env["proactive_context"]["time"]
+        current = self._time_context(target, kind)
+        elapsed = (datetime.fromisoformat(current["now"]) - datetime.fromisoformat(initial["now"])).total_seconds()
+        if all(current[name] == initial[name] for name in ("timezone", "date", "period")) and 0 <= elapsed <= 900:
+            return True
+        reason = "主动内容的日期、时段或时区已改变，或决策已超过15分钟；本次不发送过期内容"
+        self.plugin.storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "time_context_expired", "reason": reason})
+        if job:
+            self.plugin._photo_note(self.plugin._trace_job(job["id"], "time", "skipped", reason + "，原图已保留"))
+        self.plugin.storage.record_action({"kind": "delivery", "source": kind, "umo": target["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "status": "skipped", "summary": reason, "trace": [{"stage": "time", "status": "skipped", "detail": reason}]})
+        return False
+
+    def _image_policy(self, target, kind, *, check_budget=True):
+        storage = self.plugin.storage
+        mode = str(storage.settings["good_morning"].get("image_mode", "prefer_photo")) if kind == "morning" else "auto"
+        reason = ""
+        if not target.get("with_image", True):
+            reason = "目标未允许主动图片"
+        elif mode == "text_only":
+            reason = "早安设置为仅文字"
+        elif check_budget and storage.budget_summary(storage.settings["proactive_budget"])["photos"]["remaining"] <= 0:
+            reason = "今日主动照片预算已用完"
+        else:
+            try:
+                provider = self.plugin._provider()
+                if not getattr(provider.capabilities, "automated_generation", True):
+                    reason = "当前绘图接口不支持自动生成"
+                elif not getattr(provider.capabilities, "text_to_image", True):
+                    reason = "当前绘图接口不支持人设拍摄"
+            except Exception as exc:
+                reason = "绘图接口暂不可用：" + self.plugin._error(exc)
+        return not reason, mode, reason
 
     async def _schedule_context(self, target):
         """Use the optional schedule plugin's public API, never its storage."""
@@ -331,8 +381,9 @@ class ActiveScheduler:
                     return
                 env["schedule_context"] = schedule["prompt"]
             outfit = random.choice(env["persona"].get("outfit_pool") or ["casual morning clothes"]) if kind == "morning" else ""
-            image_allowed = target.get("with_image", True) and storage.budget_summary(limits)["photos"]["remaining"] > 0
-            text = ("现在处于管理员开启的每日早安时间窗。请用当前角色的口吻自然问候用户；即使近期没有未完话题，也可以简短说早安。优先文字问候，愿意且允许照片时可选择photo；暂时跳过选skip，用户要求安静或你明确今天不愿打扰时选refuse。" if kind == "morning" else "现在有一次自然联系用户的机会。结合近期聊天决定是否发送。") + ("本次不允许照片，不要选择照片、不要声称已拍照。" if not image_allowed else "")
+            image_allowed, image_mode, image_reason = self._image_policy(target, kind)
+            env["proactive_context"] = {"time": self._time_context(target, kind), "image_allowed": image_allowed, "morning_image_mode": image_mode, "image_unavailable_reason": image_reason}
+            text = ("现在处于管理员开启的每日早安时间窗。请用当前角色的口吻自然问候用户；即使近期没有未完话题，也可以简短说早安。按本次早安配图模式决定是否拍照；暂时跳过选skip，用户要求安静或你明确今天不愿打扰时选refuse。" if kind == "morning" else "现在有一次自然联系用户的机会。结合近期聊天和当前时间决定是否发送，不补发昨晚过期的问候。") + ("本次不允许照片，不要选择照片、不要声称已拍照。" if not image_allowed else "")
             recent = [{"status": item["status"], "reply": item.get("reply", ""), "at": item["at"]} for item in storage.recent_actions(env["key"], 30) if item.get("source") in {"active", "morning"}][:4]
             text += ("可接续近期话题，但没有话题不等于不能问候。避免重复已经发送的问候；之前的skip不是已发送。近期主动尝试：" if kind == "morning" else "优先接续最近聊天中的话题，避免重复最近的问候；没有合适话题时选择skip。近期主动尝试：") + json.dumps(recent, ensure_ascii=False)
             # Count attempts, including timeouts; paid calls cannot be rolled back.
@@ -340,13 +391,17 @@ class ActiveScheduler:
             decision = await self.plugin.dialogue.decide(env, text, proactive=True, event_kind="早安" if kind == "morning" else "日常", outfit=outfit)
             attempt = int((storage.delivery(key) or {}).get("attempts", 1))
             action = storage.record_action({"kind": "decision", "source": kind, "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": target["umo"], "status": decision["decision"], "reply": decision["reply"], "summary": f"早安第 {attempt}/{self._attempt_limit(kind)} 次尝试" if kind == "morning" else "日常主动联系机会", "requirements": decision.get("requirements", {}), "trace": [{"stage": "schedule", "status": "ok", "detail": "时间、空闲、静默与预算检查通过"}, {"stage": "role", "status": decision["decision"], "detail": decision["reply"] or "角色选择本轮不联系，没有生成或发送"}]})
-            storage.update_delivery(key, {"status": "decided", "decision": decision})
+            action["trace"].append({"stage": "time", "status": "ok", "detail": json.dumps(env["proactive_context"], ensure_ascii=False)})
+            storage.record_action({"trace": action["trace"]}, action["id"])
+            storage.update_delivery(key, {"status": "decided", "decision": decision, "proactive_context": env["proactive_context"]})
             if kind == "morning" and not await self._check_schedule(target, kind, key, schedule, env):
                 return
             # Schedule/identity resolution may yield across midnight. Check the
             # date after that last await, including before a skip can be retried.
             if not self._same_morning_date(target, kind, date):
                 storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "date_changed", "reason": "早安所属日期已改变，不发送前一天的内容"})
+                return
+            if not self._check_time_context(target, kind, key, env):
                 return
             if decision["decision"] in {"skip", "refuse", "ask", "state"}:
                 retryable = kind == "morning" and decision["decision"] == "skip" and attempt < self._attempt_limit(kind)
@@ -359,19 +414,28 @@ class ActiveScheduler:
                 return
             if kind != "morning" and not await self._check_schedule(target, kind, key, schedule, env):
                 return
+            if not self._check_time_context(target, kind, key, env):
+                return
             if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind):
                 storage.update_delivery(key, {"status": "skipped", "reason": "用户已回复，或目标、时间窗、启用状态与静默条件已经改变"})
                 return
             webchat_delivery = self.plugin._is_webchat(target["umo"], job={"delivery_platform": target.get("platform_type", "")})
             delivery_unconfirmed = False
             if decision["decision"] in {"photo", "scene", "edit"}:
-                if not image_allowed or decision["decision"] != "photo":
-                    raise ValueError("主动照片只支持已启用的人设拍摄")
+                current_image_allowed, _, current_image_reason = self._image_policy(target, kind)
+                if not image_allowed or not current_image_allowed or decision["decision"] != "photo":
+                    storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "image_unavailable", "reason": current_image_reason or image_reason or "主动照片只支持已启用的人设拍摄"})
+                    return
                 job = storage.create_job({"status": "queued", "source": kind, "delivery_platform": target.get("platform_type", ""), "delivery_key": key, "umo": env["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "caption": decision["reply"], "mode": "persona"})
                 storage.update_delivery(key, {"status": "generating", "job_id": job["id"]})
                 env["approved_requirements"] = decision.get("requirements", {})
                 job = await self.plugin._generate_job(env, decision["prompt"], "persona", decision["state_patch"], decision["reply"], "主动早安" if kind == "morning" else "主动照片", user_key="active:" + target["umo"], is_admin=True, source=kind, job_id=job["id"])
                 if not await self._check_schedule(target, kind, key, schedule, env, job):
+                    return
+                if not self._check_time_context(target, kind, key, env, job):
+                    return
+                if not self._image_policy(target, kind, check_budget=False)[0]:
+                    storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "image_unavailable", "reason": "生成期间主动图片设置或接口能力改变，原图已保留，本次不发送"})
                     return
                 if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind) or not self._same_morning_date(target, kind, date):
                     storage.update_delivery(key, {"status": "skipped", "retryable": False, "reason": "生成期间用户已回复，或目标、日期与发送条件已经改变"})

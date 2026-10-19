@@ -147,7 +147,7 @@ class MorningRetryStorageTests(unittest.TestCase):
         reopened = self.store()
         self.assertEqual(reopened.settings["good_morning"], {
             "enabled": True, "start": "08:00", "end": "09:00", "timezone": "UTC",
-            "max_attempts": 3, "retry_interval_sec": 900,
+            "max_attempts": 3, "retry_interval_sec": 900, "image_mode": "prefer_photo",
         })
 
     def test_invalid_claim_arguments_are_rejected(self):

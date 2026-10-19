@@ -211,11 +211,25 @@ async function main() {
     assert.equal(await get("m-attempts").inputValue(), "3"); assert.equal(await get("m-attempts").getAttribute("max"), "5");
     assert.equal(await get("m-retry-interval").inputValue(), "900"); assert.equal(await get("m-retry-interval").getAttribute("min"), "60"); assert.equal(await get("m-retry-interval").getAttribute("max"), "3600");
     assert.match(await get("active-form").innerText(), /每天每个目标最多实际发送一次早安/);
+    assert.equal(await get("m-image-mode").inputValue(), "prefer_photo");
+    assert.deepEqual(await get("m-image-mode").locator("option").evaluateAll(items => items.map(i => i.value)), ["prefer_photo", "auto", "text_only"]);
+    await get("m-image-mode").selectOption("text_only");
     await get("a-concurrency").fill("5"); await get("m-attempts").fill("4"); await get("m-retry-interval").fill("600"); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
     assert.equal((await lastPost("settings")).active.max_concurrent_targets, 5); assert.equal(await get("a-concurrency").inputValue(), "5");
     assert.equal((await lastPost("settings")).good_morning.max_attempts, 4); assert.equal((await lastPost("settings")).good_morning.retry_interval_sec, 600);
     assert.equal(await get("m-attempts").inputValue(), "4"); assert.equal(await get("m-retry-interval").inputValue(), "600");
+    assert.equal((await lastPost("settings")).good_morning.image_mode, "text_only");
+    assert.equal(await get("m-image-mode").inputValue(), "text_only");
+    await get("m-image-mode").selectOption("auto"); await get("restore-active").click();
+    assert.equal(await get("m-image-mode").inputValue(), "text_only");
+    for (const mode of ["auto", "prefer_photo"]) {
+      await get("m-image-mode").selectOption(mode);
+      await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();
+      await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+      assert.equal((await lastPost("settings")).good_morning.image_mode, mode);
+      assert.equal(await get("m-image-mode").inputValue(), mode);
+    }
     const morningSavedCount = await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length);
     for (const [id, invalid] of [["m-attempts", "6"], ["m-retry-interval", "59"], ["m-retry-interval", "3601"]]) {
       await get(id).fill(invalid); await get("active-form").getByRole("button", { name: "保存主动策略", exact: true }).click();

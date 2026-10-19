@@ -46,7 +46,7 @@ DEFAULT_SETTINGS = {
     "providers": {"default": DEFAULT_PROVIDER},
     "moderation": {"enabled": True, "daily_limit": 5, "min_interval_sec": 20, "max_concurrency": 1, "timezone": "Asia/Shanghai"},
     "active": {"enabled": False, "check_interval_sec": 30, "max_concurrent_targets": 3, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "min_idle_sec": 1800, "timezone": "Asia/Shanghai", "silence_after": 3, "silence_hours": 24, "jitter_percent": 15},
-    "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai", "max_attempts": 3, "retry_interval_sec": 900},
+    "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai", "max_attempts": 3, "retry_interval_sec": 900, "image_mode": "prefer_photo"},
     "generation": {"width": 832, "height": 1216, "steps": 28, "scale": 5, "sampler": "k_euler_ancestral", "seed": -1, "max_history": 100, "max_concurrency": 2, "timeout_sec": 180},
 }
 JOB_STATUSES = frozenset({"queued", "deciding", "generating", "succeeded", "failed", "sending", "sent", "uncertain", "delivery_failed", "cancelled"})
