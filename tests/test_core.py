@@ -48,7 +48,16 @@ star_module = types.ModuleType("astrbot.api.star")
 star_module.Context, star_module.Star, star_module.register = object, Star, decorator
 components_module = types.ModuleType("astrbot.api.message_components")
 components_module.Image = type("PlatformImage", (), {})
-for name, module in {"astrbot": astro, "astrbot.api": api, "astrbot.api.event": event_module, "astrbot.api.star": star_module, "astrbot.api.message_components": components_module}.items():
+message_module = types.ModuleType("astrbot.core.agent.message")
+class TextPart:
+    """Offline double; serialization is checked separately against real SDKs."""
+    def __init__(self, text):
+        self.text, self._no_save = text, False
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+message_module.TextPart = TextPart
+for name, module in {"astrbot": astro, "astrbot.api": api, "astrbot.api.event": event_module, "astrbot.api.star": star_module, "astrbot.api.message_components": components_module, "astrbot.core.agent.message": message_module}.items():
     sys.modules[name] = module
 spec = importlib.util.spec_from_file_location("canvas_test", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
 package = importlib.util.module_from_spec(spec)
@@ -324,7 +333,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         req = types.SimpleNamespace(system_prompt="原来的AstrBot人格", conversation=None)
         await self.plugin.inject_visual_state(event, req)
-        self.assertTrue(req.system_prompt.startswith("原来的AstrBot人格"))
+        self.assertEqual(req.system_prompt, "原来的AstrBot人格")
+        self.assertTrue(req.extra_user_content_parts[-1]._no_save)
         await self.plugin.remember_conditions(event, types.SimpleNamespace(completion_text="远一点可以吗？"))
         env = await self.plugin.dialogue.environment(event.unified_msg_origin)
         self.assertTrue(env["session"]["pending"])

@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.12"
+VERSION = "0.5.13"
 
 
 class DeliveryRejectedError(ValueError):
@@ -452,6 +452,14 @@ class PersonaCanvasPlugin(Star):
 
     @filter.on_llm_request()
     async def inject_visual_state(self, event: AstrMessageEvent, req):
+        # A request may pass this hook again. Replace only our own transient
+        # block, preserving the system prompt and other plugins' content.
+        previous = getattr(req, "_persona_canvas_visual_part", None)
+        parts = getattr(req, "extra_user_content_parts", None)
+        if previous is not None:
+            if isinstance(parts, list):
+                parts[:] = [part for part in parts if part is not previous]
+            req._persona_canvas_visual_part = None
         self.reply_images.observe(event)
         if not self.storage.settings["integration"].get("enabled", True):
             return
@@ -461,11 +469,17 @@ class PersonaCanvasPlugin(Star):
             env["session"]["pending"] = {}
             env["session"] = self.storage.save_session(env["key"], env["session"])
         _extra(event, "environment", env, set_value=True)
-        req.system_prompt = (getattr(req, "system_prompt", "") or "") + "\n" + self.dialogue.visual_prompt(env)
+        visual_context = self.dialogue.visual_prompt(env)
         if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event):
-            req.system_prompt += "\n原生工具支持上下文语义判断：你已理解用户要图片/更新外观时，在 request_summary 简述本轮意图与上下文依据，直接调用，无需用户重复关键词。已有条件时用 persona_canvas_control(action=confirm, request_id=当前编号) 记录语义确认，再调用拍照/状态工具；也可在执行工具直接填写 confirmed_request_id。重复约定原衣服不算修改；用户确实修改条件时 control(revise) 记录更新并等待下一轮确认。撤回用 control(cancel)，生成失败需用户明确要求后 control(retry)；已保存照片发送失败用 control(resend, job_id=原任务编号) 补发原图，不重新生成。发送结果不确定时用户先检查聊天记录并明确要求补发，再设 confirm_uncertain=true。修改条件可用 remove_fields 移除约束，仍需重新询问。同意的文字本身不会生图。persona 自拍默认只用角色参考图；需要参考用户附件时显式 use_message_image=true，edit 模式自动读取附件。"
+            visual_context += "\n原生工具支持上下文语义判断：你已理解用户要图片/更新外观时，在 request_summary 简述本轮意图与上下文依据，直接调用，无需用户重复关键词。已有条件时用 persona_canvas_control(action=confirm, request_id=当前编号) 记录语义确认，再调用拍照/状态工具；也可在执行工具直接填写 confirmed_request_id。重复约定原衣服不算修改；用户确实修改条件时 control(revise) 记录更新并等待下一轮确认。撤回用 control(cancel)，生成失败需用户明确要求后 control(retry)；已保存照片发送失败用 control(resend, job_id=原任务编号) 补发原图，不重新生成。发送结果不确定时用户先检查聊天记录并明确要求补发，再设 confirm_uncertain=true。修改条件可用 remove_fields 移除约束，仍需重新询问。同意的文字本身不会生图。persona 自拍默认只用角色参考图；需要参考用户附件时显式 use_message_image=true，edit 模式自动读取附件。"
         if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event) and self._eligible(_text(event), env):
-            req.system_prompt += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"
+            visual_context += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"
+        from astrbot.core.agent.message import TextPart
+        part = TextPart(text=visual_context).mark_as_temp()
+        if getattr(req, "extra_user_content_parts", None) is None:
+            req.extra_user_content_parts = []
+        req.extra_user_content_parts.append(part)
+        req._persona_canvas_visual_part = part
 
     @filter.on_llm_response()
     async def remember_conditions(self, event: AstrMessageEvent, response):
