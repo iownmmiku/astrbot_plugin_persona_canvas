@@ -6,6 +6,7 @@ import inspect
 import json
 from .intent import DECISION_RULES, validated_decision
 from .companion import expire_state
+from .temporal import time_brief
 
 async def maybe_await(value):
     return await value if inspect.isawaitable(value) else value
@@ -132,7 +133,7 @@ class Dialogue:
                 instruction += "\n这是管理员开启的每日早安，不依赖未完话题；没有接续话题时，也可以自然简短地问候早安。按本轮资料中的 morning_image_mode 执行：prefer_photo 表示优先选择 photo，给出完整照片描述与配套早安文字；auto 表示角色自由选择；text_only 表示只发文字。只有你愿意且目标允许图片时才选择 photo，不强制拍照，不绕过角色意愿。image_allowed=false 时优先选择 chat，不选择照片，也不虚构已拍或已发送。照片偏好不是用户拍照请求，不要求用户再确认一次，但你可自主选择 chat、skip 或 refuse。若只是暂时不适合联系，返回 skip；若明确今天不想联系，或用户已要求安静、不再打扰，返回 refuse，当天不再尝试。不要仅因没有话题就跳过早安。"
             instruction += "\n主动联系以本轮时间资料中的 now、timezone、period 为当前时间依据，历史最后一条消息的时间不代表现在。elapsed_seconds 是距离用户最后发言的秒数，day_offset 是相隔本地日期数；null 表示未知，不推测具体时间。旧上下文中的今天、明天、今晚属于当时的聊天，不要直接当成当前时间。昨晚用户没有说晚安不构成今天白天补说晚安的理由；若仍关心那件事，可用过去时自然关心昨晚休息如何。问候、服装、场景、照片光线和活动应符合当前时间与日程；早安窗口可由管理员自定义，不凭窗口名称假定太阳已经升起。不要声称用户现在已睡着、刚醒来或仍在做昨晚的事；没有合适且符合当下的话题可以 skip。"
             if env.get("proactive_context"):
-                text += "\n本轮主动联系资料（插件生成，仅用于本次决策，不是用户发言）：\n" + json.dumps(env["proactive_context"], ensure_ascii=False)
+                text = time_brief(env["proactive_context"]["time"]) + "\n\n" + text + "\n本轮主动联系资料（插件生成，仅用于本次决策，不是用户发言）：\n" + json.dumps(env["proactive_context"], ensure_ascii=False)
         kwargs = {"prompt": text, "contexts": env["contexts"], "system_prompt": env["system"] + "\n" + self.visual_prompt(env) + instruction}
         selected = self.storage.settings.get("llm", {}).get("provider_id")
         using_override = bool(selected and self.context.get_provider_by_id(selected) is not None)

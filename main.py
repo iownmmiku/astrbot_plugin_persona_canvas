@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.13"
+VERSION = "0.5.14"
 
 
 class DeliveryRejectedError(ValueError):
@@ -1221,7 +1221,16 @@ class PersonaCanvasPlugin(Star):
         return {"items": result}
 
     async def web_targets(self):
-        return {"items": copy.deepcopy(self.storage.targets["items"])}
+        items = copy.deepcopy(self.storage.targets["items"])
+        scheduler = self.active or ActiveScheduler(self)
+        for target in items:
+            if target.get("scope") == "group":
+                continue
+            try:
+                target["clock"] = {kind: scheduler._time_context(target, kind) for kind in ("active", "morning")}
+            except Exception as exc:
+                target["clock_error"] = self._error(exc)
+        return {"items": items}
 
     async def web_sessions(self):
         return {"items": self.storage.list_sessions()}

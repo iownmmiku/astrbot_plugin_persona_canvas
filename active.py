@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from .dialogue import field, maybe_await
+from .temporal import temporal_conflicts, time_brief
 
 class ActiveScheduler:
     def __init__(self, plugin):
@@ -152,6 +153,60 @@ class ActiveScheduler:
             except Exception as exc:
                 reason = "绘图接口暂不可用：" + self.plugin._error(exc)
         return not reason, mode, reason
+
+    async def _review_reply_time(self, target, kind, key, env, decision, outfit):
+        clock = self._time_context(target, kind)
+        review = {"status": "ok", "checked_at": clock["now"], "timezone": clock["timezone"], "issues": []}
+        if decision["decision"] not in {"chat", "photo"}:
+            return decision, review
+        issues = temporal_conflicts(decision["reply"], clock, morning=kind == "morning")
+        if not issues:
+            return decision, review
+        review.update(status="blocked", issues=issues, original_reply=decision["reply"])
+        def blocked(reason):
+            review["reason"] = reason
+            return {**decision, "decision": "skip", "reply": "", "prompt": ""}, review
+        initial_inbound = (self.plugin.storage.delivery(key) or {}).get("inbound_at", 0)
+        if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind) or not self._check_time_context(target, kind, key, env):
+            return blocked("检测到时间冲突，但联系条件已变化，本次不再修正或发送")
+        budget = self.plugin.storage.reserve_budget("llm", self.plugin.storage.settings["proactive_budget"])
+        if not budget:
+            return blocked("时间冲突修正所需的模型预算不足，本次不发送")
+        self.plugin.storage.finish_budget(budget, used=True)
+        # Do not feed the old conversation back into the correction. The model
+        # gets the current clock, current persona/schedule and one proposed draft.
+        correction_env = {**env, "contexts": [], "proactive_context": {**env["proactive_context"], "time": clock}}
+        prompt = "以下是你本轮准备主动发出的草稿，存在明确的时间冲突。请根据真实当地时钟只修正本轮内容，不接续旧历史的时间；不要求用户重新说关键词。保留角色口吻及原拍摄条件；原来是chat时不得改成photo/scene/edit，原来是photo时可继续photo或改为chat/skip/refuse。不强行拍照，不声称用户当前的作息或活动。若无法自然修正，选择skip。返回相同格式的决策JSON。\n" + json.dumps({"conflicts": issues, "draft": decision}, ensure_ascii=False)
+        try:
+            corrected = await self.plugin.dialogue.decide(correction_env, prompt, proactive=True, event_kind="早安" if kind == "morning" else "日常", outfit=outfit)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return blocked("时间冲突修正失败，本次不发送：" + self.plugin._error(exc))
+        finally:
+            self.plugin.storage.finish_budget(budget)
+        if corrected["decision"] in {"scene", "edit"} or (decision["decision"] == "chat" and corrected["decision"] == "photo"):
+            return blocked("时间修正试图扩大原动作范围，本次不发送")
+        current = self._time_context(target, kind)
+        remaining = temporal_conflicts(corrected["reply"], current, morning=kind == "morning") if corrected["decision"] in {"chat", "photo"} else []
+        if remaining:
+            review["remaining_issues"] = remaining
+            return blocked("修正后仍有时间冲突，本次不发送")
+        corrected["requirements"] = {**corrected.get("requirements", {}), **decision.get("requirements", {})}
+        review.update(status="corrected", checked_at=current["now"], reply=corrected["reply"])
+        return corrected, review
+
+    def _check_reply_time(self, target, kind, key, env, decision, job=None):
+        clock = self._time_context(target, kind)
+        issues = temporal_conflicts(decision["reply"], clock, morning=kind == "morning")
+        if not issues:
+            return True
+        reason = "发送前时间校验未通过：" + "；".join(issues)
+        self.plugin.storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "time_conflict", "reason": reason})
+        if job:
+            self.plugin._photo_note(self.plugin._trace_job(job["id"], "time_validation", "skipped", reason + "，原图已保留"))
+        self.plugin.storage.record_action({"kind": "delivery", "source": kind, "umo": target["umo"], "session_key": env["key"], "persona_id": env["persona"]["id"], "status": "skipped", "summary": reason, "trace": [{"stage": "time_validation", "status": "skipped", "detail": reason}]})
+        return False
 
     async def _schedule_context(self, target):
         """Use the optional schedule plugin's public API, never its storage."""
@@ -389,11 +444,13 @@ class ActiveScheduler:
             # Count attempts, including timeouts; paid calls cannot be rolled back.
             storage.finish_budget(model_budget, used=True)
             decision = await self.plugin.dialogue.decide(env, text, proactive=True, event_kind="早安" if kind == "morning" else "日常", outfit=outfit)
+            decision, time_review = await self._review_reply_time(target, kind, key, env, decision, outfit)
             attempt = int((storage.delivery(key) or {}).get("attempts", 1))
             action = storage.record_action({"kind": "decision", "source": kind, "session_key": env["key"], "persona_id": env["persona"]["id"], "umo": target["umo"], "status": decision["decision"], "reply": decision["reply"], "summary": f"早安第 {attempt}/{self._attempt_limit(kind)} 次尝试" if kind == "morning" else "日常主动联系机会", "requirements": decision.get("requirements", {}), "trace": [{"stage": "schedule", "status": "ok", "detail": "时间、空闲、静默与预算检查通过"}, {"stage": "role", "status": decision["decision"], "detail": decision["reply"] or "角色选择本轮不联系，没有生成或发送"}]})
             action["trace"].append({"stage": "time", "status": "ok", "detail": json.dumps(env["proactive_context"], ensure_ascii=False)})
+            action["trace"].append({"stage": "time_validation", "status": time_review["status"], "detail": json.dumps(time_review, ensure_ascii=False)})
             storage.record_action({"trace": action["trace"]}, action["id"])
-            storage.update_delivery(key, {"status": "decided", "decision": decision, "proactive_context": env["proactive_context"]})
+            storage.update_delivery(key, {"status": "decided", "decision": decision, "proactive_context": env["proactive_context"], "time_review": time_review})
             if kind == "morning" and not await self._check_schedule(target, kind, key, schedule, env):
                 return
             # Schedule/identity resolution may yield across midnight. Check the
@@ -402,6 +459,10 @@ class ActiveScheduler:
                 storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "date_changed", "reason": "早安所属日期已改变，不发送前一天的内容"})
                 return
             if not self._check_time_context(target, kind, key, env):
+                return
+            if time_review["status"] == "blocked":
+                storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "time_conflict", "reason": time_review["reason"]})
+                storage.record_action({"summary": action["summary"] + " · " + time_review["reason"]}, action["id"])
                 return
             if decision["decision"] in {"skip", "refuse", "ask", "state"}:
                 retryable = kind == "morning" and decision["decision"] == "skip" and attempt < self._attempt_limit(kind)
@@ -415,6 +476,8 @@ class ActiveScheduler:
             if kind != "morning" and not await self._check_schedule(target, kind, key, schedule, env):
                 return
             if not self._check_time_context(target, kind, key, env):
+                return
+            if not self._check_reply_time(target, kind, key, env, decision):
                 return
             if target.get("last_inbound", 0) != initial_inbound or not self._still_allowed(target, kind):
                 storage.update_delivery(key, {"status": "skipped", "reason": "用户已回复，或目标、时间窗、启用状态与静默条件已经改变"})
@@ -433,6 +496,8 @@ class ActiveScheduler:
                 if not await self._check_schedule(target, kind, key, schedule, env, job):
                     return
                 if not self._check_time_context(target, kind, key, env, job):
+                    return
+                if not self._check_reply_time(target, kind, key, env, decision, job):
                     return
                 if not self._image_policy(target, kind, check_budget=False)[0]:
                     storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "image_unavailable", "reason": "生成期间主动图片设置或接口能力改变，原图已保留，本次不发送"})
@@ -464,7 +529,8 @@ class ActiveScheduler:
                 target["morning_date"] = date
             storage.save_targets()
             try:
-                await self.plugin.dialogue.remember(env, f"[系统主动联系机会：{kind}，不是用户请求]", decision["reply"] + (" [已发送照片：" + decision["prompt"] + "]" if decision["decision"] == "photo" else ""))
+                sent_clock = self._time_context(target, kind)
+                await self.plugin.dialogue.remember(env, f"[系统主动联系机会：{kind}，不是用户请求；当地发送时间：{sent_clock['now']}；时区：{sent_clock['timezone']}]", decision["reply"] + (" [已发送照片：" + decision["prompt"] + "]" if decision["decision"] == "photo" else ""))
             except Exception as exc:
                 target["last_error"] = "消息已发送，写入聊天记忆失败：" + self.plugin._error(exc)
                 storage.save_targets()

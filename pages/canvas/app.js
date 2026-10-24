@@ -15,8 +15,8 @@ const finished = job => ["succeeded", "success", "done", "completed", "sent"].in
 const failed = job => ["failed", "error", "interrupted", "cancelled", "uncertain"].includes(job.status);
 const fullImages = new Map(), imageRequests = new Set();
 const referenceImages = new Map(), resending = new Set();
-const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截" };
-const stageNames = { request: "请求检查", preflight: "本地预检", notification: "失败通知", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会", time: "时间依据" };
+const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截", corrected: "已按当前时间修正" };
+const stageNames = { request: "请求检查", preflight: "本地预检", notification: "失败通知", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会", time: "时间依据", time_validation: "回复时间校验" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
 const negativeModes = { disabled: "不自动发送人设负面词", natural_language: "自然语言约束", field: "独立负面字段" };
 const referenceSources = { persona: "角色参考图库", persona_gallery: "角色参考图库", explicit: "指定参考图", explicit_reference: "指定参考图", attachment: "聊天附件", message_attachment: "聊天附件", last_image: "上一张图片", none: "无参考图" };
@@ -313,12 +313,14 @@ function fillTarget(t) {
   selection.target = structuredClone(t); const a = model.state.settings?.active || {}, m = model.state.settings?.good_morning || {}, group = targetScope(t) === "group";
   set("t-umo", t.umo); $("t-umo").readOnly = true;
   fillSelect("t-persona", model.personas.map(p => ({ value: p.id, label: p.name || p.id })), t.persona_id || "", "默认视觉人设");
-  set("t-timezone", t.timezone || a.timezone || "Asia/Shanghai"); set("t-start", t.start || a.default_start || "09:00"); set("t-end", t.end || a.default_end || "22:00"); set("t-gap", t.min_gap_sec ?? a.min_gap_sec ?? 3600); set("t-idle", t.min_idle_sec ?? a.min_idle_sec ?? 1800); set("t-silence", t.silence_after ?? a.silence_after ?? 3);
+  set("t-timezone", t.timezone || ""); set("t-start", t.start || a.default_start || "09:00"); set("t-end", t.end || a.default_end || "22:00"); set("t-gap", t.min_gap_sec ?? a.min_gap_sec ?? 3600); set("t-idle", t.min_idle_sec ?? a.min_idle_sec ?? 1800); set("t-silence", t.silence_after ?? a.silence_after ?? 3);
   setCheck("t-enabled", !group && t.enabled); setCheck("t-image", !group && t.with_image); setCheck("t-morning", !group && t.morning_enabled !== false); set("t-morning-start", t.morning_start || m.start || "07:00"); set("t-morning-end", t.morning_end || m.end || "10:00");
   setCheck("t-reply-enabled", t.reply_image_enabled); set("t-reply-probability", t.reply_image_probability ?? model.state.settings?.reply_images?.default_probability ?? 20);
   setText("target-status", !t.umo ? "等待发现会话" : group ? "群聊 · 回复配图" : t.silent_until && t.silent_until > Date.now() / 1000 ? `静默至 ${date(t.silent_until)}` : t.enabled ? "私聊 · 主动已开启" : "私聊 · 主动未开启");
   setText("t-scope-help", group ? "群聊：仅在机器人正常回复时才可能配图；不会主动联系或发送早安。" : "私聊：可分别开启回复配图、主动联系和早安。使用 AstrBot 完整 unified_msg_origin。");
   setText("t-proactive-help", group ? "群聊不支持主动联系与每日早安。以下设置已停用，不影响上方回复配图。" : "仅在开启私聊主动联系后执行，早安与普通主动策略分别控制。");
+  const clocks = t.clock || {};
+  setText("t-clock", group ? "" : t.clock_error ? `后台时钟读取失败：${t.clock_error}` : clocks.active && clocks.morning ? `后台读取时刻（刷新页面更新）：普通主动 ${clocks.active.now} · ${clocks.active.timezone}；早安 ${clocks.morning.now} · ${clocks.morning.timezone}` : "保存后刷新，可查看后台采用的当前时间与时区。");
   $("target-proactive-fields").querySelectorAll("input,select,textarea").forEach(input => { input.disabled = group; });
   setText("t-reply-help", model.state.settings?.reply_images?.enabled ? "全局配图已开启；开启本聊天后按这里的概率抽取，再由角色决定是否配图。" : "全局配图当前关闭。可以先保存本聊天设置，再打开上方全局开关。");
   const exists = model.targets.some(x => x.umo === t.umo); available("delete-target", exists); available("test-target", exists && !group); const save = $("target-form").querySelector('[type="submit"]'); save.disabled = !exists; save.dataset.unavailable = exists ? "false" : "true";

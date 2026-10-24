@@ -32,7 +32,7 @@ const fixtures = {
     { name: "novelai", kind: "novelai", endpoint: "https://offline.invalid", model: "offline-novelai", timeout: 90, capabilities: { ...capabilities, seed: true, sampler: true, negative_prompt: true, negative_mode: "field", negative_prompt_mode: "原生负面通道" } },
     { name: "local-comfy", kind: "comfyui", endpoint: "http://127.0.0.1:8188", model: "角色本地工作流", timeout: 180, workflow: { "6": { class_type: "CLIPTextEncode", inputs: { text: "default" } } }, workflow_fields: { prompt: "6.inputs.text" }, capabilities: { ...capabilities, image_to_image: false, negative_mode: "disabled" } },
   ] },
-  targets: { items: [{ umo: "offline:FriendMessage:friend", name: "私聊测试", scope: "private", enabled: false, morning_enabled: false, reply_image_enabled: false }, { umo: "offline:GroupMessage:group", name: "群聊测试", scope: "group", enabled: false, morning_enabled: false, reply_image_enabled: false }] }, sessions: { items: [] },
+  targets: { items: [{ umo: "offline:FriendMessage:friend", name: "私聊测试", scope: "private", clock: { active: { now: "2026-10-25T01:30:00+00:00", timezone: "UTC" }, morning: { now: "2026-10-25T09:30:00+08:00", timezone: "Asia/Hong_Kong" } }, enabled: false, morning_enabled: false, reply_image_enabled: false }, { umo: "offline:GroupMessage:group", name: "群聊测试", scope: "group", enabled: false, morning_enabled: false, reply_image_enabled: false }] }, sessions: { items: [] },
   jobs: { items: [{ id: "job-failed", status: "failed", caption: "离线失败测试", provider: "default", created_at: 1728000000, error: "绘图接口超时", failure_stage: "provider", notification_state: "failed", notification_error: "<img src=x onerror=alert(1)> 平台未接受通知", request_summary: requestSummary, trace: [{ stage: "provider", status: "failed", detail: "60 秒限制已生效" }] }, { id: "job-prepared", status: "failed", caption: "离线参考图错误", provider: "default", created_at: 1727000000, error: "参考图不可用", notification_state: "uncertain", notification_error: "传输结果未知", request_summary: { ...requestSummary, submitted: false, negative_mode: "natural_language", negative_prompt: "", reference_source: "message_attachment", notes: "请求尚未提交，显示编排输入；接口实际参数以提交后摘要为准" }, trace: [{ stage: "reference", status: "failed", detail: "参考图不可用" }] },
     { id: "job-delivery-failed", status: "delivery_failed", source: "chat", caption: "已生成平台拒收", asset: "original.png", umo: "offline:FriendMessage:test", created_at: 1726000000 },
     { id: "job-uncertain", status: "uncertain", caption: "已生成发送待确认", asset: "original-uncertain.png", umo: "offline:FriendMessage:test", created_at: 1725000000 },
@@ -257,6 +257,16 @@ async function main() {
     await get("target-scope-filter").selectOption("private"); await get("target-list").getByRole("button", { name: /私聊测试/ }).click();
     assert.equal(await get("t-reply-enabled").isChecked(), false, "群聊设置不能改变私聊开关");
     assert.equal(await get("t-enabled").isDisabled(), false); assert.equal(await get("test-target").isDisabled(), false);
+    assert.equal(await get("t-timezone").inputValue(), "", "未设置目标时区时应保留继承，而非固化全局时区");
+    assert.match(await get("t-clock").innerText(), /普通主动 2026-10-25T01:30:00\+00:00 · UTC/);
+    assert.match(await get("t-clock").innerText(), /早安 2026-10-25T09:30:00\+08:00 · Asia\/Hong_Kong/);
+    for (const zone of ["UTC", ""]) {
+      await get("t-timezone").fill(zone);
+      await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
+      await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
+      assert.equal((await lastPost("targets")).patch.timezone, zone);
+      assert.equal(await get("t-timezone").inputValue(), zone);
+    }
     await get("t-reply-enabled").check(); await get("t-reply-probability").fill("35");
     await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
@@ -309,10 +319,10 @@ async function main() {
     assert.equal(await sentRow.getByRole("button", { name: "查看画面", exact: true }).count(), 1, "历史已发送记录仍可查看原图");
     await deliveryRow.getByRole("button", { name: "补发原图", exact: true }).click();
     await page.waitForFunction(() => Boolean(window.__releaseResend));
-    assert.equal(await deliveryRow.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true);
+    assert.equal(await deliveryRow.getByRole("button", { name: /^正在(?:补发|发送)原图…$/ }).isDisabled(), true);
     await page.locator("[data-page='history']").click();
     const deliveryHistory = get("history-list").locator("article").filter({ hasText: "已生成平台拒收" });
-    assert.equal(await deliveryHistory.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true, "任务与历史共用补发中的状态");
+    assert.equal(await deliveryHistory.getByRole("button", { name: /^正在(?:补发|发送)原图…$/ }).isDisabled(), true, "任务与历史共用补发中的状态");
     assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 1);
     await page.evaluate(() => { window.__releaseResend(); window.__releaseResend = null; });
     await page.waitForFunction(() => window.__canvasFixtures.jobs.items.find(job => job.id === "job-delivery-failed").status === "sent");
@@ -330,9 +340,9 @@ async function main() {
     await get("confirm-uncertain").check(); await get("confirm-ok").click();
     await page.waitForFunction(() => Boolean(window.__releaseResend));
     assert.deepEqual(await lastPost("jobs/resend"), { id: "job-sent", confirm_uncertain: true });
-    assert.equal(await sentHistory.getByRole("button", { name: "正在补发原图…", exact: true }).isDisabled(), true);
+    assert.equal(await sentHistory.getByRole("button", { name: /^正在(?:补发|发送)原图…$/ }).isDisabled(), true);
     await page.locator("[data-page='studio']").click();
-    const sentPending = sentRow.getByRole("button", { name: "正在补发原图…", exact: true });
+    const sentPending = sentRow.getByRole("button", { name: /^正在(?:补发|发送)原图…$/ });
     assert.equal(await sentPending.isDisabled(), true, "任务与历史共用历史已发送补发状态");
     await sentPending.dispatchEvent("click");
     assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "jobs/resend").length), 2, "补发中的重复点击不重复发送");

@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_FILES = (
     "__init__.py", "main.py", "active.py", "dialogue.py", "intent.py", "companion.py",
-    "moderation.py", "storage.py", "page_api.py", "webui_server.py", "reply_images.py",
+    "moderation.py", "storage.py", "page_api.py", "webui_server.py", "reply_images.py", "temporal.py",
     "metadata.yaml", "_conf_schema.json", "requirements.txt", "README.md", "CHANGELOG.md", "logo.png",
     "providers/__init__.py", "providers/base.py", "providers/comfyui.py",
     "pages/canvas/index.html", "pages/canvas/app.js", "pages/canvas/app.css",
