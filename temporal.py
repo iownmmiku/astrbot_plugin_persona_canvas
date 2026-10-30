@@ -59,6 +59,14 @@ def temporal_conflicts(reply, clock, *, morning=False):
             continue
         for match in re.finditer("|".join(GREETINGS), clause):
             word, before, after = match[0], clause[:match.start()], clause[match.end():]
+            # A greeting embedded in a longer word is not an explicit greeting:
+            # e.g. 下午好好休息 / 今晚安心 / 昨晚安稳. Prefer a missed ambiguous
+            # phrase to charging for a correction of an otherwise valid reply.
+            greeting_end = r"(?:$|\W|[啊呀啦哦喔哟呦哈呢吧])"
+            if not re.match(greeting_end, after) and not re.match(r"(?:主人|朋友们?|大家|各位|宝贝|亲爱的|小可爱|你们?)" + greeting_end, after):
+                continue
+            if _recalled_or_hypothetical(clause, match.start()):
+                continue
             if re.search(r"昨[天晚夜]|前[天晚夜]|上次|那天|当时|过去|明[天晚早]|今晚|以后|到时候|一会|稍后|待会|等会|回头|到时|等.{0,12}(?:再|说)|(?:早上|晚上|下午|中午).{0,8}(?:再|会|说|讲)$|(?:不|别|没).{0,8}(?:说|道|讲|是|算|要|用|想)$", before):
                 continue
             if re.search(r"吗|么|这[两几]个字|这个词|这句话|的意思|怎么说|是什么意思", after):
@@ -81,18 +89,17 @@ def temporal_conflicts(reply, clock, *, morning=False):
             if not 0 <= hour <= 23 or (minute is not None and not 0 <= minute <= 59):
                 issues.append("回复中的当前钟点无效")
                 continue
-            if match["period"] in {"中午", "下午", "傍晚", "晚上", "深夜"} and hour < 12:
-                hour += 12
-            elif match["period"] in {"凌晨", "半夜", "清晨", "早上", "上午"} and hour == 12:
-                hour = 0
-            candidates = [hour]
-            if match["period"] is None and hour < 12:
-                candidates.append(hour + 12)
+            # Twelve-hour expressions include both midnight and noon. Resolve
+            # their ambiguity using the named daypart, including intervals
+            # crossing midnight (深夜十一点 = 23:00, 深夜一点 = 01:00).
+            candidates = [hour % 12, hour % 12 + 12] if hour <= 12 else [hour]
+            if match["period"]:
+                candidates = [value for value in candidates if _contains_hour(value, PERIOD_HOURS[match["period"]])]
             if minute is None:
                 correct = now.hour in candidates
             else:
                 current = now.hour * 60 + now.minute
-                correct = min(min(abs(current - (h * 60 + minute)), 1440 - abs(current - (h * 60 + minute))) for h in candidates) <= 5
+                correct = any(min(abs(current - (h * 60 + minute)), 1440 - abs(current - (h * 60 + minute))) <= 5 for h in candidates)
             if not correct:
                 issues.append(f"回复给出的当前钟点与真实 {now:%H:%M} 不符")
         for match in re.finditer(r"今天(?:已经|正好|才)?(?:是)?\s*(?:(?P<year>\d{4})[年/-])?(?P<month>\d{1,2})[月/-](?P<day>\d{1,2})(?:日|号)?", clause):

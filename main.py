@@ -27,7 +27,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.14"
+VERSION = "0.5.15"
 
 
 class DeliveryRejectedError(ValueError):
@@ -305,7 +305,7 @@ class PersonaCanvasPlugin(Star):
             task.add_done_callback(self._requests.discard)
 
     def _error(self, exc):
-        text = str(exc)[:1500]
+        text = str(self.storage._scrub_known_secrets(str(exc)))
         for config in self.storage.settings.get("providers", {}).values():
             for key in ("api_key", "auth_value"):
                 secret = str(config.get(key) or "")
@@ -546,6 +546,11 @@ class PersonaCanvasPlugin(Star):
         if valid_pending(env["session"].get("pending"), env):
             env["changed_request"] = True
             env["previous_conditions"] = env["session"]["pending"]
+            previous_job = self.storage.job(env["previous_conditions"].get("execution_job_id", "")) or {}
+            if previous_job.get("session_key") == env["key"] and previous_job.get("persona_id") == env["persona"]["id"] and previous_job.get("status") in {"queued", "deciding", "generating", "succeeded"}:
+                # Replacing an agreement also withdraws its unfinished photo.
+                # Keeping the newer state alone would still send the old image.
+                await self._cancel_job(previous_job["id"])
         pending = self._save_conditions(env, _text(event), reply, {"outfit": outfit, "camera": camera, "pose": pose, "expression": expression, "scene": scene, "avoid": avoid}, request_kind)
         _extra(event, "conditions_recorded", True, set_value=True)
         self.storage.record_action({"session_key": env["key"], "persona_id": env["persona"]["id"], "umo": env["umo"], "kind": "decision", "status": "ask", "request": _text(event), "request_basis": {"source": "model_tool" if semantic else "keyword", "summary": str(request_summary or _text(event))[:1500]}, "reply": reply, "requirements": pending["requirements"]})
@@ -1060,9 +1065,11 @@ class PersonaCanvasPlugin(Star):
                     self.storage.release_asset(lease)
             if _extra(event, "delivery_key"):
                 job = self.storage.update_job(job["id"], {"delivery_key": _extra(event, "delivery_key")})
-            await self._send_job(job, event=event)
-            await self.dialogue.remember(env, text, decision["reply"] + " [已发送照片：" + decision["prompt"] + "]")
-            return {**decision, "sent": True, "job_id": job["id"]}
+            delivered = await self._send_job(job, event=event)
+            sent = delivered.get("status") == "sent"
+            if sent:
+                await self.dialogue.remember(env, text, decision["reply"] + " [已发送照片：" + decision["prompt"] + "]")
+            return {**decision, "sent": sent, "job_id": job["id"], "status": delivered.get("status"), "delivery_evidence": delivered.get("delivery_evidence", "")}
         session = self.storage.read_session(env["key"])
         if action == "ask":
             session["pending"] = pending_request(env, text, decision["reply"], {**infer_requirements(decision["reply"]), **state_patch(decision.get("state_patch")), **requirements(decision.get("requirements"))}, kind="photo" if explicit or self._eligible(text, env) else "state", ttl=int(self.storage.settings["dialogue"].get("confirmation_ttl_sec", 1800)))
@@ -1283,8 +1290,9 @@ class PersonaCanvasPlugin(Star):
         if "extra_body" in patch and not isinstance(patch["extra_body"], dict):
             raise ValueError("额外参数必须为 JSON 对象")
         old = self.storage.settings["providers"].get(name, {})
-        if "workflow" in patch and isinstance(patch["workflow"], dict):
-            patch["workflow"] = _restore_workflow_secrets(patch["workflow"], old.get("workflow"))
+        for field in ("workflow", "extra_body"):
+            if field in patch and isinstance(patch[field], dict):
+                patch[field] = _restore_workflow_secrets(patch[field], old.get(field))
         candidate = {**old, **patch, "name": name}
         if "reset_option_fields" in body and not isinstance(body["reset_option_fields"], bool):
             raise ValueError("reset_option_fields 必须为开关值")
