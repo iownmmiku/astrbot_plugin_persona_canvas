@@ -75,6 +75,10 @@ async function main() {
         apiGet: async route => structuredClone(data[route.replace(/^page\//, "")] || { items: [] }),
         apiPost: async (route, body) => {
           route = route.replace(/^page\//, ""); window.__canvasCalls.push({ route, body: structuredClone(body) });
+          if (route === "jobs/query") return structuredClone(data.jobs);
+          if (route === "history/query") return structuredClone(window.__historyPagination ? body.cursor ? { items: [{ history_id: 199, job_id: "older", caption: "更早的离线记录", ok: false }], has_more: false, next_cursor: null } : { items: data.history.items.map((item, index) => ({ ...item, history_id: 203 - index })), has_more: true, next_cursor: 200 } : { ...data.history, has_more: false, next_cursor: null });
+          if (route === "targets/inspect") return { umo: body.umo, checked_at: 1793318400, active: { eligible: false, blockers: [{ code: "idle", message: "最近用户发言，空闲时间尚未满足" }], image_allowed: false, image_reason: "今日照片预算已用完", next_check_at: 1793320200, effective: { timezone: { value: "UTC", source: "active" } } }, morning: { eligible: false, blockers: [{ code: "window", message: "当前不在早安时间窗" }], image_allowed: true, attempts: 1, max_attempts: 3 } };
+          if (route === "jobs/recover") { const item = data.jobs.items.find(job => job.id === body.id); item.recovery.phase = "recovered"; item.asset = "recovered.png"; return { ok: true, generated: false, image_saved: true, note: "原图已取回，没有自动发送。" }; }
           if (route === "providers") {
             const current = data.providers.items.find(item => item.name === body.name);
             const saved = { ...current, ...body, capabilities: current?.capabilities || { text_to_image: true } };
@@ -271,15 +275,23 @@ async function main() {
     await get("target-form").getByRole("button", { name: "保存目标", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
     assert.equal((await lastPost("targets")).patch.reply_image_probability, 35);
-    await get("r-enabled").check(); await get("r-probability").fill("40"); await get("r-interval").fill("120"); await get("r-provider").selectOption("local-comfy");
+    assert.equal(await get("r-max-wait").inputValue(), "30");
+    await get("r-enabled").check(); await get("r-probability").fill("40"); await get("r-interval").fill("120"); await get("r-max-wait").fill("45"); await get("r-provider").selectOption("local-comfy");
     await get("reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
-    assert.deepEqual((await lastPost("settings")).reply_images, { enabled: true, default_probability: 40, min_interval_sec: 120, provider: "local-comfy" });
+    assert.deepEqual((await lastPost("settings")).reply_images, { enabled: true, default_probability: 40, min_interval_sec: 120, max_wait_sec: 45, provider: "local-comfy" });
     assert.equal(await get("r-provider").inputValue(), "local-comfy"); assert.equal(await get("t-reply-probability").inputValue(), "35", "修改全局默认不得覆盖聊天概率");
     const settingsCount = await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length);
     await get("r-probability").fill("101"); await get("reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
     assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length), settingsCount, "HTML范围校验阻止超过100%的概率");
     await get("restore-reply-images").click();
+    assert.equal(await get("r-max-wait").inputValue(), "45");
+    await get("t-gap").fill("9999"); await get("refresh-target-diagnostics").click();
+    assert.match(await get("target-diagnostics").innerText(), /空闲时间尚未满足/);
+    assert.match(await get("target-diagnostics").innerText(), /照片预算已用完/);
+    assert.match(await get("target-diagnostics").innerText(), /当前不在早安时间窗/);
+    assert.equal(await get("t-gap").inputValue(), "9999", "只读诊断不覆盖未保存表单");
+    await get("restore-target").click();
 
     await page.locator("[data-page='providers']").click(); await get("provider-list").getByRole("button", { name: /local-comfy/ }).click();
     assert.equal(await get("comfy-workflow").isVisible(), true); assert.match(await get("v-model-label").innerText(), /工作流显示名称/);
@@ -365,6 +377,25 @@ async function main() {
     await page.locator("[data-page='settings']").click();
     assert.equal(await get("d-timeout").getAttribute("max"), "600");
     assert.match(await get("settings-form").innerText(), /persona_canvas_control/);
+
+    await page.locator("[data-page='studio']").click();
+    const retainedDetail = get("job-list").locator(".request-detail").first();
+    await retainedDetail.evaluate(el => { el.open = true; el.dataset.keep = "same-node"; });
+    await get("refresh-jobs").click();
+    assert.equal(await retainedDetail.evaluate(el => el.open && el.dataset.keep === "same-node"), true, "未变化的任务保持原DOM与展开详情");
+    await page.evaluate(() => { window.__canvasFixtures.jobs.items.push({ id: "recover-comfy", status: "failed", caption: "ComfyUI 原任务可恢复", recovery: { kind: "comfyui", prompt_id: "offline-id", phase: "accepted" } }); });
+    await get("refresh-jobs").click();
+    const recoverRow = get("job-list").locator(".task-row").filter({ hasText: "ComfyUI 原任务可恢复" });
+    await recoverRow.getByRole("button", { name: "检查原任务结果", exact: true }).click();
+    assert.deepEqual(await lastPost("jobs/recover"), { id: "recover-comfy" });
+    assert.match(await get("notice").innerText(), /没有自动发送/);
+    assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "generate").length), 1);
+    await page.evaluate(() => { window.__historyPagination = true; });
+    await page.locator("[data-page='history']").click(); await get("reload-history").click();
+    await get("load-more-history").click();
+    assert.match(await get("history-list").innerText(), /更早的离线记录/);
+    assert.equal(await get("load-more-history").isVisible(), false);
+    assert.deepEqual(await lastPost("history/query"), { cursor: 200, limit: 20 });
 
     await page.locator("[data-page='providers']").click();
     await get("provider-list").getByRole("button", { name: /custom-nested/ }).click();

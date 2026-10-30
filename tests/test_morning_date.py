@@ -16,6 +16,7 @@ class MorningDateTests(unittest.IsolatedAsyncioTestCase):
 
     def setup_morning(self):
         scheduler = ActiveScheduler(self.plugin)
+        self.plugin.active = scheduler
         self.store.settings["active"].update(enabled=False, min_idle_sec=0, min_gap_sec=60)
         self.store.settings["good_morning"].update(enabled=True, start="23:30", end="01:00", max_attempts=3, retry_interval_sec=900)
         self.store.settings["proactive_budget"].update(messages=10, llm=20, photos=10)

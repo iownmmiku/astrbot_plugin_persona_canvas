@@ -1,11 +1,12 @@
 """Persistent proactive deliveries; role decision always precedes generation."""
 from __future__ import annotations
 import asyncio
+import copy
 import json
 import math
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -66,38 +67,137 @@ class ActiveScheduler:
         current = now.time().replace(tzinfo=None)
         return left <= current <= right if left <= right else current >= left or current <= right
 
-    def _blocked(self, target, now):
+    def _base_rules(self, target, now):
+        """Evaluate common gates without applying scheduler state transitions."""
         active = self.plugin.storage.settings["active"]
         exists = any(item.get("umo") == target.get("umo") for item in self.plugin.storage.targets["items"])
-        if not exists or target.get("scope") == "group" or not self.plugin.storage.settings["integration"].get("enabled", True) or not target.get("enabled") or now < float(target.get("silent_until", 0)):
-            return True
-        if target.get("silent_until"):
-            # A completed silence period starts a new unanswered cycle.
-            target.update(silent_until=0, unanswered=0)
-            self.plugin.storage.save_targets()
-        if now - float(target.get("last_inbound", 0)) < int(target.get("min_idle_sec", active.get("min_idle_sec", 1800))):
-            return True
-        if now - float(target.get("last_active", 0)) < int(target.get("min_gap_sec", active.get("min_gap_sec", 3600))):
-            return True
+        blockers, updates = [], {}
+        def block(code, message, until=None):
+            blockers.append({"code": code, "message": message, **({"next_check_at": until} if until is not None else {})})
+        if not exists:
+            block("target_missing", "目标已移除")
+        if target.get("scope") == "group":
+            block("group", "群聊仅支持回复配图，不主动联系")
+        if not self.plugin.storage.settings["integration"].get("enabled", True):
+            block("integration_disabled", "插件聊天接入已关闭")
+        if not target.get("enabled"):
+            block("target_disabled", "此聊天的主动联系未开启")
+        silent = float(target.get("silent_until", 0))
+        if now < silent:
+            block("silent", "连续未回复静默中", silent)
+        foundation_blocked = bool(blockers)
+        unanswered = int(target.get("unanswered", 0))
+        if silent and now >= silent:
+            unanswered = 0
+            if not foundation_blocked:
+                updates.update(silent_until=0, unanswered=0)
+        idle_at = float(target.get("last_inbound", 0)) + int(target.get("min_idle_sec", active.get("min_idle_sec", 1800)))
+        gap_at = float(target.get("last_active", 0)) + int(target.get("min_gap_sec", active.get("min_gap_sec", 3600)))
+        if now < idle_at:
+            block("idle", "距用户最后消息的空闲时间不足", idle_at)
+        if now < gap_at:
+            block("gap", "距上次主动联系的间隔不足", gap_at)
         limit = int(target.get("silence_after", active.get("silence_after", 3)))
-        if int(target.get("unanswered", 0)) >= limit:
-            target["silent_until"] = now + int(active.get("silence_hours", 24)) * 3600
+        if unanswered >= limit and not now < silent:
+            if not blockers:
+                updates["silent_until"] = now + int(active.get("silence_hours", 24)) * 3600
+            block("silence_threshold", "连续未回复次数达到静默门槛", updates.get("silent_until"))
+        return blockers, updates
+
+    def _blocked(self, target, now):
+        blockers, updates = self._base_rules(target, now)
+        if updates:
+            target.update(updates)
             self.plugin.storage.save_targets()
-            return True
-        return False
+        return bool(blockers)
+
+    def _window_settings(self, target, kind):
+        group = "good_morning" if kind == "morning" else "active"
+        config = self.plugin.storage.settings[group]
+        start_key, end_key = ("morning_start", "morning_end") if kind == "morning" else ("start", "end")
+        start_default, end_default = ("start", "end") if kind == "morning" else ("default_start", "default_end")
+        return {"start": target.get(start_key) or config[start_default], "end": target.get(end_key) or config[end_default], "timezone": str(target.get("timezone") or config.get("timezone", "Asia/Shanghai"))}
+
+    def _window_rules(self, target, kind):
+        config = self.plugin.storage.settings["good_morning" if kind == "morning" else "active"]
+        blockers = []
+        if not config.get("enabled"):
+            blockers.append({"code": "strategy_disabled", "message": "每日早安未开启" if kind == "morning" else "普通主动联系未开启"})
+        if kind == "morning" and not target.get("morning_enabled", True):
+            blockers.append({"code": "morning_disabled", "message": "此聊天的每日早安未开启"})
+        window = self._window_settings(target, kind)
+        if not self._in_window(window["start"], window["end"], window["timezone"]):
+            local = datetime.now(ZoneInfo(window["timezone"]))
+            hour, minute = map(int, window["start"].split(":"))
+            opening = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if opening <= local:
+                opening += timedelta(days=1)
+            blockers.append({"code": "window", "message": "当前不在允许联系的时间窗内", "next_check_at": opening.timestamp()})
+        return blockers
 
     def _still_allowed(self, target, kind):
         if self._blocked(target, time.time()):
             return False
-        settings = self.plugin.storage.settings
-        config = settings["good_morning" if kind == "morning" else "active"]
-        if not config.get("enabled") or (kind == "morning" and not target.get("morning_enabled", True)):
-            return False
-        if kind == "morning":
-            start, end = target.get("morning_start") or config["start"], target.get("morning_end") or config["end"]
-        else:
-            start, end = target.get("start") or config["default_start"], target.get("end") or config["default_end"]
-        return self._in_window(start, end, str(target.get("timezone") or config.get("timezone", "Asia/Shanghai")))
+        return not self._window_rules(target, kind)
+
+    async def inspect_target(self, target):
+        """Explain current opportunities; never claim, reserve, send or mutate."""
+        target = copy.deepcopy(target)
+        now = time.time()
+        storage = self.plugin.storage
+        budget = storage.budget_summary(storage.settings["proactive_budget"])
+        schedule = await self._schedule_context(target) if target.get("scope") != "group" else None
+        result = {"umo": target.get("umo", ""), "checked_at": now, "note": "只读检查；下次时间是可重新检查的机会，不保证角色联系或拍照。"}
+        common, _ = self._base_rules(target, now)
+        for kind in ("active", "morning"):
+            group = "good_morning" if kind == "morning" else "active"
+            config = storage.settings[group]
+            clock = self._time_context(target, kind)
+            window = self._window_settings(target, kind)
+            blockers = copy.deepcopy(common) + self._window_rules(target, kind)
+            effective = {}
+            for key, value in window.items():
+                target_key = "morning_" + key if kind == "morning" and key in {"start", "end"} else key
+                effective[key] = {"value": value, "source": "target" if target.get(target_key) else group}
+            for key in ("min_idle_sec", "min_gap_sec", "silence_after"):
+                effective[key] = {"value": target.get(key, storage.settings["active"][key]), "source": "target" if key in target else "active"}
+            effective.update(enabled={"value": bool(config.get("enabled")), "source": group}, target_enabled={"value": bool(target.get("enabled")), "source": "target"}, with_image={"value": bool(target.get("with_image", True)), "source": "target"})
+            if kind == "morning":
+                effective["morning_enabled"] = {"value": bool(target.get("morning_enabled", True)), "source": "target"}
+            key = f"morning:{target['umo']}:{clock['date']}" if kind == "morning" else target.get("active_delivery_key", "")
+            delivery = storage.delivery(key) or {}
+            active_retry = kind == "active" and delivery.get("status") == "failed" and int(delivery.get("attempts", 1)) < self._attempt_limit(kind)
+            if kind == "morning" and target.get("morning_date") == clock["date"]:
+                blockers.append({"code": "morning_sent", "message": "今天的早安已发送"})
+            elif kind == "morning" or active_retry:
+                blockers.extend(self._retry_rules(target, kind, delivery, now))
+            elif now < float(target.get("next_opportunity", 0)):
+                blockers.append({"code": "next_opportunity", "message": "尚未到下一次主动检查机会", "next_check_at": float(target["next_opportunity"])})
+            if kind == "active" and not self._window_rules(target, "morning"):
+                blockers.append({"code": "morning_priority", "message": "当前早安时间窗优先，普通主动联系待窗口结束后再检查"})
+            if getattr(self.plugin, "_closing", False):
+                blockers.append({"code": "closing", "message": "插件正在停止"})
+            task = self._target_tasks.get(target.get("umo"))
+            if task is not None and not task.done():
+                blockers.append({"code": "inflight", "message": "此聊天已有主动任务正在执行"})
+            capacity = max(1, min(16, int(storage.settings["active"].get("max_concurrent_targets", 3))))
+            if sum(not task.done() for task in self._target_tasks.values()) >= capacity and not any(item["code"] == "inflight" for item in blockers):
+                blockers.append({"code": "capacity", "message": "主动任务并发已满，等待其他任务完成"})
+            for category, label in (("messages", "主动消息"), ("llm", "角色判断")):
+                if budget[category]["remaining"] <= 0:
+                    blockers.append({"code": "budget_" + category, "message": "今日" + label + "预算已用完"})
+            if schedule and not schedule["allowed"]:
+                blockers.append({"code": "schedule", "message": str(schedule.get("reason") or "当前日程不允许主动联系")})
+            allowed, mode, reason = self._image_policy(target, kind)
+            next_checks = [float(item["next_check_at"]) for item in blockers if item.get("next_check_at")]
+            # Unknown blockers (switches, role refusal, live schedule, budgets)
+            # cannot safely promise a future eligibility timestamp.
+            timed_only = all(item.get("next_check_at") for item in blockers)
+            next_check = max([now, *next_checks]) if timed_only else None
+            retry_rules = self._retry_rules(target, kind, delivery, now) if kind == "morning" or active_retry else [{"code": "none"}]
+            retry_at = delivery.get("retry_at") if delivery and all(item["code"] == "retry_wait" for item in retry_rules) else None
+            result[kind] = {"eligible": not blockers, "blockers": blockers, "clock": clock, "effective": effective, "next_check_at": next_check, "retry_at": retry_at, "attempts": int(delivery.get("attempts", 0)), "max_attempts": self._attempt_limit(kind), "delivery_status": delivery.get("status", ""), "image_allowed": allowed, "image_mode": mode, "image_reason": reason, "budget": budget, "schedule": {"status": schedule.get("status"), "allowed": schedule["allowed"]} if schedule else None}
+        return result
 
     def _next_opportunity(self, target, now):
         active = self.plugin.storage.settings["active"]
@@ -243,24 +343,36 @@ class ActiveScheduler:
     def _skip_schedule(self, target, kind, key, state, env=None, job=None):
         storage = self.plugin.storage
         reason = str(state.get("reason") or "当前日程不允许主动联系，本次机会已取消")[:500]
-        storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "schedule_cancelled", "reason": reason})
+        stage = state.get("stage", "schedule")
+        storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": state.get("skip_reason", "schedule_cancelled"), "reason": reason})
         if job:
             cancelled = storage.update_job(job["id"], {"status": "cancelled", "cancel_requested": True, "error": reason})
-            self.plugin._photo_note(self.plugin._trace_job(cancelled["id"], "schedule", "cancelled", reason))
-        storage.record_action({"kind": "decision", "source": kind, "session_key": (env or {}).get("key", target["umo"]), "persona_id": ((env or {}).get("persona") or {}).get("id", ""), "umo": target["umo"], "status": "skip", "reply": "", "summary": reason, "trace": [{"stage": "schedule", "status": "skipped", "detail": reason}]}, "schedule:" + key)
+            self.plugin._photo_note(self.plugin._trace_job(cancelled["id"], stage, "cancelled", reason))
+        storage.record_action({"kind": "decision", "source": kind, "session_key": (env or {}).get("key", target["umo"]), "persona_id": ((env or {}).get("persona") or {}).get("id", ""), "umo": target["umo"], "status": "skip", "reply": "", "summary": reason, "trace": [{"stage": stage, "status": "skipped", "detail": reason}]}, "schedule:" + key)
 
     async def _check_schedule(self, target, kind, key, initial, env=None, job=None):
-        if initial:
+        if env:
             try:
-                identity = await asyncio.wait_for(self.plugin.dialogue.current_identity(target["umo"]), 15)
+                reason = await self.plugin._delivery_guard(env=env, job=job)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._skip_schedule(target, kind, key, {"reason": "当前会话身份暂不可用，本次主动联系已取消"}, env, job)
+                reason = "当前会话身份暂不可用，本次主动联系已取消"
+            if reason:
+                image_blocked = job is not None and not self._image_policy(target, kind, check_budget=False)[0]
+                self._skip_schedule(target, kind, key, {"reason": reason, "stage": "delivery_guard", "skip_reason": "image_unavailable" if image_blocked else "delivery_guard"}, env, job)
                 return False
         # Read schedule last: identity resolution may yield while an admin
         # edits a time slot. No further await precedes the send decision.
         current = await self._schedule_context(target)
+        if env:
+            # The schedule read may also yield while conditions or settings
+            # change. Repeat local checks without another identity/network read.
+            reason = await self.plugin._delivery_guard(env=env, job=job, check_identity=False)
+            if reason:
+                image_blocked = job is not None and not self._image_policy(target, kind, check_budget=False)[0]
+                self._skip_schedule(target, kind, key, {"reason": reason, "stage": "delivery_guard", "skip_reason": "image_unavailable" if image_blocked else "delivery_guard"}, env, job)
+                return False
         if current and not current["allowed"]:
             self._skip_schedule(target, kind, key, current, env, job)
             return False
@@ -274,7 +386,7 @@ class ActiveScheduler:
             if initial["context_key"] != current["context_key"]:
                 self._skip_schedule(target, kind, key, {"reason": "人设、会话或当前日程已改变，本次主动联系已取消"}, env, job)
                 return False
-            if any(str((env or {}).get(key) or "") != str(current[field] or "") or identity[key] != str(current[field] or "") for key, field in (("astro_id", "persona_id"), ("cid", "cid"))):
+            if any(str((env or {}).get(key) or "") != str(current[field] or "") for key, field in (("astro_id", "persona_id"), ("cid", "cid"))):
                 self._skip_schedule(target, kind, key, {"reason": "画卷与当前 AstrBot 人设或会话不一致，本次主动联系已取消"}, env, job)
                 return False
         return True
@@ -291,24 +403,36 @@ class ActiveScheduler:
         timezone = str(target.get("timezone") or config.get("timezone", "Asia/Shanghai"))
         return datetime.now(ZoneInfo(timezone)).date().isoformat() == date
 
-    def _retry_ready(self, target, kind, key, now):
-        existing = self.plugin.storage.delivery(key)
+    def _retry_rules(self, target, kind, existing, now):
+        """Pure counterpart of the durable retry claim eligibility checks."""
         if not existing:
-            return True
+            return []
         role_skip = kind == "morning" and existing.get("status") == "skipped" and existing.get("retryable") is True and existing.get("skip_reason") == "role_skip"
         retryable = existing.get("status") == "failed" or role_skip
         if kind == "morning" and retryable and "inbound_at" in existing and existing["inbound_at"] != target.get("last_inbound", 0):
-            self.plugin.storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "user_replied", "reason": "用户已发来消息，不再补发本次早安"})
-            return False
-        if existing.get("status") != "failed" and not role_skip:
-            return False
-        return int(existing.get("attempts", 1)) < self._attempt_limit(kind) and existing.get("retry_at") is not None and now >= float(existing["retry_at"])
+            return [{"code": "user_replied", "message": "用户已发来消息，不再补发本次早安"}]
+        if not retryable:
+            return [{"code": "delivery_terminal", "message": str(existing.get("reason") or existing.get("error") or "本次机会已处理，不自动重复")[:500]}]
+        if int(existing.get("attempts", 1)) >= self._attempt_limit(kind):
+            return [{"code": "attempt_limit", "message": "本次机会的尝试次数已用完"}]
+        if existing.get("retry_at") is None:
+            return [{"code": "retry_unavailable", "message": "本次机会未安排重试"}]
+        retry_at = float(existing["retry_at"])
+        return [{"code": "retry_wait", "message": "等待本次机会的下次重试", "next_check_at": retry_at}] if now < retry_at else []
+
+    def _retry_ready(self, target, kind, key, now):
+        blockers = self._retry_rules(target, kind, self.plugin.storage.delivery(key), now)
+        if blockers and blockers[0]["code"] == "user_replied":
+            self.plugin.storage.update_delivery(key, {"status": "skipped", "retryable": False, "skip_reason": "user_replied", "reason": blockers[0]["message"]})
+        return not blockers
 
     @staticmethod
     def _interrupted_status(state, job):
         # The send operation owns the delivery outcome. Keep a retained image
         # out of automatic generation retries, including when cancellation
         # arrives after the platform send has already started.
+        if job.get("delivery_blocked"):
+            return "skipped"
         outcomes = {state.get("status"), job.get("status")}
         if "uncertain" in outcomes:
             return "uncertain"
@@ -430,6 +554,7 @@ class ActiveScheduler:
                 storage.update_delivery(key, {"status": "skipped", "reason": "今日主动判断模型预算已用完"})
                 return
             env = await self.plugin.dialogue.environment(target["umo"], target.get("persona_id", ""))
+            env["delivery_source"] = kind
             if schedule:
                 if str(env.get("astro_id") or "") != schedule["persona_id"] or str(env.get("cid") or "") != schedule["cid"]:
                     self._skip_schedule(target, kind, key, {"reason": "画卷与日程的人设或会话不一致，本次主动联系已取消"}, env)
@@ -538,12 +663,14 @@ class ActiveScheduler:
             state = storage.delivery(key) or {}
             job = storage.job(state.get("job_id", "")) or {}
             withdrawn = job.get("cancel_requested")
-            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": "用户撤回拍摄" if withdrawn else "任务被停止", "retry_at": now + 300})
+            retained = (job.get("recovery") or {}).get("submitted") and not job.get("asset") and state.get("status") not in {"sending", "uncertain", "delivery_failed"}
+            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": "用户撤回拍摄" if withdrawn else "任务被停止", "retry_at": now + 300, **({"status": "skipped", "retryable": False, "skip_reason": "upstream_pending", "reason": "已有上游任务，需查询原任务结果，不自动重复生成"} if retained else {})})
             raise
         except Exception as exc:
             state = storage.delivery(key) or {}
             job = storage.job(state.get("job_id", "")) or {}
-            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": self.plugin._error(exc), "retry_at": time.time() + 300})
+            retained = (job.get("recovery") or {}).get("submitted") and not job.get("asset") and state.get("status") not in {"sending", "uncertain", "delivery_failed"}
+            storage.update_delivery(key, {"status": self._interrupted_status(state, job), "error": self.plugin._error(exc), "retry_at": time.time() + 300, **({"status": "skipped", "retryable": False, "skip_reason": "upstream_pending", "reason": "已有上游任务，需查询原任务结果，不自动重复生成"} if retained else {})})
             if job and job["status"] in {"queued", "generating"}:
                 self.plugin._photo_note(storage.update_job(job["id"], {"status": "failed", "error": self.plugin._error(exc)}))
             target["last_error"] = self.plugin._error(exc)

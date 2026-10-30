@@ -15,6 +15,37 @@ const finished = job => ["succeeded", "success", "done", "completed", "sent"].in
 const failed = job => ["failed", "error", "interrupted", "cancelled", "uncertain"].includes(job.status);
 const fullImages = new Map(), imageRequests = new Set();
 const referenceImages = new Map(), resending = new Set();
+const thumbnailImages = new Map(), thumbnailRequests = new Map();
+let historyCursor = null, historyHasMore = false, historyExpanded = false, targetInspectionSeq = 0;
+function syncRows(container, rows) {
+  const previous = new Map(Array.from(container.children).map(el => [el.dataset.key, el]));
+  rows.forEach((row, index) => {
+    const old = previous.get(row.dataset.key);
+    if (old && old.dataset.signature === row.dataset.signature) row = old;
+    else if (old) { const expanded = Array.from(old.querySelectorAll("details")).map(el => el.open); row.querySelectorAll("details").forEach((el, n) => { el.open = Boolean(expanded[n]); }); }
+    if (container.children[index] !== row) container.insertBefore(row, container.children[index] || null);
+  });
+  while (container.children.length > rows.length) { container.lastElementChild.querySelectorAll("img[data-thumbnail]").forEach(image => previewObserver.unobserve(image)); container.lastElementChild.remove(); }
+  container.querySelectorAll("img[data-thumbnail]:not([data-observed])").forEach(image => { image.dataset.observed = "true"; previewObserver.observe(image); });
+}
+async function thumbnail(descriptor) {
+  const key = `${descriptor.asset}:${descriptor.version}`;
+  if (thumbnailImages.has(key)) { const result = thumbnailImages.get(key); thumbnailImages.delete(key); thumbnailImages.set(key, result); return result; }
+  if (!thumbnailRequests.has(key)) thumbnailRequests.set(key, api(`reference/preview/${encodeURIComponent(descriptor.asset)}`).then(result => {
+    if (result.thumbnail && result.thumbnail.version !== descriptor.version) return "";
+    const image = safeImage(result.image); if (image) thumbnailImages.set(key, image);
+    while (thumbnailImages.size > 96 || Array.from(thumbnailImages.values()).reduce((sum, value) => sum + value.length, 0) > 8 * 1024 * 1024) thumbnailImages.delete(thumbnailImages.keys().next().value);
+    return image;
+  }).finally(() => thumbnailRequests.delete(key)));
+  return thumbnailRequests.get(key);
+}
+const previewObserver = new IntersectionObserver(entries => {
+  for (const entry of entries) if (entry.isIntersecting) {
+    const image = entry.target; previewObserver.unobserve(image);
+    thumbnail(JSON.parse(image.dataset.thumbnail)).then(src => { if (src && image.isConnected) image.src = src; }).catch(() => { image.alt = "缩略图暂不可用，可查看原图"; });
+  }
+}, { rootMargin: "200px" });
+function lazyPreview(image, descriptor) { image.dataset.thumbnail = JSON.stringify(descriptor); }
 const decisionNames = { photo: "同意拍摄", scene: "场景绘图", edit: "图片编辑", state: "更新状态", ask: "等待确认", refuse: "角色拒绝", chat: "文字回复", skip: "暂不联系", no_tool: "未调用拍照工具", blocked: "请求被拦截", corrected: "已按当前时间修正" };
 const stageNames = { request: "请求检查", preflight: "本地预检", notification: "失败通知", role: "角色判断", tool: "工具调用", conditions: "拍摄条件", reference: "参考图", quota: "额度", provider: "接口请求", generation: "生成结果", delivery: "平台发送", cancel: "撤回", schedule: "主动机会", time: "时间依据", time_validation: "回复时间校验" };
 const conditionNames = { outfit: "服装", camera: "镜头", pose: "姿势", expression: "表情", scene: "场景", avoid: "避免", notes: "约定" };
@@ -174,10 +205,11 @@ function renderDiagnostics() {
   for (const step of data.setup || []) { const row = node("div", "setup-row"), body = node("div"); body.append(node("strong", "", `${step.ok === true ? "✓" : step.ok === false ? "○" : "◇"} ${step.name}`), node("small", "", step.message)); row.append(body, button("前往设置", async () => setPage(step.page))); setup.append(row); }
   const budget = data.budget || {};
   $("budget-status").replaceChildren(...[["messages", "主动消息"], ["photos", "主动照片"], ["llm", "角色判断"]].map(([key, label]) => node("span", "", `${label} ${budget[key]?.used ?? 0} / ${budget[key]?.limit ?? "—"}`)), node("small", "", `${budget.day || ""} · ${budget.timezone || ""}`));
-  const container = $("diagnostic-list"), query = value("diagnostic-filter").toLowerCase(); container.replaceChildren();
+  const container = $("diagnostic-list"), query = value("diagnostic-filter").toLowerCase(), rows = [];
   const items = (data.items || []).filter(item => !query || JSON.stringify(item).toLowerCase().includes(query)).slice(0, 40);
   if (!items.length) return empty(container, "暂无匹配的动作记录。可先预演角色反应，再发起一次请求。");
-  for (const item of items) { const row = node("article", "diagnostic-row"); row.append(node("span", `badge ${item.status}`, decisionNames[item.status] || statusNames[item.status] || item.status), node("p", "", item.summary || item.request || item.reply || "主动联系机会"), node("small", "muted", `${item.umo || ""} · ${date(item.updated_at || item.at)}`)); if (item.error) row.append(node("p", "danger-text", item.error)); if (item.reply && item.reply !== item.request) row.append(node("p", "", item.reply)); const request = requestDetail(item); if (request) row.append(request); row.append(actionDetail(item)); container.append(row); }
+  for (const item of items) { const row = node("article", "diagnostic-row"); row.dataset.key = item.id || `${item.umo}:${item.at}:${rows.length}`; row.dataset.signature = JSON.stringify(item); row.append(node("span", `badge ${item.status}`, decisionNames[item.status] || statusNames[item.status] || item.status), node("p", "", item.summary || item.request || item.reply || "主动联系机会"), node("small", "muted", `${item.umo || ""} · ${date(item.updated_at || item.at)}`)); if (item.error) row.append(node("p", "danger-text", item.error)); if (item.reply && item.reply !== item.request) row.append(node("p", "", item.reply)); const request = requestDetail(item); if (request) row.append(request); row.append(actionDetail(item)); rows.push(row); }
+  syncRows(container, rows);
 }
 function renderProviders() {
   const container = $("provider-list"); container.replaceChildren();
@@ -297,7 +329,7 @@ function fillActive() {
 }
 function fillReplyImages() {
   const config = model.state.settings?.reply_images || {};
-  setCheck("r-enabled", config.enabled); set("r-probability", config.default_probability ?? 20); set("r-interval", config.min_interval_sec ?? 300);
+  setCheck("r-enabled", config.enabled); set("r-probability", config.default_probability ?? 20); set("r-interval", config.min_interval_sec ?? 300); set("r-max-wait", config.max_wait_sec ?? 30);
   fillSelect("r-provider", model.providers.map(p => ({ value: p.name, label: p.name })), config.provider || "", "使用默认绘画接口");
   if (config.provider && !model.providers.some(p => p.name === config.provider)) { const option = node("option", "", `${config.provider}（接口已移除，请重新选择）`); option.value = config.provider; $("r-provider").append(option); $("r-provider").value = config.provider; }
   markDirty("reply-images-form", false);
@@ -321,10 +353,37 @@ function fillTarget(t) {
   setText("t-proactive-help", group ? "群聊不支持主动联系与每日早安。以下设置已停用，不影响上方回复配图。" : "仅在开启私聊主动联系后执行，早安与普通主动策略分别控制。");
   const clocks = t.clock || {};
   setText("t-clock", group ? "" : t.clock_error ? `后台时钟读取失败：${t.clock_error}` : clocks.active && clocks.morning ? `后台读取时刻（刷新页面更新）：普通主动 ${clocks.active.now} · ${clocks.active.timezone}；早安 ${clocks.morning.now} · ${clocks.morning.timezone}` : "保存后刷新，可查看后台采用的当前时间与时区。");
+  renderTargetDiagnostics(t);
+  if (t.umo && !group) inspectTarget(t.umo).catch(error => { if (value("t-umo") === t.umo) setText("target-diagnostics", `只读检查暂不可用：${error.message}`); });
   $("target-proactive-fields").querySelectorAll("input,select,textarea").forEach(input => { input.disabled = group; });
   setText("t-reply-help", model.state.settings?.reply_images?.enabled ? "全局配图已开启；开启本聊天后按这里的概率抽取，再由角色决定是否配图。" : "全局配图当前关闭。可以先保存本聊天设置，再打开上方全局开关。");
   const exists = model.targets.some(x => x.umo === t.umo); available("delete-target", exists); available("test-target", exists && !group); const save = $("target-form").querySelector('[type="submit"]'); save.disabled = !exists; save.dataset.unavailable = exists ? "false" : "true";
+  available("refresh-target-diagnostics", exists && !group);
   $("target-test-result").replaceChildren(); markDirty("target-form", false); renderTargets();
+}
+function renderTargetDiagnostics(target) {
+  const container = $("target-diagnostics"); container.replaceChildren();
+  if (targetScope(target) === "group") return;
+  const diagnostics = target.diagnostics;
+  if (!diagnostics) return empty(container, "刷新可读取已保存配置的主动检查结果。");
+  container.append(node("p", "muted", `只读检查 · ${date(diagnostics.checked_at)}。使用已保存设置，不消耗模型或生图预算；检查机会不保证发送。`));
+  for (const [key, label] of [["active", "普通主动"], ["morning", "每日早安"]]) {
+    const state = diagnostics[key]; if (!state) continue;
+    const card = node("div", "diagnostic-row"); card.append(node("strong", "", `${label} · ${state.eligible ? "可进入角色判断" : "当前不触发"}`));
+    for (const blocker of state.blockers || []) card.append(node("p", "", blocker.message));
+    card.append(node("p", "muted", state.image_allowed ? "图片条件允许，是否拍照由角色决定。" : `本轮不允许图片：${state.image_reason || "条件未满足"}`));
+    card.append(node("small", "", `下次可检查：${date(state.next_check_at)}${state.retry_at ? ` · 重试最早 ${date(state.retry_at)}` : ""}${key === "morning" ? ` · 今日尝试 ${state.attempts ?? 0}/${state.max_attempts ?? "—"}` : ""}`));
+    const details = node("details"); details.append(node("summary", "", "查看生效设置与来源"));
+    const labels = { timezone: "时区", start: "开始时间", end: "结束时间", min_idle_sec: "最小空闲秒数", min_gap_sec: "最小间隔秒数", silence_after: "未回复次数上限", enabled: "策略开关", target_enabled: "目标开关", with_image: "允许图片", morning_enabled: "允许早安" };
+    for (const [name, item] of Object.entries(state.effective || {})) details.append(node("p", "muted", `${labels[name] || name}：${String(item.value)}（${item.source === "target" ? "本聊天" : item.source === "good_morning" ? "全局早安" : "全局主动"}）`));
+    card.append(details); container.append(card);
+  }
+}
+async function inspectTarget(umo) {
+  const sequence = ++targetInspectionSeq, diagnostics = await api("targets/inspect", "POST", { umo });
+  if (sequence !== targetInspectionSeq || value("t-umo") !== umo) return;
+  const target = model.targets.find(item => item.umo === umo);
+  if (target) { target.diagnostics = diagnostics; renderTargetDiagnostics(target); }
 }
 function readTarget() {
   const patch = { persona_id: value("t-persona"), reply_image_enabled: check("t-reply-enabled"), reply_image_probability: num("t-reply-probability") };
@@ -414,54 +473,72 @@ function deliveryActions(actions, body, job) {
   if (job.status === "sending") { const pending = button("正在发送原图…", () => {}); pending.disabled = true; actions.append(pending); }
 }
 function renderJobs() {
-  const container = $("job-list"); container.replaceChildren();
+  const container = $("job-list"), rows = [];
   if (!model.jobs.length) empty(container, "暂无生成任务。");
   for (const job of model.jobs.slice(0, 40)) {
     const row = node("article", "task-row"), body = node("div"), actions = node("div", "actions");
+    row.dataset.key = jobId(job); row.dataset.signature = JSON.stringify([job, resending.has(jobId(job))]);
     body.append(node("span", `badge ${job.status}`, statusNames[job.status] || job.status), node("p", "", job.caption || job.request?.text || job.text || "生成任务"), node("small", "", `${jobId(job)} · ${job.provider || job.request?.provider || "默认接口"} · ${date(job.created_at || job.at)}`));
     if (job.error) body.append(node("pre", "", job.error));
     if (job.status === "queued" && job.phase === "local_queued") body.append(node("p", "muted", "本地预检通过，等待后台提交，尚无上游受理凭据。"));
     if (job.notification_state) { const labels = { sending: "正在发送失败通知", accepted: "失败通知发送调用已完成，终端送达未知", failed: "失败通知未发送", uncertain: "失败通知结果不确定" }; body.append(node("p", ["failed", "uncertain"].includes(job.notification_state) ? "danger-text" : "muted", `${labels[job.notification_state] || job.notification_state}${job.notification_error ? `：${job.notification_error}` : ""}`)); }
     if (finished(job) || job.asset || jobImage(job)) actions.append(button("查看画面", async () => { selection.previewJob = jobId(job); renderPreview(job); }));
-    if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
+    if (["failed", "cancelled"].includes(job.status) && !job.cancel_requested && !job.recovery?.submitted && !job.recovery?.prompt_id) actions.append(button("重试", async () => { const result = await api("jobs/retry", "POST", { id: jobId(job) }); selection.previewJob = result.job_id; notice("已提交重试任务"); await refreshJobs(); }));
+    if (job.recovery?.kind === "comfyui" && job.recovery.prompt_id && !job.asset && !["queued", "deciding", "generating", "sending"].includes(job.status)) actions.append(button("检查原任务结果", async () => {
+      const result = await api("jobs/recover", "POST", { id: jobId(job) });
+      notice(result.note || (result.image_saved ? "原图已取回并保存，没有自动发送。" : "原任务尚无可取回的图片。"), result.ok === false);
+      await refreshJobs();
+    }));
+    if (job.recovery?.phase) body.append(node("p", "muted", `ComfyUI 原任务：${({ submitting: "已尝试提交，受理未确认", accepted: "已受理", queued: "排队中", running: "执行中", fetching: "正在读取原图", completed: "已完成", missing: "暂无记录", recovered: "原图已取回" })[job.recovery.phase] || job.recovery.phase}；检查原结果不会重新提交工作流。`));
+    if (job.recovery?.submitted && !job.recovery.prompt_id && !job.asset) body.append(node("p", "muted", "没有可靠任务编号，暂时无法查询。请先检查 ComfyUI 队列或历史，确认后如需重画，再提交新的绘图请求。"));
     deliveryActions(actions, body, job);
     if (["queued", "deciding", "generating", "succeeded"].includes(job.status) && !job.cancel_requested) actions.append(button("取消拍摄", async () => { await api("jobs/cancel", "POST", { id: jobId(job) }); notice("已停止等待与发送；上游已受理的任务可能仍计费。"); await refreshJobs(); }));
-    const request = requestDetail(job); if (request) body.append(request); body.append(actionDetail(job)); row.append(body, actions); container.append(row);
+    const request = requestDetail(job); if (request) body.append(request); body.append(actionDetail(job)); row.append(body, actions); rows.push(row);
   }
+  if (rows.length) syncRows(container, rows);
   const current = model.jobs.find(j => jobId(j) === selection.previewJob) || model.jobs.find(finished) || model.jobs[0]; if (current) renderPreview(current);
 }
 function renderPreview(job) {
   setText("preview-status", statusNames[job.status] || job.status); $("preview-status").className = `badge ${job.status}`; setText("preview-caption", job.caption || job.request?.text || job.text || "");
   const image = fullImages.get(jobId(job)) || jobImage(job), stage = $("studio-preview");
-  if (image) { const img = node("img"); img.src = image; img.alt = job.caption || "生成结果"; stage.replaceChildren(img); }
-  else { const generated = Boolean(job.asset), el = node("div", "empty"); el.append(node("span", "", !generated && failed(job) ? "×" : "✧"), node("p", "", generated ? "原图已保存，正在读取预览…" : failed(job) ? job.error || "生成失败，可在任务列表重试" : finished(job) ? "任务已完成，刷新历史查看画面" : "任务正在处理，完成后自动显示")); stage.replaceChildren(el); }
+  const signature = JSON.stringify([jobId(job), job.status, job.thumbnail, Boolean(fullImages.get(jobId(job))), image?.slice(-48), job.error]);
+  if (stage.dataset.signature !== signature) {
+    stage.querySelectorAll("img[data-thumbnail]").forEach(img => previewObserver.unobserve(img)); stage.dataset.signature = signature;
+    if (image || job.thumbnail) { const img = node("img"); img.alt = job.caption || "生成结果"; if (image) img.src = image; else lazyPreview(img, job.thumbnail); stage.replaceChildren(img); if (job.thumbnail && !image) previewObserver.observe(img); }
+    else { const generated = Boolean(job.asset), el = node("div", "empty"); el.append(node("span", "", !generated && failed(job) ? "×" : "✧"), node("p", "", generated ? "原图已保存，正在读取预览…" : failed(job) ? job.error || "生成失败，可在任务列表重试" : finished(job) ? "任务已完成，刷新历史查看画面" : "任务正在处理，完成后自动显示")); stage.replaceChildren(el); }
+  }
   if ((finished(job) || job.asset) && selection.previewJob === jobId(job) && !fullImages.has(jobId(job)) && !imageRequests.has(jobId(job))) {
     const id = jobId(job); imageRequests.add(id);
     api(`jobs/${encodeURIComponent(id)}`).then(result => { if (safeImage(result.image)) { fullImages.set(id, result.image); if (fullImages.size > 3) fullImages.delete(fullImages.keys().next().value); if (selection.previewJob === id) renderPreview(result); } }).catch(error => notice(`原图读取失败：${error.message}`, true)).finally(() => imageRequests.delete(id));
   }
 }
 function renderHistory() {
-  const filter = value("history-filter"), container = $("history-list"); container.replaceChildren();
+  const filter = value("history-filter"), container = $("history-list"), rows = [];
+  $("load-more-history").hidden = !historyHasMore;
   const list = model.history.filter(h => filter === "all" || (filter === "success" ? h.ok === true || finished(h) : h.ok === false || failed(h)));
   if (!list.length) return empty(container, "这个筛选条件下暂无记录。");
   for (const h of list) {
     const el = node("article", "history-item"), media = node("div", "history-image"), content = node("div", "history-content"), ok = h.ok === true || finished(h);
-    if (safeImage(h.image)) { const img = node("img"); img.src = h.image; img.alt = h.caption || "生成结果"; img.loading = "lazy"; media.append(img); } else media.append(node("span", "", ok ? "图片不可用" : "生成未完成"));
+    el.dataset.key = String(h.history_id || h.job_id || h.id || `${h.at}:${rows.length}`); el.dataset.signature = JSON.stringify([h, model.jobs.find(j => jobId(j) === h.job_id), resending.has(h.job_id)]);
+    if (safeImage(h.image) || h.thumbnail) { const img = node("img"); if (safeImage(h.image)) img.src = h.image; else lazyPreview(img, h.thumbnail); img.alt = h.caption || "生成结果"; img.loading = "lazy"; media.append(img); } else media.append(node("span", "", ok ? "图片不可用" : "生成未完成"));
     content.append(node("span", `badge ${ok ? "success" : "failed"}`, ok ? "生成成功" : "生成失败"), node("h4", "", h.caption || h.raw || h.request?.text || "生成请求"), node("small", "", `${h.provider || "默认接口"} / ${h.model || "默认模型"} · ${date(h.at || h.created_at)}`));
     if (h.error) content.append(node("p", "danger-text", h.error));
     const request = requestDetail(h); if (request) content.append(request);
     const detail = node("details"); detail.append(node("summary", "", request ? "查看状态修改与任务信息" : "查看历史提示词与任务信息"), node("pre", "", JSON.stringify({ ...(request ? {} : { prompt: h.prompt || "", negative_prompt: h.negative_prompt || h.negative || "", note: "早期记录未保存最终请求摘要，以下提示词不代表适配器实际提交内容。" }), mode: h.mode, state_patch: h.state_patch, job_id: h.job_id }, null, 2))); content.append(detail, actionDetail(h));
-    const actions = node("div", "actions"); if (!ok && h.job_id && ["failed", "cancelled"].includes(model.jobs.find(j => jobId(j) === h.job_id)?.status || h.status) && !model.jobs.find(j => jobId(j) === h.job_id)?.cancel_requested) actions.append(button("重试任务", async () => { const result = await api("jobs/retry", "POST", { id: h.job_id }); selection.previewJob = result.job_id; setPage("studio"); await refreshJobs(); }));
+    const activeRecord = model.jobs.find(j => jobId(j) === h.job_id) || h, recovery = activeRecord.recovery || {};
+    const actions = node("div", "actions"); if (!ok && h.job_id && ["failed", "cancelled"].includes(activeRecord.status) && !activeRecord.cancel_requested && !recovery.submitted && !recovery.prompt_id) actions.append(button("重试任务", async () => { const result = await api("jobs/retry", "POST", { id: h.job_id }); selection.previewJob = result.job_id; setPage("studio"); await refreshJobs(); }));
     deliveryActions(actions, content, { ...h, ...(model.jobs.find(j => jobId(j) === h.job_id) || {}), id: h.job_id });
-    if (safeImage(h.image) && h.job_id) actions.append(button("保存原图", async () => { const job = await api(`jobs/${encodeURIComponent(h.job_id)}`); if (!safeImage(job.image)) throw new Error("原图不可用"); const a = node("a"); a.href = job.image; a.download = `persona-canvas-${h.job_id}.${job.image.startsWith("data:image/jpeg") ? "jpg" : job.image.startsWith("data:image/webp") ? "webp" : "png"}`; document.body.append(a); a.click(); a.remove(); }));
-    content.append(actions); el.append(media, content); container.append(el);
+    if ((safeImage(h.image) || h.thumbnail) && h.job_id) actions.append(button("保存原图", async () => { const job = await api(`jobs/${encodeURIComponent(h.job_id)}`); if (!safeImage(job.image)) throw new Error("原图不可用"); const a = node("a"); a.href = job.image; a.download = `persona-canvas-${h.job_id}.${job.image.startsWith("data:image/jpeg") ? "jpg" : job.image.startsWith("data:image/webp") ? "webp" : "png"}`; document.body.append(a); a.click(); a.remove(); }));
+    content.append(actions); el.append(media, content); rows.push(el);
   }
+  syncRows(container, rows);
 }
 async function reload() {
   if (loading) return; loading = true;
   try {
-    const [state, personas, providers, targets, jobs, sessions, historyResult, diagnostics] = await Promise.all([api("state"), api("personas"), api("providers"), api("targets"), api("jobs"), api("sessions"), api("history"), api("diagnostics")]);
+    const [state, personas, providers, targets, jobs, sessions, historyResult, diagnostics] = await Promise.all([api("state"), api("personas"), api("providers"), api("targets"), api("jobs/query", "POST"), api("sessions"), api("history/query", "POST", { limit: 20 }), api("diagnostics")]);
     model.diagnostics = diagnostics; model.state = state; model.personas = personas.items || []; model.providers = providers.items || []; model.targets = targets.items || []; model.jobs = (jobs.items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0)); model.sessions = sessions.items || []; model.history = (historyResult.items || []).slice().sort((a, b) => (b.at || b.created_at || 0) - (a.at || a.created_at || 0));
+    historyExpanded = false; historyCursor = historyResult.next_cursor ?? null; historyHasMore = Boolean(historyResult.has_more);
     renderSelectors();
     if (!dirty.has("persona-form")) fillPersona(model.personas.find(p => p.id === selection.persona?.id) || model.personas.find(p => p.id === state.settings?.current_persona) || model.personas[0] || { id: `persona-${Date.now()}`, state: {} });
     if (!dirty.has("provider-form")) fillProvider(model.providers.find(p => p.name === selection.provider?.name) || model.providers.find(p => p.name === state.settings?.default_provider) || model.providers[0] || { name: "default", kind: "openai" });
@@ -471,8 +548,11 @@ async function reload() {
   } finally { loading = false; }
 }
 async function refreshJobs() {
-  const [jobs, historyResult, sessions, diagnostics] = await Promise.all([api("jobs"), api("history"), api("sessions"), api("diagnostics")]); model.diagnostics = diagnostics;
-  model.jobs = (jobs.items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0)); model.history = (historyResult.items || []).slice().sort((a, b) => (b.at || b.created_at || 0) - (a.at || a.created_at || 0)); model.sessions = sessions.items || [];
+  const [jobs, historyResult, sessions, diagnostics] = await Promise.all([api("jobs/query", "POST"), api("history/query", "POST", { limit: 20 }), api("sessions"), api("diagnostics")]); model.diagnostics = diagnostics;
+  model.jobs = (jobs.items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0)); model.sessions = sessions.items || [];
+  const first = historyResult.items || [], lastId = first.at(-1)?.history_id;
+  model.history = [...first, ...(historyExpanded && lastId ? model.history.filter(item => item.history_id < lastId) : [])];
+  if (!historyExpanded || !lastId) { historyCursor = historyResult.next_cursor ?? null; historyHasMore = Boolean(historyResult.has_more); }
   renderOverview(); renderJobs(); renderHistory(); renderDiagnostics();
 }
 function bindForm(id, handler) { $(id).addEventListener("submit", event => { event.preventDefault(); const el = $(id).querySelector('[type="submit"]'); run(el, handler); }); $(id).addEventListener("input", () => markDirty(id)); $(id).addEventListener("change", () => markDirty(id)); }
@@ -547,14 +627,25 @@ bind("use-persona-reference", async () => { const p = model.personas.find(x => x
 bind("refresh-jobs", refreshJobs);
 bindForm("simulate-form", async () => { setText("simulate-result", "正在读取角色判断…"); const result = await api("simulate", "POST", { text: value("s-text"), umo: value("s-umo"), persona_id: value("s-persona"), execute: false }); setText("simulate-result", JSON.stringify(result, null, 2)); });
 bindForm("active-form", async () => { await api("settings", "POST", { active: { enabled: check("a-enabled"), timezone: value("a-timezone"), default_start: value("a-start"), default_end: value("a-end"), check_interval_sec: num("a-interval"), min_gap_sec: num("a-gap"), min_idle_sec: num("a-idle"), silence_after: num("a-silence"), silence_hours: num("a-silence-hours"), jitter_percent: num("a-jitter"), max_concurrent_targets: num("a-concurrency") }, proactive_budget: { messages: num("b-messages"), photos: num("b-photos"), llm: num("b-llm"), timezone: value("b-timezone") }, good_morning: { enabled: check("m-enabled"), timezone: value("m-timezone"), start: value("m-start"), end: value("m-end"), max_attempts: num("m-attempts"), retry_interval_sec: num("m-retry-interval"), image_mode: value("m-image-mode") } }); markDirty("active-form", false); await reload(); notice("主动消息策略已保存"); });
-bindForm("reply-images-form", async () => { await api("settings", "POST", { reply_images: { enabled: check("r-enabled"), default_probability: num("r-probability"), min_interval_sec: num("r-interval"), provider: value("r-provider") } }); markDirty("reply-images-form", false); await reload(); notice("对话配图设置已保存"); });
+bindForm("reply-images-form", async () => { await api("settings", "POST", { reply_images: { enabled: check("r-enabled"), default_probability: num("r-probability"), min_interval_sec: num("r-interval"), max_wait_sec: num("r-max-wait"), provider: value("r-provider") } }); markDirty("reply-images-form", false); await reload(); notice("对话配图设置已保存"); });
 bind("restore-reply-images", async () => fillReplyImages()); $("target-scope-filter").addEventListener("change", renderTargets);
 bind("restore-active", async () => fillActive()); bind("restore-target", async () => fillTarget(model.targets.find(t => t.umo === selection.target?.umo) || selection.target || {}));
 bindForm("target-form", async () => { const umo = value("t-umo"), patch = readTarget(); await api("targets", "POST", { action: "save", umo, patch, ...patch }); selection.target = { umo }; markDirty("target-form", false); await reload(); notice("会话目标已保存"); });
 bind("test-target", async () => { const umo = value("t-umo"); if (!model.targets.some(t => t.umo === umo)) throw new Error("请先保存目标会话"); if (await confirmAction("发送测试消息？", `这会向会话 ${umo} 立即发送一条测试消息。`)) { await api("targets", "POST", { action: "test", umo }); setText("target-test-result", "测试消息已发送，请在目标会话中查看。"); } });
 bind("delete-target", async () => { if (await confirmAction("移除这个目标？", "移除后停用这个聊天的主动消息与回复配图；再次收到该聊天消息时会重新发现，默认停用。")) { await api("targets", "POST", { action: "remove", umo: value("t-umo") }); selection.target = null; markDirty("target-form", false); await reload(); notice("聊天目标已移除"); } });
 bind("refresh-diagnostics", async () => { model.diagnostics = await api("diagnostics"); renderDiagnostics(); }); $("diagnostic-filter").addEventListener("input", renderDiagnostics);
-bind("reload-history", refreshJobs); $("history-filter").addEventListener("change", renderHistory);
+bind("reload-history", async () => { historyExpanded = false; await refreshJobs(); }); $("history-filter").addEventListener("change", renderHistory);
+bind("load-more-history", async () => {
+  if (!historyHasMore || historyCursor == null) return;
+  const result = await api("history/query", "POST", { cursor: historyCursor, limit: 20 }), known = new Set(model.history.map(item => item.history_id));
+  model.history.push(...(result.items || []).filter(item => !known.has(item.history_id))); historyExpanded = true;
+  historyCursor = result.next_cursor ?? null; historyHasMore = Boolean(result.has_more); renderHistory();
+});
+bind("refresh-target-diagnostics", async () => {
+  const umo = value("t-umo"); if (!umo || targetScope(selection.target) === "group") return;
+  await inspectTarget(umo);
+  notice("已刷新已保存配置的只读检查；未保存的表单内容保持不变。");
+});
 bindForm("settings-form", async () => { await api("settings", "POST", { integration: { enabled: check("c-enabled"), mode: value("c-mode"), strict_trigger: true }, dialogue: { timeout_sec: num("c-timeout"), context_turns: num("c-context"), confirmation_ttl_sec: num("c-confirmation") }, state_lifetimes: Object.fromEntries(["outfit", "pose", "expression", "scene"].map(key => [key + "_sec", num(`s-${key}-life`)])), moderation: { enabled: check("q-enabled"), daily_limit: num("q-daily"), min_interval_sec: num("q-interval"), max_concurrency: num("q-concurrency"), timezone: value("q-timezone") }, generation: { width: num("d-width"), height: num("d-height"), steps: num("d-steps"), scale: num("d-scale"), sampler: value("d-sampler"), seed: num("d-seed"), max_history: num("d-history"), max_concurrency: num("d-concurrency"), timeout_sec: num("d-timeout") } }); markDirty("settings-form", false); await reload(); notice("运行设置已保存"); });
 bind("restore-settings", async () => fillSettings());
 bind("export-data", async () => { const data = await api("export"), blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }), url = URL.createObjectURL(blob), a = node("a"); a.href = url; a.download = `persona-canvas-backup-${new Date().toISOString().slice(0, 10)}.json`; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); notice("安全备份已导出，密钥不包含在其中。"); });

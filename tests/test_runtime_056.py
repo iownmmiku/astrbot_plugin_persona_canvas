@@ -14,8 +14,9 @@ class Runtime056Tests(unittest.IsolatedAsyncioTestCase):
 
     def scheduler(self, count=2):
         scheduler = ActiveScheduler(self.plugin)
+        self.plugin.active = scheduler
         scheduler._in_window = lambda *args: True
-        self.store.settings["active"].update(enabled=True, max_concurrent_targets=2, min_idle_sec=0, min_gap_sec=60)
+        self.store.settings["active"].update(enabled=True, max_concurrent_targets=2, min_idle_sec=0, min_gap_sec=60, default_start="00:00", default_end="23:59")
         self.store.settings["good_morning"]["enabled"] = False
         self.store.settings["proactive_budget"].update(messages=20, photos=20, llm=20)
         for index in range(count):
@@ -154,7 +155,7 @@ class Runtime056Tests(unittest.IsolatedAsyncioTestCase):
     def morning_scheduler(self):
         scheduler = self.scheduler(1)
         self.store.settings["active"]["enabled"] = False
-        self.store.settings["good_morning"]["enabled"] = True
+        self.store.settings["good_morning"].update(enabled=True, start="00:00", end="23:59")
         return scheduler
 
     async def assert_morning_photo_is_not_redrawn(self, scheduler, status):

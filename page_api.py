@@ -6,12 +6,15 @@ import io
 import mimetypes
 import re
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
 PAGE_PREFIX = f"/{PLUGIN_NAME}/page"
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+THUMBNAIL_CACHE_ENTRIES = 96
+THUMBNAIL_CACHE_BYTES = 8 * 1024 * 1024
 _ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,180}$")
 
 GET_ROUTES = {
@@ -22,6 +25,8 @@ GET_ROUTES = {
 }
 POST_ROUTES = {
     "jobs/cancel": "web_cancel_job", "jobs/resend": "web_resend_job",
+    "jobs/query": "web_jobs_query", "history/query": "web_history_query", "jobs/recover": "web_recover_job",
+    "targets/inspect": "web_inspect_target",
     "settings": "web_save_settings", "personas": "web_save_persona",
     "personas/delete": "web_delete_persona", "providers": "web_save_provider",
     "providers/delete": "web_delete_provider", "targets": "web_target_action",
@@ -57,20 +62,51 @@ def asset_path(plugin, name: str) -> Path:
     return path
 
 
+def preview_descriptor(plugin, name: str) -> dict[str, str] | None:
+    """Small immutable-image identity for metadata polling and lazy previews."""
+    try:
+        path = asset_path(plugin, name)
+        stat = path.stat()
+        return {"asset": name, "version": f"{stat.st_mtime_ns:x}-{stat.st_ctime_ns:x}-{stat.st_size:x}"}
+    except (ValueError, OSError):
+        cache = getattr(plugin, "_canvas_thumbnail_cache", None)
+        if cache is not None:
+            cache.pop(name, None)
+        return None
+
+
 def image_data_url(plugin, name: str, thumbnail: bool = False) -> str:
     try:
         path = asset_path(plugin, name)
         if thumbnail:
+            descriptor = preview_descriptor(plugin, name)
+            if descriptor is None:
+                return ""
+            cache = getattr(plugin, "_canvas_thumbnail_cache", None)
+            if cache is None:
+                cache = plugin._canvas_thumbnail_cache = OrderedDict()
+            cached = cache.get(name)
+            if cached and cached[0] == descriptor["version"]:
+                cache.move_to_end(name)
+                return cached[1]
             from PIL import Image, ImageOps
             with Image.open(path) as source:
                 picture = ImageOps.exif_transpose(source).convert("RGB")
                 picture.thumbnail((384, 384))
                 buffer = io.BytesIO()
                 picture.save(buffer, "JPEG", quality=75, optimize=True)
-                return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+            cache[name] = (descriptor["version"], result)
+            cache.move_to_end(name)
+            while cache and (len(cache) > THUMBNAIL_CACHE_ENTRIES or sum(len(item[1]) for item in cache.values()) > THUMBNAIL_CACHE_BYTES):
+                cache.popitem(last=False)
+            return result
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
         return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
     except (ValueError, OSError, ImportError):
+        cache = getattr(plugin, "_canvas_thumbnail_cache", None)
+        if cache is not None:
+            cache.pop(name, None)
         return ""
 
 
@@ -80,7 +116,7 @@ async def dispatch_api(plugin, method: str, path: str, body: dict | None = None)
         return await plugin.web_job(path.removeprefix("jobs/"))
     if method == "GET" and path.startswith("reference/preview/"):
         name = path.removeprefix("reference/preview/")
-        return {"asset": name, "image": image_data_url(plugin, name, thumbnail=True)}
+        return {"asset": name, "image": image_data_url(plugin, name, thumbnail=True), "thumbnail": preview_descriptor(plugin, name)}
     routes = GET_ROUTES if method == "GET" else POST_ROUTES
     callback = routes.get(path)
     if callback is None:
@@ -149,7 +185,7 @@ class CanvasPageApi:
             if not name and modern:
                 name = str(request.path_params.get("name") or "")
             asset_path(self.plugin, name)
-            return jsonify({"asset": name, "image": image_data_url(self.plugin, name, thumbnail=True)})
+            return jsonify({"asset": name, "image": image_data_url(self.plugin, name, thumbnail=True), "thumbnail": preview_descriptor(self.plugin, name)})
         except Exception as exc:
             return error(public_error(self.plugin, exc), status_code=404)
 

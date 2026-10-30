@@ -29,11 +29,10 @@ class ProactiveTime0512Tests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         scheduler = ActiveScheduler(self.plugin)
+        self.plugin.active = scheduler
         scheduler.observe(Event())
-        scheduler._blocked = lambda *_: False
-        scheduler._in_window = lambda *_: True
-        self.store.settings["active"].update(enabled=kind == "active", timezone="Asia/Hong_Kong")
-        self.store.settings["good_morning"].update(enabled=kind == "morning", timezone="Asia/Hong_Kong", image_mode="prefer_photo")
+        self.store.settings["active"].update(enabled=kind == "active", timezone="Asia/Hong_Kong", min_idle_sec=0, min_gap_sec=0, default_start="00:00", default_end="23:59")
+        self.store.settings["good_morning"].update(enabled=kind == "morning", timezone="Asia/Hong_Kong", image_mode="prefer_photo", start="00:00", end="23:59")
         self.store.settings["proactive_budget"].update(messages=10, photos=10, llm=20)
         target = self.store.targets["items"][0]
         target.update(enabled=True, last_inbound=0, last_active=0, with_image=True)
@@ -138,7 +137,7 @@ class ProactiveTime0512Tests(unittest.IsolatedAsyncioTestCase):
         self.setup_clock()
         for index, gate in enumerate(("target", "budget", "text_only", "manual_provider")):
             self.key = "morning:gate:" + str(index)
-            self.target.update(with_image=True, last_active=0, morning_date="")
+            self.target.update(with_image=True, last_active=0, morning_date="", unanswered=0, silent_until=0)
             self.store.settings["proactive_budget"]["photos"] = 10
             self.store.settings["good_morning"]["image_mode"] = "prefer_photo"
             self.image_provider.capabilities = fixtures.ProviderCapabilities()

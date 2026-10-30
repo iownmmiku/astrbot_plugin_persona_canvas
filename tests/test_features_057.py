@@ -78,6 +78,8 @@ class Settings057Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.context.sent)
 
     async def test_reply_picture_leaves_persistent_state_and_pending_unchanged(self):
+        self.store.settings["reply_images"]["enabled"] = True
+        self.store.targets["items"] = [{"umo": Event().unified_msg_origin, "reply_image_enabled": True}]
         env = await self.plugin.dialogue.environment(Event().unified_msg_origin)
         self.plugin._save_conditions(env, "自拍", "需要远景，可以吗？", {"camera": "wide shot"})
         before = copy.deepcopy(self.store.read_session(env["key"]))
@@ -121,6 +123,8 @@ class Settings057Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.image_provider.calls)
 
     async def test_comfy_generation_uses_shared_task_and_safe_workflow_summary(self):
+        self.store.settings["reply_images"]["enabled"] = True
+        self.store.targets["items"] = [{"umo": Event().unified_msg_origin, "reply_image_enabled": True}]
         item = comfy_provider()
         submitted = []
         request = working_http(item)

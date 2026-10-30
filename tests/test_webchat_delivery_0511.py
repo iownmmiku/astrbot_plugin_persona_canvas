@@ -395,9 +395,10 @@ class WebChatDelivery0511Tests(unittest.IsolatedAsyncioTestCase):
 
     def setup_webchat_morning(self, *, with_image):
         scheduler = fixtures.ActiveScheduler(self.plugin)
+        self.plugin.active = scheduler
         scheduler._in_window = lambda *_args: True
         self.store.settings["active"].update(enabled=False, min_idle_sec=0, min_gap_sec=60)
-        self.store.settings["good_morning"].update(enabled=True, max_attempts=3, retry_interval_sec=900)
+        self.store.settings["good_morning"].update(enabled=True, max_attempts=3, retry_interval_sec=900, start="00:00", end="23:59")
         self.store.settings["proactive_budget"].update(messages=10, llm=20, photos=10)
         event = SimulatedWebChatEvent(self.platform)
         scheduler.observe(event)

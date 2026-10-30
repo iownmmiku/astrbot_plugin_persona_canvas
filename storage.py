@@ -40,7 +40,7 @@ DEFAULT_SETTINGS = {
     "llm": {"provider_id": "", "model": "", "fallback_to_current": True, "timeout_sec": 45},
     "integration": {"enabled": True, "mode": "native_tools", "strict_trigger": True},
     "dialogue": {"enabled": True, "timeout_sec": 60, "context_turns": 12, "confirmation_ttl_sec": 1800},
-    "reply_images": {"enabled": False, "default_probability": 20, "min_interval_sec": 300, "provider": ""},
+    "reply_images": {"enabled": False, "default_probability": 20, "min_interval_sec": 300, "max_wait_sec": 30, "provider": ""},
     "state_lifetimes": {"outfit_sec": 0, "pose_sec": 1800, "expression_sec": 1800, "scene_sec": 14400},
     "proactive_budget": {"messages": 10, "photos": 2, "llm": 24, "timezone": "Asia/Shanghai"},
     "providers": {"default": DEFAULT_PROVIDER},
@@ -908,7 +908,38 @@ class Storage:
             rows = self._db.execute("SELECT payload FROM history ORDER BY id DESC LIMIT ?", (max(0, min(10000, int(limit))),)).fetchall()
             return [_decoded(row["payload"], "history") for row in reversed(rows)]
 
-    def cleanup_history(self, limit: int) -> dict[str, int]:
+    def history_page(self, limit: int = 20, before_id: int | None = None) -> dict[str, Any]:
+        """Cursor pagination remains stable while new generation records arrive."""
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 100:
+            raise StorageError("每页记录数应为 1 到 100")
+        if before_id is not None and (isinstance(before_id, bool) or int(before_id) < 1):
+            raise StorageError("历史分页游标无效")
+        size = int(limit)
+        condition, args = ("WHERE id<?", [int(before_id)]) if before_id is not None else ("", [])
+        with self._lock:
+            self._check_open()
+            rows = self._db.execute(f"SELECT id,payload FROM history {condition} ORDER BY id DESC LIMIT ?", (*args, size + 1)).fetchall()
+            selected = rows[:size]
+            items = [{**_decoded(row["payload"], "history"), "history_id": row["id"]} for row in selected]
+            more = len(rows) > size
+            return {"items": items, "has_more": more, "next_cursor": selected[-1]["id"] if more else None}
+
+    def maintenance(self, limit: int, batch_size: int = 200) -> dict[str, int]:
+        """Apply existing retention even when no image generation succeeds.
+
+        Each deletion batch is bounded. Usage with any unsettled reservation is
+        retained, even if its lease is old; settlement owns those rows.
+        """
+        size = max(1, min(1000, int(batch_size)))
+        result = self.cleanup_history(limit, batch_size=size)
+        cutoff = datetime.fromtimestamp(time.time(), timezone.utc).date() - timedelta(days=30)
+        with self._lock, self._db:
+            self._check_open()
+            quota = self._db.execute("DELETE FROM quota_usage WHERE rowid IN (SELECT u.rowid FROM quota_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM quota_reservations r WHERE r.user_key=u.user_key AND r.day=u.day) ORDER BY u.day LIMIT ?)", (cutoff.isoformat(), size)).rowcount
+            budget = self._db.execute("DELETE FROM budget_usage WHERE rowid IN (SELECT u.rowid FROM budget_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM budget_reservations r WHERE r.kind=u.kind AND r.day=u.day) ORDER BY u.day LIMIT ?)", (cutoff.isoformat(), size)).rowcount
+        return {**result, "quota_days_deleted": quota, "budget_days_deleted": budget}
+
+    def cleanup_history(self, limit: int, *, batch_size: int | None = None) -> dict[str, int]:
         """Bound history/finished jobs and retain delivery records for 30 days.
 
         In-flight jobs and deliveries always survive. A newly generated chat
@@ -919,10 +950,11 @@ class Storage:
         with self._lock, self._db:
             self._check_open()
             self._db.execute("BEGIN IMMEDIATE")
-            rows = self._db.execute("SELECT id,payload FROM history ORDER BY id DESC LIMIT -1 OFFSET ?", (limit,)).fetchall()
+            batch = -1 if batch_size is None else max(1, min(1000, int(batch_size)))
+            rows = self._db.execute("SELECT id,payload FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (batch, limit)).fetchall()
             deleted = [_decoded(row["payload"], "history") for row in rows]
             now = time.time()
-            delivery_rows = self._db.execute("SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain','delivery_failed')", (now - 30 * 86400,)).fetchall()
+            delivery_rows = self._db.execute("SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain','delivery_failed') ORDER BY updated_at LIMIT ?", (now - 30 * 86400, batch)).fetchall()
             expired_delivery_keys = {row["key"] for row in delivery_rows}
             protected_jobs = set()
             for row in self._db.execute("SELECT key,payload FROM deliveries"):
@@ -943,7 +975,7 @@ class Storage:
                 if row["status"] == "succeeded" and value.get("source") != "webui" and row["updated_at"] > now - 300:
                     continue
                 eligible_finished.append(row)
-            pruned_jobs = eligible_finished[limit:]
+            pruned_jobs = eligible_finished[limit:] if batch < 0 else eligible_finished[limit:limit + batch]
             deleted.extend(_decoded(row["payload"], "job") for row in pruned_jobs)
             deleted.extend(_decoded(row["payload"], "delivery") for row in delivery_rows)
             self._db.executemany("DELETE FROM history WHERE id=?", [(row["id"],) for row in rows])

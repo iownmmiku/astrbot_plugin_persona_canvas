@@ -47,7 +47,8 @@ class MorningPromptTests(unittest.IsolatedAsyncioTestCase):
         request = self.context.llm.calls[-1]
         self.assertIn("日常主动联系机会", request["system_prompt"])
         self.assertNotIn("这是管理员开启的每日早安", request["system_prompt"])
-        self.assertEqual(request["prompt"], "没有合适话题时选择skip")
+        self.assertTrue(request["prompt"].startswith("没有合适话题时选择skip"))
+        self.assertIn("visual_profile", request["prompt"])
         self.assertEqual(result["decision"], "skip")
 
     async def test_non_proactive_chat_does_not_receive_morning_instruction(self):

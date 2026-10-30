@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import inspect
 import json
 import re
 import secrets
@@ -43,6 +45,8 @@ class ComfyUIProvider(ImageProvider):
         derived["negative_mode"] = "field" if fields.get("negative_prompt") else "disabled"
         super().__init__(name, derived)
         self.supported_options = {key for key in OPTION_FIELDS if fields.get(key)}
+        self.on_progress = None
+        self.last_recovery = {}
         self.capabilities = ProviderCapabilities(
             image_to_image=bool(fields.get("reference")),
             negative_prompt=bool(fields.get("negative_prompt")),
@@ -147,6 +151,113 @@ class ComfyUIProvider(ImageProvider):
             # Older ComfyUI versions only remove queued work; never interrupt all.
             pass
 
+    def recovery_fingerprint(self) -> str:
+        """Bind a saved prompt without persisting the source configuration.
+
+        Only a digest is persisted; the workflow can contain private node inputs.
+        Authentication rotation and timeout changes do not change the binding.
+        """
+        value = {
+            "version": 1, "provider": self.name,
+            "endpoint": str(self.config.get("endpoint") or "").strip().rstrip("/"),
+            "workflow": self.config.get("workflow"),
+            "fields": self.config.get("workflow_fields"),
+            "output_node": self.config.get("output_node", ""),
+        }
+        encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prompt_id(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+            raise ProviderError("ComfyUI 任务编号无效")
+        return value
+
+    async def _progress(self, phase: str, prompt_id: str = "") -> None:
+        record = {
+            "kind": "comfyui", "provider": self.name, "prompt_id": prompt_id,
+            "fingerprint": self.recovery_fingerprint(), "phase": phase,
+            "submitted": True, "upstream_accepted": bool(prompt_id),
+        }
+        self.last_recovery = record
+        self.last_request.update(submitted=True, upstream_accepted=bool(prompt_id), recovery=copy.deepcopy(record))
+        if prompt_id:
+            self.last_request["workflow_prompt_id"] = prompt_id
+        callback = self.on_progress
+        if callable(callback):
+            result = callback(copy.deepcopy(record))
+            if inspect.isawaitable(result):
+                await result
+
+    async def _history_image(self, prompt_id: str) -> dict | None:
+        payload = await self._json_request("GET", "/history/" + quote(prompt_id, safe=""), operation="读取历史")
+        history = payload.get(prompt_id)
+        if history is not None and not isinstance(history, dict):
+            raise ProviderError("ComfyUI 任务历史格式错误")
+        return self._select_image(history) if isinstance(history, dict) else None
+
+    async def _queue_phase(self, prompt_id: str) -> str:
+        queue = await self._json_request("GET", "/queue", operation="读取任务队列")
+        for field, phase in (("queue_running", "running"), ("queue_pending", "queued")):
+            entries = queue.get(field)
+            if not isinstance(entries, list):
+                raise ProviderError("ComfyUI 任务队列格式错误")
+            for entry in entries:
+                # Queue entries also contain full graphs and private node inputs.
+                # Inspect only their prompt ID; never store or return the rest.
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2 or not isinstance(entry[1], str):
+                    raise ProviderError("ComfyUI 任务队列条目格式错误")
+                if entry[1] == prompt_id:
+                    return phase
+        return "missing"
+
+    async def _fetch_image(self, prompt_id: str, image: dict, model: str) -> GeneratedImage:
+        name, folder, kind = self._file_descriptor(image)
+        await self._progress("fetching", prompt_id)
+        url = self._comfy_url("/view") + "?" + urlencode({"filename": name, "subfolder": folder, "type": kind})
+        raw, mime, _ = await self._http("GET", url, limit=MAX_IMAGE_BYTES)
+        extension, actual_mime, _ = _image_info(raw)
+        declared = mime.split(";", 1)[0].strip().lower().replace("image/jpg", "image/jpeg")
+        if declared.startswith("image/") and declared != actual_mime:
+            raise ProviderError("ComfyUI 图片 MIME 与实际内容不匹配")
+        if declared and declared not in {actual_mime, "application/octet-stream", "binary/octet-stream"}:
+            raise ProviderError("ComfyUI 图片响应类型无效")
+        await self._progress("completed", prompt_id)
+        return GeneratedImage(raw, extension, self.name, model)
+
+    async def recover(self, prompt_id: str, *, fingerprint: str) -> GeneratedImage | None:
+        """Inspect one previously accepted task; never submit, cancel or send.
+
+        None means no image was found in this check, not generation failure.
+        ``last_recovery.phase`` distinguishes queued/running/missing. A missing
+        task may have been removed from remote history; it cannot be resubmitted
+        automatically without risking a second generation.
+        """
+        self.validate_config()
+        prompt_id = self._prompt_id(prompt_id)
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint) or not secrets.compare_digest(fingerprint, self.recovery_fingerprint()):
+            raise ProviderError("ComfyUI 接口或工作流已改变，请恢复原任务配置后再检查结果")
+        self.last_request = {}
+
+        async def inspect_result():
+            image = await self._history_image(prompt_id)
+            if image is not None:
+                return await self._fetch_image(prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流"))
+            phase = await self._queue_phase(prompt_id)
+            if phase == "missing":
+                # Completion can move a prompt from queue to history between
+                # the two reads. Recheck once before reporting it unavailable.
+                image = await self._history_image(prompt_id)
+                if image is not None:
+                    return await self._fetch_image(prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流"))
+            await self._progress(phase, prompt_id)
+            return None
+
+        try:
+            return await asyncio.wait_for(inspect_result(), timeout=_integer(self.config.get("timeout", 180), "超时", 5, 600))
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise ProviderError("ComfyUI 原任务查询超时，未重新提交或取消任务") from exc
+
     @staticmethod
     def _option(key: str, value: Any, *, randomize: bool = True) -> Any:
         if key in {"width", "height"}:
@@ -238,6 +349,7 @@ class ComfyUIProvider(ImageProvider):
 
     async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
         self.last_request = {}
+        self.last_recovery = {}
         prepared = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
         workflow, fields, model = prepared["workflow"], prepared["fields"], prepared["model"]
         negative_field = prepared["negative_field"]
@@ -252,30 +364,26 @@ class ComfyUIProvider(ImageProvider):
                 uploaded = await self._json_request("POST", "/upload/image", {"type": "input", "subfolder": "persona_canvas", "overwrite": "false"}, files={"image": data}, operation="上传参考图")
                 name, folder, _ = self._file_descriptor(uploaded, upload=True)
                 _path_set(workflow, fields["reference"], f"{folder}/{name}" if folder else name)
-            self.last_request["submitted"] = True
+            await self._progress("submitting")
             submitted = await self._json_request("POST", "/prompt", {"prompt": workflow, "client_id": "persona-canvas-" + secrets.token_hex(12)}, operation="提交工作流")
             prompt_id = submitted.get("prompt_id")
             if not isinstance(prompt_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", prompt_id):
                 raise ProviderError("ComfyUI 提交响应缺少有效 prompt_id")
             state["prompt_id"] = prompt_id
-            self.last_request["workflow_prompt_id"] = prompt_id
+            await self._progress("accepted", prompt_id)
+            checked_queue_at = 0.0
             while True:
-                payload = await self._json_request("GET", "/history/" + quote(prompt_id, safe=""), operation="读取历史")
-                history = payload.get(prompt_id)
-                if history is not None and not isinstance(history, dict):
-                    raise ProviderError("ComfyUI 任务历史格式错误")
-                image = self._select_image(history) if isinstance(history, dict) else None
+                image = await self._history_image(prompt_id)
                 if image is not None:
-                    name, folder, kind = self._file_descriptor(image)
-                    url = self._comfy_url("/view") + "?" + urlencode({"filename": name, "subfolder": folder, "type": kind})
-                    raw, mime, _ = await self._http("GET", url, limit=MAX_IMAGE_BYTES)
-                    extension, actual_mime, _ = _image_info(raw)
-                    declared = mime.split(";", 1)[0].strip().lower().replace("image/jpg", "image/jpeg")
-                    if declared.startswith("image/") and declared != actual_mime:
-                        raise ProviderError("ComfyUI 图片 MIME 与实际内容不匹配")
-                    if declared and declared not in {actual_mime, "application/octet-stream", "binary/octet-stream"}:
-                        raise ProviderError("ComfyUI 图片响应类型无效")
-                    return GeneratedImage(raw, extension, self.name, model)
+                    return await self._fetch_image(prompt_id, image, model)
+                if callable(self.on_progress) and time.monotonic() - checked_queue_at >= 2:
+                    checked_queue_at = time.monotonic()
+                    try:
+                        phase = await self._queue_phase(prompt_id)
+                    except ProviderError:
+                        phase = "accepted"  # History polling remains authoritative.
+                    if phase in {"running", "queued"} and self.last_recovery.get("phase") != phase:
+                        await self._progress(phase, prompt_id)
                 await asyncio.sleep(self.poll_interval)
 
         try:

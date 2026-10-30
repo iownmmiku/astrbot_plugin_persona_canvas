@@ -106,7 +106,7 @@ class ReplyImages:
 
     def _current(self, event, env, rule, result, reply, token):
         umo = env["umo"]
-        if self.plugin._closing or self._latest.get(umo) != token or _extra(event, "request_cancelled"):
+        if self.plugin._closing or self._latest.get(umo) != token or _extra(event, "request_cancelled") or _extra(event, "reply_image_expired"):
             return False
         _, current_rule = self._rule(umo)
         if current_rule != rule or event.get_result() is not result or self._plain_reply(result) != reply:
@@ -116,6 +116,8 @@ class ReplyImages:
 
     async def _current_role(self, event, env, rule, result, reply, token):
         if not self._current(event, env, rule, result, reply, token):
+            return False
+        if await self.plugin._delivery_guard(env={**env, "delivery_source": "reply_image"}):
             return False
         # Resolve current AstrBot persona/conversation overrides again; a console
         # persona switch need not have touched the old SQLite session yet.
@@ -150,6 +152,29 @@ class ReplyImages:
         return {"decision": decision, "prompt": description, "state_patch": state_patch(value.get("state_patch"))}
 
     async def decorate(self, event):
+        """Bound optional work without cancelling AstrBot's original reply task."""
+        if self.plugin._closing or self._rule(str(getattr(event, "unified_msg_origin", "") or ""))[1] is None:
+            return
+        self.plugin._track_current()
+        timeout = _number(self.plugin.storage.settings.get("reply_images", {}).get("max_wait_sec", 30), 30, 5, 600)
+        task = self.plugin._spawn(self._decorate(event), "persona-canvas-reply-image")
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if done:
+                await task
+                return
+            _extra(event, "reply_image_expired", True, write=True)
+            key = _extra(event, "reply_image_delivery")
+            if key:
+                self.plugin.storage.update_delivery(key, {"status": "skipped", "reason": "配图总等待时间已用完，保留原文字回复", "skip_reason": "reply_image_timeout"})
+            task.cancel()
+            # Cancellation cleanup may require network IO. Do not hold the text
+            # reply for it; _current prevents late images from being attached.
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
+    async def _decorate(self, event):
         """Append one image, or leave the completed text reply untouched."""
         text = message_text(getattr(event, "message_str", ""))
         result = event.get_result()
@@ -168,6 +193,7 @@ class ReplyImages:
         if not self.plugin.storage.reserve_delivery(key):
             return
         self.plugin.storage.update_delivery(key, {"kind": "reply_image", "umo": umo, "status": "claimed"})
+        _extra(event, "reply_image_delivery", key, write=True)
         job = None
         self._inflight.add(umo)
         try:
@@ -211,7 +237,8 @@ class ReplyImages:
             self.plugin.storage.save_targets()
             _extra(event, "reply_image_job_id", job["id"], write=True)
         except asyncio.CancelledError:
-            self.plugin.storage.update_delivery(key, {"status": "skipped", "reason": "配图任务中断，保留原回复"})
+            expired = _extra(event, "reply_image_expired")
+            self.plugin.storage.update_delivery(key, {"status": "skipped", "reason": "配图总等待时间已用完，保留原回复" if expired else "配图任务中断，保留原回复"})
             current = self.plugin.storage.job(job["id"]) if job else None
             if current and current.get("cancel_requested") and not self.plugin._closing:
                 task = asyncio.current_task()
@@ -233,3 +260,5 @@ class ReplyImages:
             logger.warning("[随想画卷] 对话配图失败，保留原回复：%s", error)
         finally:
             self._inflight.discard(umo)
+            if job and _extra(event, "reply_image_expired"):
+                self.plugin.storage.update_job(job["id"], {"delivery_mode": "reply_chain", "delivery_state": "discarded", "delivery_note": "配图总等待时间已用完，保留原文字；迟到图片不附加"})

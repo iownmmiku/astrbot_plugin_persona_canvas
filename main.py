@@ -17,6 +17,7 @@ from astrbot.api.star import Context, Star, register
 
 from .active import ActiveScheduler
 from .dialogue import Dialogue, field, maybe_await
+from .delivery import delivery_guard, local_delivery_guard
 from .companion import REQUIREMENT_KEYS, apply_state, cancel_request, infer_requirements, is_confirmation, pending_request, requirements, semantic_request_error, valid_pending
 from .intent import Intent, message_text, photo_request, prompt_bundle, state_patch, state_request
 from .moderation import Moderation
@@ -27,7 +28,7 @@ from .storage import Storage, _secret_key
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.15"
+VERSION = "0.5.16"
 
 
 class DeliveryRejectedError(ValueError):
@@ -90,6 +91,8 @@ class PersonaCanvasPlugin(Star):
         self._session_locks = {}
         self._slots = asyncio.Condition()
         self._running = 0
+        self._generation_waiters = []
+        self._generation_ticket = 0
         self._closing = False
         self._apply_plugin_config()
 
@@ -131,6 +134,8 @@ class PersonaCanvasPlugin(Star):
 
     def _fail_job(self, job_id, exc, stage=""):
         current = self.storage.job(job_id) or {}
+        if current.get("delivery_blocked"):
+            return current
         if current.get("status") in {"failed", "cancelled", "uncertain", "delivery_failed"}:
             return current
         error = self._error(exc)
@@ -273,13 +278,18 @@ class PersonaCanvasPlugin(Star):
                 elif delivery.get("status") in {"claimed", "decided", "generating"}:
                     self.storage.update_delivery(delivery["key"], {"status": "skipped", "error": "重启前配图尚未附加，不自动补图"})
             elif delivery.get("status") in {"claimed", "decided", "generating"}:
-                self.storage.update_delivery(delivery["key"], {"status": "failed", "error": "重启中断，尚未发送，将有限重试", "retry_at": time.time() + 300})
+                interrupted = self.storage.job(delivery.get("job_id", "")) or {}
+                if interrupted.get("recovery", {}).get("submitted"):
+                    self.storage.update_delivery(delivery["key"], {"status": "skipped", "retryable": False, "skip_reason": "upstream_pending", "error": "工作流可能已提交，须先检查原任务结果，不自动重新生图"})
+                else:
+                    self.storage.update_delivery(delivery["key"], {"status": "failed", "error": "重启中断，尚未发送，将有限重试", "retry_at": time.time() + 300})
             elif delivery.get("status") == "sending":
                 self.storage.update_delivery(delivery["key"], {"status": "uncertain", "error": "重启前正在发送，请先检查聊天记录"})
 
     async def _asset_maintenance(self):
         while not self._closing:
             try:
+                self.storage.maintenance(int(self.storage.settings["generation"].get("max_history", 100)))
                 self.storage.cleanup_assets(grace_sec=3600)
             except Exception as exc:
                 logger.warning("随想画卷资源清理失败：%s", self._error(exc))
@@ -347,18 +357,36 @@ class PersonaCanvasPlugin(Star):
         return str(umo).split(":", 1)[0].lower() == "webchat"
 
     @asynccontextmanager
-    async def _generation_slot(self):
+    async def _generation_slot(self, source="chat"):
         async with self._slots:
-            await self._slots.wait_for(lambda: self._closing or self._running < int(self.storage.settings["generation"].get("max_concurrency", 2)))
-            if self._closing:
-                raise RuntimeError("插件正在停止")
-            self._running += 1
+            self._generation_ticket += 1
+            waiter = (self._generation_ticket, source in {"active", "morning", "reply_image"}, time.monotonic())
+            self._generation_waiters.append(waiter)
+            def ready():
+                if self._closing:
+                    return True
+                now = time.monotonic()
+                first = min(self._generation_waiters, key=lambda item: (bool(item[1] and now - item[2] < 30), item[0]))
+                return first == waiter and self._running < int(self.storage.settings["generation"].get("max_concurrency", 2))
+            try:
+                await self._slots.wait_for(ready)
+                if self._closing:
+                    raise RuntimeError("插件正在停止")
+                self._running += 1
+            finally:
+                self._generation_waiters.remove(waiter)
+                self._slots.notify_all()
         try:
             yield
         finally:
             async with self._slots:
                 self._running -= 1
                 self._slots.notify_all()
+
+    async def _delivery_guard(self, *, env=None, job=None, check_identity=True):
+        if not check_identity:
+            return local_delivery_guard(self, env=env, job=job)
+        return await delivery_guard(self, env=env, job=job)
 
     def _lock(self, key):
         return self._session_locks.setdefault(key, asyncio.Lock())
@@ -490,6 +518,8 @@ class PersonaCanvasPlugin(Star):
         if getattr(response, "tools_call_name", None) or getattr(response, "is_chunk", False):
             return
         env = await self._env(event)
+        if await self._delivery_guard(env=env):
+            return
         text = str(getattr(response, "completion_text", "") or "")
         session = self.storage.read_session(env["key"])
         if not session or session.get("persona_id") != env["persona"]["id"]:
@@ -537,6 +567,9 @@ class PersonaCanvasPlugin(Star):
         """
         env = await self._env(event)
         _extra(event, "native_tool_seen", True, set_value=True)
+        guard_reason = await self._delivery_guard(env=env)
+        if guard_reason:
+            return json.dumps({"ok": False, "reason": guard_reason}, ensure_ascii=False)
         self._prepare_request(env, _text(event))
         semantic = bool(str(request_summary or "").strip())
         if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event) or request_kind not in {"photo", "state"} or (semantic_request_error(_text(event)) if semantic else not (self._eligible(_text(event), env) or state_request(_text(event), env["session"].get("pending")))):
@@ -582,6 +615,10 @@ class PersonaCanvasPlugin(Star):
             if not current or current.get("persona_id") != env["persona"]["id"]:
                 raise ValueError("会话角色已改变，请重新读取当前视觉档案")
             env["session"] = current
+            if action != "cancel":
+                guard_reason = await self._delivery_guard(env=env)
+                if guard_reason:
+                    raise ValueError(guard_reason)
             pending = current.get("pending") or {}
             if action in {"confirm", "revise"}:
                 if not request_id or not valid_pending(pending, env) or pending.get("request_id") != request_id:
@@ -682,11 +719,17 @@ class PersonaCanvasPlugin(Star):
         reason, _stage = self._native_request(event, env, "state", request_summary, confirmed_request_id)
         if reason:
             return json.dumps({"ok": False, "reason": reason}, ensure_ascii=False)
+        guard_reason = await self._delivery_guard(env=env)
+        if guard_reason:
+            return json.dumps({"ok": False, "reason": guard_reason}, ensure_ascii=False)
         patch = state_patch({k: v for k, v in {"outfit": outfit, "pose": pose, "expression": expression, "scene": scene}.items() if v})
         if is_confirmation(_text(event)):
             patch.update(state_patch((env["session"].get("pending") or {}).get("requirements")))
         patch.update(state_patch(env.get("approved_requirements")))
         async with self._lock(env["key"]):
+            guard_reason = local_delivery_guard(self, env=env)
+            if guard_reason:
+                return json.dumps({"ok": False, "reason": guard_reason}, ensure_ascii=False)
             session = self.storage.read_session(env["key"])
             if not session or session.get("persona_id") != env["persona"]["id"] or session.get("revision") != env["session"].get("revision"):
                 return json.dumps({"ok": False, "reason": "会话状态或条件已改变，请重新判断"}, ensure_ascii=False)
@@ -824,6 +867,8 @@ class PersonaCanvasPlugin(Star):
         persona = copy.deepcopy(env["persona"])
         intent = Intent(mode={"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}[mode], use_persona=mode == "persona", prompt_delta=prompt if mode == "persona" else "", scene_prompt=prompt if mode != "persona" else "", state_patch=patch, raw=raw, caption=caption)
         positive, negative = prompt_bundle(persona, intent)
+        if source in {"active", "morning"} and env.get("proactive_context", {}).get("time"):
+            positive += "\nCurrent capture time (scene context only; do not render as text):\n" + json.dumps(env["proactive_context"]["time"], ensure_ascii=False) + "\nUse this same current time for the photograph and caption. Respect indoor lighting and the agreed scene; a custom morning window does not imply sunrise."
         if source in {"active", "morning"} and env.get("schedule_context"):
             positive += "\nCurrent role schedule (scene context only; do not render this as text):\n" + env["schedule_context"] + "\nThe photo's setting, outfit and action should fit the current activity, not a future plan."
         visual_conditions = {k: agreed[k] for k in ("outfit", "camera", "pose", "expression", "scene") if agreed.get(k)}
@@ -883,6 +928,12 @@ class PersonaCanvasPlugin(Star):
         reference_source, reference_warning = prepared["reference_source"], prepared["reference_warning"]
         job_data = {"status": "queued", "source": source, "mode": mode, "umo": env["umo"], "session_key": env["key"], "persona_id": persona["id"], "persona_snapshot": persona, "session_revision": env["session"].get("revision", 0), "prompt": positive, "negative_prompt": negative, "request_prompt": prompt, "raw": raw, "caption": caption, "state_patch": patch, "provider": provider.name, "reference_asset": reference_name, "reference_assets": reference_names, "reference_source": reference_source, "reference_warning": reference_warning, "requirements": agreed, "options": options, "request_summary": self._request_summary(provider, positive, negative, options, len(reference_names), reference_source)}
         job = self.storage.update_job(job_id, job_data) if job_id else self.storage.create_job(job_data)
+        job = self.storage.update_job(job["id"], {"identity": {name: env.get(name, "") for name in ("astro_id", "cid")}, "delivery_revision": env["session"].get("revision", 0), "delivery_pending_id": (env["session"].get("pending") or {}).get("request_id", "")})
+        if callable(getattr(provider, "recover", None)):
+            async def save_progress(record):
+                current = self.storage.job(job["id"])
+                self.storage.update_job(job["id"], {"recovery": {**(current.get("recovery") or {}), **record}, "request_summary": self._request_summary(provider, positive, negative, options, len(reference_names), reference_source)})
+            provider.on_progress = save_progress
         self._bind_job_task(job["id"], asyncio.current_task())
         basis = job.get("request_basis") or {}
         self._trace_job(job["id"], "request", detail=("角色工具语义判断：" + basis.get("summary", "")) if basis.get("source") == "model_tool" else "明确请求 / 主动机会，角色已同意")
@@ -895,7 +946,10 @@ class PersonaCanvasPlugin(Star):
         try:
             self._trace_job(job["id"], "reference", "warning" if reference_warning else "ok", reference_warning or f"使用 {len(reference_names)} 张真实参考图")
             failure_stage = "quota"
-            async with self._generation_slot():
+            async with self._generation_slot(source):
+                guard_reason = await self._delivery_guard(env=env, job=job)
+                if guard_reason:
+                    raise ValueError(guard_reason)
                 allowed, reason, quota_token = self.moderation.reserve(user_key, raw + "\n" + positive, is_admin=is_admin)
                 if not allowed:
                     raise ValueError(reason)
@@ -922,9 +976,11 @@ class PersonaCanvasPlugin(Star):
                 failure_stage = "generation"
                 asset = self.storage.save_asset(result.data, result.extension)
                 success = True
+                guard_reason = await self._delivery_guard(env=env, job=job)
                 async with self._lock(env["key"]):
                     session = self.storage.read_session(env["key"])
-                    state_committed = bool(source != "reply_image" and session and session.get("persona_id") == persona["id"] and session.get("revision", 0) == env["session"].get("revision", 0))
+                    guard_reason = guard_reason or local_delivery_guard(self, env=env, job=job)
+                    state_committed = bool(not guard_reason and source != "reply_image" and session and session.get("persona_id") == persona["id"] and session.get("revision", 0) == env["session"].get("revision", 0))
                     if state_committed:
                         if mode == "persona":
                             apply_state(session, patch, self.storage.settings)
@@ -933,6 +989,10 @@ class PersonaCanvasPlugin(Star):
                         session = self.storage.save_session(env["key"], session)
                         env["session"] = session
                 job = self.storage.update_job(job["id"], {"status": "succeeded", "phase": "generated", "failure_stage": "", "asset": asset.name, "model": result.model, "state_after": (session or {}).get("state", {}), "state_committed": state_committed, "elapsed_ms": int((time.time() - job.get("at", time.time())) * 1000)})
+                if guard_reason:
+                    job = self.storage.update_job(job["id"], {"delivery_blocked": True, "delivery_note": guard_reason})
+                if state_committed:
+                    job = self.storage.update_job(job["id"], {"delivery_revision": session.get("revision", 0), "delivery_pending_id": (session.get("pending") or {}).get("request_id", "")})
                 job = self._trace_job(job["id"], "generation", detail="图片已验证并保存；" + ("对话配图不修改持续视觉状态" if source == "reply_image" else "状态已提交" if state_committed else "较新状态保留，未覆盖"))
                 self._photo_note(job)
                 self.storage.append_history({"ok": True, "job_id": job["id"], "image": "/assets/" + asset.name, "caption": caption, "prompt": positive, "negative_prompt": negative, "request_summary": job["request_summary"], "state_patch": patch, "requirements": agreed, "reference_source": reference_source, "trace": job["trace"], "provider": provider.name, "model": result.model, "mode": mode})
@@ -955,6 +1015,13 @@ class PersonaCanvasPlugin(Star):
         current = self.storage.job(job["id"])
         if current.get("cancel_requested") or current.get("status") == "cancelled":
             raise asyncio.CancelledError()
+        guard_reason = await self._delivery_guard(job=current)
+        if guard_reason:
+            self.storage.update_job(job["id"], {"delivery_blocked": True, "delivery_note": guard_reason})
+            self._photo_note(self._trace_job(job["id"], "delivery_guard", "blocked", guard_reason))
+            if current.get("delivery_key"):
+                self.storage.update_delivery(current["delivery_key"], {"status": "skipped", "retryable": False, "skip_reason": "delivery_guard", "reason": guard_reason})
+            raise DeliveryRejectedError(guard_reason)
         destination = str(current.get("umo") or umo or "")
         webchat = self._is_webchat(destination, event=event, job=current)
         use_context = event is None or webchat
@@ -970,7 +1037,7 @@ class PersonaCanvasPlugin(Star):
             if job.get("delivery_key"):
                 self.storage.update_delivery(job["delivery_key"], {"status": "delivery_failed", "error": self._error(exc)})
             raise
-        self.storage.update_job(job["id"], {"status": "sending", "phase": "sending", "delivery_channel": channel, "delivery_platform": "webchat" if webchat else current.get("delivery_platform", ""), "delivery_evidence": "unverified"})
+        self.storage.update_job(job["id"], {"status": "sending", "phase": "sending", "delivery_blocked": False, "delivery_channel": channel, "delivery_platform": "webchat" if webchat else current.get("delivery_platform", ""), "delivery_evidence": "unverified"})
         if job.get("delivery_key"):
             self.storage.update_delivery(job["delivery_key"], {"status": "sending", "job_id": job["id"]})
         try:
@@ -1019,6 +1086,9 @@ class PersonaCanvasPlugin(Star):
     async def _apply_decision(self, env, decision, text, *, event=None, explicit=False, body=None):
         if self._closing:
             raise RuntimeError("插件正在停止")
+        guard_reason = await self._delivery_guard(env=env)
+        if guard_reason:
+            raise ValueError(guard_reason)
         current = self.storage.read_session(env["key"])
         if not current or current.get("persona_id") != env["persona"]["id"]:
             raise ValueError("会话角色已改变，请重新由当前角色判断")
@@ -1239,11 +1309,39 @@ class PersonaCanvasPlugin(Star):
                 target["clock_error"] = self._error(exc)
         return {"items": items}
 
+    async def web_inspect_target(self, body):
+        target = next((item for item in self.storage.targets["items"] if item.get("umo") == str(body.get("umo") or "")), None)
+        if target is None:
+            raise ValueError("目标会话不存在")
+        return await (self.active or ActiveScheduler(self)).inspect_target(copy.deepcopy(target))
+
     async def web_sessions(self):
         return {"items": self.storage.list_sessions()}
 
     async def web_jobs(self):
         return {"items": self._jobs()}
+
+    async def web_jobs_query(self, body):
+        from .page_api import preview_descriptor
+        items = self.storage.recent_jobs(50)
+        for job in items:
+            job.pop("image", None)
+            job.pop("image_url", None)
+            if job.get("asset"):
+                job["thumbnail"] = preview_descriptor(self, job["asset"])
+        return {"items": items}
+
+    async def web_history_query(self, body):
+        from .page_api import preview_descriptor
+        result = self.storage.history_page(limit=body.get("limit", 20), before_id=body.get("cursor"))
+        for item in result["items"]:
+            job = self.storage.job(item.get("job_id", "")) or {}
+            item.update({key: job[key] for key in ("status", "umo", "cancel_requested", "asset", "recovery", "recovered") if key in job})
+            asset = item.get("asset") or (str(item.get("image", "")).rsplit("/", 1)[-1] if str(item.get("image", "")).startswith("/assets/") else "")
+            item.pop("image", None)
+            if asset:
+                item["thumbnail"] = preview_descriptor(self, asset)
+        return result
 
     async def web_job(self, id):
         job = self.storage.job(id)
@@ -1330,6 +1428,7 @@ class PersonaCanvasPlugin(Star):
         ranges["default_probability"] = (0, 100)
         ranges["max_attempts"] = (1, 5)
         ranges["retry_interval_sec"] = (60, 3600)
+        ranges["max_wait_sec"] = (5, 600)
         allowed_groups = {"integration", "dialogue", "reply_images", "llm", "moderation", "generation", "active", "good_morning", "state_lifetimes", "proactive_budget"}
         candidate = copy.deepcopy(self.storage.settings)
         for group, patch in body.items():
@@ -1468,6 +1567,41 @@ class PersonaCanvasPlugin(Star):
     async def web_resend_job(self, body):
         return await self._resend_job(body)
 
+    async def web_recover_job(self, body):
+        """Retrieve an existing workflow result; never submit or send a photo."""
+        self._track_current()
+        identifier = str(body.get("id") or "")
+        async with self._lock("recovery:" + identifier):
+            job = self.storage.job(identifier) or {}
+            if job.get("asset"):
+                self.storage.asset(job["asset"])
+                return {"ok": True, "job_id": identifier, "status": job["status"], "recovery_status": "completed", "generated": False, "image_saved": True, "reused": True, "note": "原图已保存，未重新生图或发送"}
+            record = job.get("recovery") or {}
+            if not record.get("prompt_id"):
+                raise ValueError("没有可靠的 ComfyUI 任务编号，无法查询原结果；不会自动重新提交")
+            if job.get("status") in {"queued", "deciding", "generating", "sending"}:
+                raise ValueError("原任务仍在本地执行，请等待结果或结束等待后再检查")
+            provider = self._provider(job.get("provider"))
+            recover = getattr(provider, "recover", None)
+            if not callable(recover):
+                raise ValueError("当前接口不支持原工作流结果查询")
+            result = await recover(record["prompt_id"], fingerprint=record.get("fingerprint", ""))
+            state = {**record, **getattr(provider, "last_recovery", {})}
+            phase = str(state.get("phase") or state.get("status") or "missing")
+            if result is None:
+                self.storage.update_job(identifier, {"recovery": state})
+                note = {"queued": "原工作流仍在排队", "running": "原工作流仍在执行", "missing": "尚未找到原任务结果；记录可能已清理，不代表未执行"}.get(phase, "尚无可取回图片")
+                return {"ok": True, "job_id": identifier, "status": job["status"], "recovery_status": phase, "generated": False, "image_saved": False, "note": note}
+            asset = self.storage.save_asset(result.data, result.extension)
+            current = self.storage.job(identifier)
+            updates = {"asset": asset.name, "model": result.model, "recovery": {**state, "phase": "completed", "saved": True}, "recovered": True, "delivery_blocked": True, "delivery_note": "已取回原工作流图片，仅供查看或下载；未更新视觉状态，未发送", "state_committed": False}
+            if current.get("status") != "cancelled" and not current.get("cancel_requested"):
+                updates.update(status="succeeded", phase="recovered", error="")
+            job = self.storage.update_job(identifier, updates)
+            self._photo_note(self._trace_job(identifier, "recovery", "completed", updates["delivery_note"]))
+            self.storage.append_history({"ok": True, "job_id": identifier, "image": "/assets/" + asset.name, "caption": job.get("caption", ""), "mode": job.get("mode", "persona"), "provider": job.get("provider"), "recovered": True})
+            return {"ok": True, "job_id": identifier, "status": job["status"], "recovery_status": "completed", "generated": False, "image_saved": True, "note": updates["delivery_note"]}
+
     async def _resend_job(self, body, *, event=None):
         identifier = str(body.get("id") or "")
         observed = self.storage.job(identifier) or {}
@@ -1514,6 +1648,8 @@ class PersonaCanvasPlugin(Star):
             raise ValueError("仅能重试已失败的生成任务；发送结果不确定时请先检查聊天记录")
         if old.get("cancel_requested"):
             raise ValueError("拍摄意愿已撤回，请在生图工作台重新提交，由角色重新判断")
+        if old.get("recovery", {}).get("submitted"):
+            raise ValueError("工作流可能已受理，请先检查原任务结果；再次绘图需作为新请求提交，不重复原任务")
         persona = copy.deepcopy(old["persona_snapshot"])
         session = self.storage.read_session(old["session_key"])
         if not session or session.get("persona_id") != persona["id"]:
@@ -1531,6 +1667,7 @@ class PersonaCanvasPlugin(Star):
             return {"job_id": pending["execution_job_id"], "status": existing.get("status"), "reused": True, "instruction": "原请求已有重试任务，不再重复提交"}
         persona["state"] = copy.deepcopy(session["state"])
         env = {"umo": old["umo"], "key": old["session_key"], "persona": persona, "session": session, "approved_requirements": old.get("requirements", {}), "approved_reference_assets": old.get("reference_assets", []), "request_basis": {"source": "model_tool" if event else "webui_retry", "summary": "用户明确重试失败任务 " + old["id"]}}
+        env.update(old.get("identity") or await self.dialogue.current_identity(old["umo"]))
         decision = {"decision": {"persona": "photo", "scene": "scene", "edit": "edit"}[old["mode"]], "prompt": old["request_prompt"], "reply": old["caption"], "state_patch": old["state_patch"]}
         result = await self._queue_job(env, decision, old["raw"], {**old.get("options", {}), "reference_asset": old.get("reference_asset", ""), "reference_source": old.get("reference_source", "explicit_reference"), "provider": old.get("provider", ""), "mode": old["mode"]}, event=event, retry_old=old)
         return result

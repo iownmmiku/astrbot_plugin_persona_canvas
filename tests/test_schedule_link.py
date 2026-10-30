@@ -71,7 +71,8 @@ class ScheduleLinkTests(unittest.IsolatedAsyncioTestCase):
                 self.context.llm.next = {"decision": "photo", "reply": "给你看看河边。", "prompt": "portrait at riverside", "state_patch": {}}
                 state = await self.deliver(scheduler, target, "active:" + status)
                 self.assertEqual(state["status"], "sent")
-                self.assertIn(schedule.state["prompt"], self.context.llm.calls[-1]["system_prompt"])
+                self.assertIn(schedule.state["prompt"], self.context.llm.calls[-1]["prompt"])
+                self.assertNotIn(schedule.state["prompt"], self.context.llm.calls[-1]["system_prompt"])
                 self.assertIn(schedule.state["prompt"], self.image_provider.calls[-1]["positive"])
                 self.assertIn("do not render this as text", self.image_provider.calls[-1]["positive"])
                 self.assertEqual(len(schedule.calls), 3)
