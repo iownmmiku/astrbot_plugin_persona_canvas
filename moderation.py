@@ -37,14 +37,23 @@ class Moderation:
         try:
             tz = ZoneInfo(tz_name)
         except ZoneInfoNotFoundError:
-            fallbacks = {"Asia/Shanghai": timezone(timedelta(hours=8)), "Asia/Hong_Kong": timezone(timedelta(hours=8)), "UTC": timezone.utc, "Etc/UTC": timezone.utc}
+            fallbacks = {
+                "Asia/Shanghai": timezone(timedelta(hours=8)),
+                "Asia/Hong_Kong": timezone(timedelta(hours=8)),
+                "UTC": timezone.utc,
+                "Etc/UTC": timezone.utc,
+            }
             if tz_name not in fallbacks:
                 raise ValueError("该时区在当前 Python 环境不可用")
             tz = fallbacks[tz_name]
         day = datetime.fromtimestamp(now, tz).strftime("%Y-%m-%d")
         with self._lock:
-            self._reservations = {token: record for token, record in self._reservations.items() if record["expires_at"] > now}
-            running = [record for record in self._reservations.values() if record["key"] == key and not record["is_admin"]]
+            self._reservations = {
+                token: record for token, record in self._reservations.items() if record["expires_at"] > now
+            }
+            running = [
+                record for record in self._reservations.values() if record["key"] == key and not record["is_admin"]
+            ]
             if not is_admin and limits.get("enabled", True):
                 if len(running) >= max(1, int(limits.get("max_concurrency", 1))):
                     return False, "已有图片正在生成", None
@@ -56,7 +65,15 @@ class Moderation:
                 if last and now - last < interval:
                     return False, "请稍后再拍摄", None
             token = secrets.token_hex(12)
-            lease = max(60, int(limits.get("reservation_timeout_sec", max(720, int(self.settings.get("generation", {}).get("timeout_sec", 180)) + 120))))
+            lease = max(
+                60,
+                int(
+                    limits.get(
+                        "reservation_timeout_sec",
+                        max(720, int(self.settings.get("generation", {}).get("timeout_sec", 180)) + 120),
+                    )
+                ),
+            )
             self._reservations[token] = {"key": key, "day": day, "is_admin": is_admin, "expires_at": now + lease}
             if not is_admin:
                 self._last[key] = now
@@ -71,7 +88,9 @@ class Moderation:
             return
         with self._lock:
             if token is None:
-                token = next((candidate for candidate, record in self._reservations.items() if record["key"] == key), None)
+                token = next(
+                    (candidate for candidate, record in self._reservations.items() if record["key"] == key), None
+                )
             record = self._reservations.get(token)
             if record is None or record["key"] != key:
                 return

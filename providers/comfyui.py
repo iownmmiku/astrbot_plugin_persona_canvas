@@ -3,6 +3,7 @@
 The workflow remains authoritative for checkpoints and unmapped inputs. Mapping
 paths address existing scalar inputs only; graph links are never overwritten.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +18,17 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from .base import (
-    GeneratedImage, ImageProvider, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, ProviderCapabilities,
-    ProviderError, _image_info, _integer, _number, _path_get, _path_set,
+    GeneratedImage,
+    ImageProvider,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGE_PIXELS,
+    ProviderCapabilities,
+    ProviderError,
+    _image_info,
+    _integer,
+    _number,
+    _path_get,
+    _path_set,
     _validate_field_paths,
 )
 
@@ -27,11 +37,24 @@ OPTION_FIELDS = WORKFLOW_FIELDS - {"prompt", "negative_prompt", "reference"}
 MAX_WORKFLOW_BYTES = 2 * 1024 * 1024
 # Explicit equivalents verified against comfy/samplers.py. Shared defaults use
 # NovelAI-style names; deliberate per-request values remain authoritative.
-SHARED_SAMPLER_ALIASES = {"k_" + name: name for name in (
-    "euler", "euler_ancestral", "dpm_2", "dpm_2_ancestral", "lms", "heun",
-    "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_2m",
-    "dpmpp_2m_sde", "dpmpp_3m_sde",
-)}
+SHARED_SAMPLER_ALIASES = {
+    "k_" + name: name
+    for name in (
+        "euler",
+        "euler_ancestral",
+        "dpm_2",
+        "dpm_2_ancestral",
+        "lms",
+        "heun",
+        "dpm_fast",
+        "dpm_adaptive",
+        "dpmpp_2s_ancestral",
+        "dpmpp_sde",
+        "dpmpp_2m",
+        "dpmpp_2m_sde",
+        "dpmpp_3m_sde",
+    )
+}
 
 
 class ComfyUIProvider(ImageProvider):
@@ -55,7 +78,9 @@ class ComfyUIProvider(ImageProvider):
             dimensions="仅写入 workflow_fields 已映射的宽高；其余沿用工作流",
             identity_reference="通过上传图片与工作流参考节点保持外观，效果取决于工作流",
             negative_mode=derived["negative_mode"],
-            negative_prompt_mode=("工作流独立负面输入：" + str(fields["negative_prompt"])) if fields.get("negative_prompt") else "未映射插件负面词，沿用工作流原有输入",
+            negative_prompt_mode=("工作流独立负面输入：" + str(fields["negative_prompt"]))
+            if fields.get("negative_prompt")
+            else "未映射插件负面词，沿用工作流原有输入",
             max_reference_images=1,
         )
 
@@ -83,7 +108,14 @@ class ComfyUIProvider(ImageProvider):
         if len(encoded) > MAX_WORKFLOW_BYTES or len(workflow) > 2000:
             raise ProviderError("ComfyUI 工作流超过 2 MB 或 2000 个节点")
         for node_id, node in workflow.items():
-            if not isinstance(node_id, str) or not node_id or not isinstance(node, dict) or not isinstance(node.get("class_type"), str) or not node["class_type"].strip() or not isinstance(node.get("inputs"), dict):
+            if (
+                not isinstance(node_id, str)
+                or not node_id
+                or not isinstance(node, dict)
+                or not isinstance(node.get("class_type"), str)
+                or not node["class_type"].strip()
+                or not isinstance(node.get("inputs"), dict)
+            ):
                 raise ProviderError("ComfyUI API 工作流每个节点必须包含 class_type 与 inputs")
         fields = self.config.get("workflow_fields")
         if not isinstance(fields, dict) or not fields.get("prompt"):
@@ -105,7 +137,9 @@ class ComfyUIProvider(ImageProvider):
                 raise ProviderError(f"ComfyUI 映射不能覆盖节点连接或对象：{key}")
             if key in {"prompt", "negative_prompt", "reference", "sampler"} and not isinstance(value, str):
                 raise ProviderError(f"ComfyUI 文本或参考图映射必须指向字符串输入：{key}")
-            if key in {"seed", "steps", "width", "height", "scale"} and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            if key in {"seed", "steps", "width", "height", "scale"} and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
                 raise ProviderError(f"ComfyUI 数值映射必须指向数字输入：{key}")
         output = self.config.get("output_node", "")
         if not isinstance(output, str) or output and output not in workflow:
@@ -118,9 +152,24 @@ class ComfyUIProvider(ImageProvider):
         name = value.get("name" if upload else "filename")
         folder = value.get("subfolder", "")
         kind = value.get("type", "input" if upload else "output")
-        if not isinstance(name, str) or not name or len(name) > 512 or name in {".", ".."} or any(char in name for char in ("/", "\\", "\0", ":")) or ".." in name:
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 512
+            or name in {".", ".."}
+            or any(char in name for char in ("/", "\\", "\0", ":"))
+            or ".." in name
+        ):
             raise ProviderError("ComfyUI 返回了无效图片文件名")
-        if not isinstance(folder, str) or len(folder) > 1024 or "\\" in folder or "\0" in folder or ":" in folder or folder.startswith("/") or any(part in {".", ".."} for part in folder.split("/")):
+        if (
+            not isinstance(folder, str)
+            or len(folder) > 1024
+            or "\\" in folder
+            or "\0" in folder
+            or ":" in folder
+            or folder.startswith("/")
+            or any(part in {".", ".."} for part in folder.split("/"))
+        ):
             raise ProviderError("ComfyUI 返回了无效图片子目录")
         if kind not in ({"input"} if upload else {"output", "temp"}):
             raise ProviderError("ComfyUI 返回了不受支持的图片目录类型")
@@ -138,7 +187,9 @@ class ComfyUIProvider(ImageProvider):
             raise ProviderError(f"ComfyUI {operation}失败，请检查工作流节点、模型及映射配置")
         return value
 
-    async def _json_request(self, method: str, route: str, body: dict | None = None, *, files: dict | None = None, operation: str) -> dict:
+    async def _json_request(
+        self, method: str, route: str, body: dict | None = None, *, files: dict | None = None, operation: str
+    ) -> dict:
         raw, _, _ = await self._http(method, self._comfy_url(route), body, files=files, limit=8 * 1024 * 1024)
         return self._comfy_json(raw, operation)
 
@@ -146,7 +197,9 @@ class ComfyUIProvider(ImageProvider):
         if not prompt_id:
             return
         try:
-            await asyncio.wait_for(self._http("POST", self._comfy_url("/queue"), {"delete": [prompt_id]}, limit=1024 * 1024), timeout=2)
+            await asyncio.wait_for(
+                self._http("POST", self._comfy_url("/queue"), {"delete": [prompt_id]}, limit=1024 * 1024), timeout=2
+            )
         except (Exception, asyncio.CancelledError):
             # Older ComfyUI versions only remove queued work; never interrupt all.
             pass
@@ -158,7 +211,8 @@ class ComfyUIProvider(ImageProvider):
         Authentication rotation and timeout changes do not change the binding.
         """
         value = {
-            "version": 1, "provider": self.name,
+            "version": 1,
+            "provider": self.name,
             "endpoint": str(self.config.get("endpoint") or "").strip().rstrip("/"),
             "workflow": self.config.get("workflow"),
             "fields": self.config.get("workflow_fields"),
@@ -175,9 +229,13 @@ class ComfyUIProvider(ImageProvider):
 
     async def _progress(self, phase: str, prompt_id: str = "") -> None:
         record = {
-            "kind": "comfyui", "provider": self.name, "prompt_id": prompt_id,
-            "fingerprint": self.recovery_fingerprint(), "phase": phase,
-            "submitted": True, "upstream_accepted": bool(prompt_id),
+            "kind": "comfyui",
+            "provider": self.name,
+            "prompt_id": prompt_id,
+            "fingerprint": self.recovery_fingerprint(),
+            "phase": phase,
+            "submitted": True,
+            "upstream_accepted": bool(prompt_id),
         }
         self.last_recovery = record
         self.last_request.update(submitted=True, upstream_accepted=bool(prompt_id), recovery=copy.deepcopy(record))
@@ -235,26 +293,36 @@ class ComfyUIProvider(ImageProvider):
         """
         self.validate_config()
         prompt_id = self._prompt_id(prompt_id)
-        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint) or not secrets.compare_digest(fingerprint, self.recovery_fingerprint()):
+        if (
+            not isinstance(fingerprint, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            or not secrets.compare_digest(fingerprint, self.recovery_fingerprint())
+        ):
             raise ProviderError("ComfyUI 接口或工作流已改变，请恢复原任务配置后再检查结果")
         self.last_request = {}
 
         async def inspect_result():
             image = await self._history_image(prompt_id)
             if image is not None:
-                return await self._fetch_image(prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流"))
+                return await self._fetch_image(
+                    prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流")
+                )
             phase = await self._queue_phase(prompt_id)
             if phase == "missing":
                 # Completion can move a prompt from queue to history between
                 # the two reads. Recheck once before reporting it unavailable.
                 image = await self._history_image(prompt_id)
                 if image is not None:
-                    return await self._fetch_image(prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流"))
+                    return await self._fetch_image(
+                        prompt_id, image, str(self.config.get("model") or self.name or "ComfyUI 工作流")
+                    )
             await self._progress(phase, prompt_id)
             return None
 
         try:
-            return await asyncio.wait_for(inspect_result(), timeout=_integer(self.config.get("timeout", 180), "超时", 5, 600))
+            return await asyncio.wait_for(
+                inspect_result(), timeout=_integer(self.config.get("timeout", 180), "超时", 5, 600)
+            )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise ProviderError("ComfyUI 原任务查询超时，未重新提交或取消任务") from exc
 
@@ -268,10 +336,10 @@ class ComfyUIProvider(ImageProvider):
                 raise ProviderError("ComfyUI 随机种子必须为 -1 或 uint64 整数")
             if isinstance(value, int) or isinstance(value, str) and re.fullmatch(r"-?\d+", value):
                 number = int(value)
-                if not -1 <= number <= 2 ** 64 - 1:
+                if not -1 <= number <= 2**64 - 1:
                     raise ProviderError("ComfyUI 随机种子超出支持范围")
             else:
-                number = _integer(value, "随机种子", -1, 2 ** 64 - 1)
+                number = _integer(value, "随机种子", -1, 2**64 - 1)
             return secrets.randbits(63) if randomize and number == -1 else number
         if key == "steps":
             return _integer(value, "采样步数", 1, 1000)
@@ -292,7 +360,10 @@ class ComfyUIProvider(ImageProvider):
         messages = status.get("messages", []) if isinstance(status, dict) else []
         if not isinstance(messages, list):
             raise ProviderError("ComfyUI 执行消息格式错误")
-        failed = status.get("status_str") in {"error", "failed", "interrupted"} or any(isinstance(item, (list, tuple)) and item and item[0] in {"execution_error", "execution_interrupted"} for item in messages)
+        failed = status.get("status_str") in {"error", "failed", "interrupted"} or any(
+            isinstance(item, (list, tuple)) and item and item[0] in {"execution_error", "execution_interrupted"}
+            for item in messages
+        )
         if failed:
             raise ProviderError("ComfyUI 工作流执行失败或被中断，请检查本地节点与模型日志")
         outputs = history.get("outputs", {})
@@ -310,7 +381,9 @@ class ComfyUIProvider(ImageProvider):
             raise ProviderError("ComfyUI 已完成但没有图片输出，请检查 SaveImage/PreviewImage 与 output_node")
         return None
 
-    def _prepare_generation(self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False) -> dict:
+    def _prepare_generation(
+        self, prompt: str, negative_prompt: str, *, reference=None, options=None, randomize: bool = False
+    ) -> dict:
         supplied = copy.deepcopy(options) if isinstance(options, dict) else options
         if isinstance(supplied, dict):
             explicit = supplied.get("_explicit", [])
@@ -345,15 +418,40 @@ class ComfyUIProvider(ImageProvider):
                 raise ProviderError("ComfyUI 映射的图片尺寸超过 3600 万像素限制")
         negative_field = str(fields.get("negative_prompt") or "")
         model = str(self.config.get("model") or self.name or "ComfyUI 工作流")
-        return {"workflow": workflow, "fields": fields, "prompt": prompt, "model": model, "options": actual_options, "negative_field": negative_field, "notes": notes}
+        return {
+            "workflow": workflow,
+            "fields": fields,
+            "prompt": prompt,
+            "model": model,
+            "options": actual_options,
+            "negative_field": negative_field,
+            "notes": notes,
+        }
 
-    async def generate(self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict[str, Any] | None = None) -> GeneratedImage:
+    async def generate(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        *,
+        reference: bytes | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> GeneratedImage:
         self.last_request = {}
         self.last_recovery = {}
-        prepared = self._prepare_generation(prompt, negative_prompt, reference=reference, options=options, randomize=True)
+        prepared = self._prepare_generation(
+            prompt, negative_prompt, reference=reference, options=options, randomize=True
+        )
         workflow, fields, model = prepared["workflow"], prepared["fields"], prepared["model"]
         negative_field = prepared["negative_field"]
-        self._record_request(prepared["prompt"], _path_get(workflow, negative_field) if negative_field else "", model, prepared["options"], reference, negative_field=negative_field, notes=prepared["notes"])
+        self._record_request(
+            prepared["prompt"],
+            _path_get(workflow, negative_field) if negative_field else "",
+            model,
+            prepared["options"],
+            reference,
+            negative_field=negative_field,
+            notes=prepared["notes"],
+        )
         self.last_request["submitted"] = False
         self.last_request["output_node"] = str(self.config.get("output_node") or "")
         state = {"prompt_id": ""}
@@ -361,11 +459,22 @@ class ComfyUIProvider(ImageProvider):
         async def run() -> GeneratedImage:
             if reference is not None:
                 data = reference[0] if isinstance(reference, list) else reference
-                uploaded = await self._json_request("POST", "/upload/image", {"type": "input", "subfolder": "persona_canvas", "overwrite": "false"}, files={"image": data}, operation="上传参考图")
+                uploaded = await self._json_request(
+                    "POST",
+                    "/upload/image",
+                    {"type": "input", "subfolder": "persona_canvas", "overwrite": "false"},
+                    files={"image": data},
+                    operation="上传参考图",
+                )
                 name, folder, _ = self._file_descriptor(uploaded, upload=True)
                 _path_set(workflow, fields["reference"], f"{folder}/{name}" if folder else name)
             await self._progress("submitting")
-            submitted = await self._json_request("POST", "/prompt", {"prompt": workflow, "client_id": "persona-canvas-" + secrets.token_hex(12)}, operation="提交工作流")
+            submitted = await self._json_request(
+                "POST",
+                "/prompt",
+                {"prompt": workflow, "client_id": "persona-canvas-" + secrets.token_hex(12)},
+                operation="提交工作流",
+            )
             prompt_id = submitted.get("prompt_id")
             if not isinstance(prompt_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", prompt_id):
                 raise ProviderError("ComfyUI 提交响应缺少有效 prompt_id")
@@ -397,7 +506,11 @@ class ComfyUIProvider(ImageProvider):
 
     async def list_models(self) -> dict[str, Any]:
         self.validate_config()
-        return {"models": [str(self.config.get("model") or self.name)], "automatic": False, "note": "ComfyUI 模型由工作流节点决定；此名称仅用于标记工作流"}
+        return {
+            "models": [str(self.config.get("model") or self.name)],
+            "automatic": False,
+            "note": "ComfyUI 模型由工作流节点决定；此名称仅用于标记工作流",
+        }
 
     async def test_connection(self) -> dict[str, Any]:
         started = time.monotonic()
@@ -408,7 +521,9 @@ class ComfyUIProvider(ImageProvider):
             required = {node["class_type"] for node in self.config["workflow"].values()}
             if required - set(nodes):
                 raise ProviderError("ComfyUI 缺少工作流需要的节点，请安装相应自定义节点后重试")
-            result.update(ok=True, status_code=200, message="ComfyUI 可达且工作流节点齐全；模型文件与生成效果仍需执行测试图")
+            result.update(
+                ok=True, status_code=200, message="ComfyUI 可达且工作流节点齐全；模型文件与生成效果仍需执行测试图"
+            )
         except Exception as exc:
             result["message"] = self._safe_error(exc)
         result["elapsed_ms"] = int((time.monotonic() - started) * 1000)

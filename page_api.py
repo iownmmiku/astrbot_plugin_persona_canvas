@@ -19,19 +19,35 @@ _ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,180}$")
 
 GET_ROUTES = {
     "diagnostics": "web_diagnostics",
-    "state": "web_state", "personas": "web_personas", "providers": "web_providers",
-    "targets": "web_targets", "history": "web_history", "sessions": "web_sessions",
-    "jobs": "web_jobs", "llm/providers": "_llm_providers", "export": "web_export",
+    "state": "web_state",
+    "personas": "web_personas",
+    "providers": "web_providers",
+    "targets": "web_targets",
+    "history": "web_history",
+    "sessions": "web_sessions",
+    "jobs": "web_jobs",
+    "llm/providers": "_llm_providers",
+    "export": "web_export",
 }
 POST_ROUTES = {
-    "jobs/cancel": "web_cancel_job", "jobs/resend": "web_resend_job",
-    "jobs/query": "web_jobs_query", "history/query": "web_history_query", "jobs/recover": "web_recover_job",
+    "jobs/cancel": "web_cancel_job",
+    "jobs/resend": "web_resend_job",
+    "jobs/query": "web_jobs_query",
+    "history/query": "web_history_query",
+    "jobs/recover": "web_recover_job",
     "targets/inspect": "web_inspect_target",
-    "settings": "web_save_settings", "personas": "web_save_persona",
-    "personas/delete": "web_delete_persona", "providers": "web_save_provider",
-    "providers/delete": "web_delete_provider", "targets": "web_target_action",
-    "generate": "web_generate", "jobs/retry": "web_retry_job", "llm/test": "_test_llm",
-    "image/models": "_image_models", "image/test": "_image_test", "simulate": "web_simulate",
+    "settings": "web_save_settings",
+    "personas": "web_save_persona",
+    "personas/delete": "web_delete_persona",
+    "providers": "web_save_provider",
+    "providers/delete": "web_delete_provider",
+    "targets": "web_target_action",
+    "generate": "web_generate",
+    "jobs/retry": "web_retry_job",
+    "llm/test": "_test_llm",
+    "image/models": "_image_models",
+    "image/test": "_image_test",
+    "simulate": "web_simulate",
 }
 
 
@@ -53,7 +69,14 @@ def public_error(plugin, exc: Exception) -> str:
 
 
 def asset_path(plugin, name: str) -> Path:
-    if not _ASSET_NAME.fullmatch(name) or Path(name).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}:
+    if not _ASSET_NAME.fullmatch(name) or Path(name).suffix.lower() not in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".avif",
+    }:
         raise ValueError("资源路径无效")
     root = plugin.storage.assets.resolve()
     path = (root / name).resolve()
@@ -90,6 +113,7 @@ def image_data_url(plugin, name: str, thumbnail: bool = False) -> str:
                 cache.move_to_end(name)
                 return cached[1]
             from PIL import Image, ImageOps
+
             with Image.open(path) as source:
                 picture = ImageOps.exif_transpose(source).convert("RGB")
                 picture.thumbnail((384, 384))
@@ -98,7 +122,10 @@ def image_data_url(plugin, name: str, thumbnail: bool = False) -> str:
                 result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
             cache[name] = (descriptor["version"], result)
             cache.move_to_end(name)
-            while cache and (len(cache) > THUMBNAIL_CACHE_ENTRIES or sum(len(item[1]) for item in cache.values()) > THUMBNAIL_CACHE_BYTES):
+            while cache and (
+                len(cache) > THUMBNAIL_CACHE_ENTRIES
+                or sum(len(item[1]) for item in cache.values()) > THUMBNAIL_CACHE_BYTES
+            ):
                 cache.popitem(last=False)
             return result
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -116,7 +143,11 @@ async def dispatch_api(plugin, method: str, path: str, body: dict | None = None)
         return await plugin.web_job(path.removeprefix("jobs/"))
     if method == "GET" and path.startswith("reference/preview/"):
         name = path.removeprefix("reference/preview/")
-        return {"asset": name, "image": image_data_url(plugin, name, thumbnail=True), "thumbnail": preview_descriptor(plugin, name)}
+        return {
+            "asset": name,
+            "image": image_data_url(plugin, name, thumbnail=True),
+            "thumbnail": preview_descriptor(plugin, name),
+        }
     routes = GET_ROUTES if method == "GET" else POST_ROUTES
     callback = routes.get(path)
     if callback is None:
@@ -130,10 +161,18 @@ def _web_adapter():
     """Legacy AstrBot can load the plugin without the new api.web module."""
     try:
         from astrbot.api.web import error_response, file_response, json_response, request
+
         return request, json_response, error_response, file_response, True
     except ImportError:
         from quart import jsonify, request, send_file
-        return request, jsonify, lambda message, status_code=400: (jsonify({"status": "error", "message": message}), status_code), send_file, False
+
+        return (
+            request,
+            jsonify,
+            lambda message, status_code=400: (jsonify({"status": "error", "message": message}), status_code),
+            send_file,
+            False,
+        )
 
 
 class CanvasPageApi:
@@ -167,6 +206,7 @@ class CanvasPageApi:
                 return error(public_error(self.plugin, exc), status_code=404)
             except Exception as exc:
                 return error(public_error(self.plugin, exc), status_code=400)
+
         handler.__name__ = "canvas_" + suffix.replace("/", "_")
         return handler
 
@@ -185,7 +225,13 @@ class CanvasPageApi:
             if not name and modern:
                 name = str(request.path_params.get("name") or "")
             asset_path(self.plugin, name)
-            return jsonify({"asset": name, "image": image_data_url(self.plugin, name, thumbnail=True), "thumbnail": preview_descriptor(self.plugin, name)})
+            return jsonify(
+                {
+                    "asset": name,
+                    "image": image_data_url(self.plugin, name, thumbnail=True),
+                    "thumbnail": preview_descriptor(self.plugin, name),
+                }
+            )
         except Exception as exc:
             return error(public_error(self.plugin, exc), status_code=404)
 

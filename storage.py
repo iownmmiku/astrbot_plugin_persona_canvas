@@ -21,38 +21,131 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 SCHEMA_VERSION = 5
 OLD_PLUGIN_NAME = "astrbot_plugin_persona_studio"
 DEFAULT_PERSONA = {
-    "id": "default", "name": "默认人设", "description": "",
-    "astrbot_persona_id": "", "consent_prompt": "", "positive_prompt": "",
+    "id": "default",
+    "name": "默认人设",
+    "description": "",
+    "astrbot_persona_id": "",
+    "consent_prompt": "",
+    "positive_prompt": "",
     "negative_prompt": "lowres, worst quality, bad quality, blurry, bad anatomy, bad hands, watermark, logo, signature",
     "style_prompt": "anime illustration, clean lineart, soft shading",
     "state": {"outfit": "", "pose": "", "expression": "", "scene": ""},
     "outfit_pool": ["white shirt and pleated skirt", "casual hoodie", "summer dress"],
-    "reference_enabled": False, "reference_asset": "", "reference_assets": [], "reference_path": "",
-    "created_at": 0, "updated_at": 0,
+    "reference_enabled": False,
+    "reference_asset": "",
+    "reference_assets": [],
+    "reference_path": "",
+    "created_at": 0,
+    "updated_at": 0,
 }
 DEFAULT_PROVIDER = {
-    "name": "default", "kind": "openai", "endpoint": "", "model": "", "api_key": "",
-    "auth_header": "Authorization", "auth_prefix": "Bearer ", "extra_body": {},
-    "response_path": "", "supports_image_edit": False, "negative_prompt": True,
+    "name": "default",
+    "kind": "openai",
+    "endpoint": "",
+    "model": "",
+    "api_key": "",
+    "auth_header": "Authorization",
+    "auth_prefix": "Bearer ",
+    "extra_body": {},
+    "response_path": "",
+    "supports_image_edit": False,
+    "negative_prompt": True,
 }
 DEFAULT_SETTINGS = {
-    "current_persona": "default", "default_provider": "default",
+    "current_persona": "default",
+    "default_provider": "default",
     "llm": {"provider_id": "", "model": "", "fallback_to_current": True, "timeout_sec": 45},
     "integration": {"enabled": True, "mode": "native_tools", "strict_trigger": True},
     "dialogue": {"enabled": True, "timeout_sec": 60, "context_turns": 12, "confirmation_ttl_sec": 1800},
-    "reply_images": {"enabled": False, "default_probability": 20, "min_interval_sec": 300, "max_wait_sec": 30, "provider": ""},
+    "reply_images": {
+        "enabled": False,
+        "default_probability": 20,
+        "min_interval_sec": 300,
+        "max_wait_sec": 30,
+        "provider": "",
+    },
     "state_lifetimes": {"outfit_sec": 0, "pose_sec": 1800, "expression_sec": 1800, "scene_sec": 14400},
     "proactive_budget": {"messages": 10, "photos": 2, "llm": 24, "timezone": "Asia/Shanghai"},
     "providers": {"default": DEFAULT_PROVIDER},
-    "moderation": {"enabled": True, "daily_limit": 5, "min_interval_sec": 20, "max_concurrency": 1, "timezone": "Asia/Shanghai"},
-    "active": {"enabled": False, "check_interval_sec": 30, "max_concurrent_targets": 3, "default_start": "09:00", "default_end": "22:00", "min_gap_sec": 3600, "min_idle_sec": 1800, "timezone": "Asia/Shanghai", "silence_after": 3, "silence_hours": 24, "jitter_percent": 15},
-    "good_morning": {"enabled": False, "start": "07:00", "end": "10:00", "timezone": "Asia/Shanghai", "max_attempts": 3, "retry_interval_sec": 900, "image_mode": "prefer_photo"},
-    "generation": {"width": 832, "height": 1216, "steps": 28, "scale": 5, "sampler": "k_euler_ancestral", "seed": -1, "max_history": 100, "max_concurrency": 2, "timeout_sec": 180},
+    "moderation": {
+        "enabled": True,
+        "daily_limit": 5,
+        "min_interval_sec": 20,
+        "max_concurrency": 1,
+        "timezone": "Asia/Shanghai",
+    },
+    "active": {
+        "enabled": False,
+        "check_interval_sec": 30,
+        "max_concurrent_targets": 3,
+        "default_start": "09:00",
+        "default_end": "22:00",
+        "min_gap_sec": 3600,
+        "min_idle_sec": 1800,
+        "timezone": "Asia/Shanghai",
+        "silence_after": 3,
+        "silence_hours": 24,
+        "jitter_percent": 15,
+    },
+    "good_morning": {
+        "enabled": False,
+        "start": "07:00",
+        "end": "10:00",
+        "timezone": "Asia/Shanghai",
+        "max_attempts": 3,
+        "retry_interval_sec": 900,
+        "image_mode": "prefer_photo",
+    },
+    "generation": {
+        "width": 832,
+        "height": 1216,
+        "steps": 28,
+        "scale": 5,
+        "sampler": "k_euler_ancestral",
+        "seed": -1,
+        "max_history": 100,
+        "max_concurrency": 2,
+        "timeout_sec": 180,
+    },
 }
-JOB_STATUSES = frozenset({"queued", "deciding", "generating", "succeeded", "failed", "sending", "sent", "uncertain", "delivery_failed", "cancelled"})
-DELIVERY_STATUSES = frozenset({"claimed", "decided", "skipped", "generating", "sending", "sent", "failed", "uncertain", "delivery_failed"})
+JOB_STATUSES = frozenset(
+    {
+        "queued",
+        "deciding",
+        "generating",
+        "succeeded",
+        "failed",
+        "sending",
+        "sent",
+        "uncertain",
+        "delivery_failed",
+        "cancelled",
+    }
+)
+DELIVERY_STATUSES = frozenset(
+    {"claimed", "decided", "skipped", "generating", "sending", "sent", "failed", "uncertain", "delivery_failed"}
+)
 _LEGACY_FILES = ("personas.json", "settings.json", "targets.json", "history.jsonl", "runtime.json", "webui_token.txt")
-_SECRET_KEYS = frozenset({"api_key", "apikey", "api_token", "authorization", "auth", "auth_key", "auth_token", "auth_value", "access_token", "refresh_token", "bearer_token", "token", "secret", "client_secret", "password", "x_api_key"})
+_SECRET_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "api_token",
+        "authorization",
+        "auth",
+        "auth_key",
+        "auth_token",
+        "auth_value",
+        "access_token",
+        "refresh_token",
+        "bearer_token",
+        "token",
+        "secret",
+        "client_secret",
+        "password",
+        "x_api_key",
+    }
+)
 _ASSET_SUFFIXES = frozenset({"png", "jpg", "jpeg", "webp", "gif", "avif", "bin"})
 
 
@@ -67,6 +160,7 @@ class StorageConflictError(StorageError):
 def _data_dir() -> Path:
     try:
         from astrbot.api.star import StarTools
+
         return Path(StarTools.get_data_dir("astrbot_plugin_persona_canvas"))
     except (ImportError, AttributeError):
         return Path(__file__).resolve().parent / "data"
@@ -75,6 +169,7 @@ def _data_dir() -> Path:
 def _legacy_data_dir() -> Path | None:
     try:
         from astrbot.api.star import StarTools
+
         return Path(StarTools.get_data_dir(OLD_PLUGIN_NAME))
     except (ImportError, AttributeError):
         return Path(__file__).resolve().parent.parent / OLD_PLUGIN_NAME / "data"
@@ -84,7 +179,11 @@ def _merge(base: dict[str, Any], incoming: Any) -> dict[str, Any]:
     result = copy.deepcopy(base)
     if isinstance(incoming, dict):
         for key, value in incoming.items():
-            result[key] = _merge(result[key], value) if isinstance(result.get(key), dict) and isinstance(value, dict) else copy.deepcopy(value)
+            result[key] = (
+                _merge(result[key], value)
+                if isinstance(result.get(key), dict) and isinstance(value, dict)
+                else copy.deepcopy(value)
+            )
     return result
 
 
@@ -259,7 +358,10 @@ class Storage:
             for name, value in documents.items():
                 self._write_document(name, value)
             for item in history:
-                self._db.execute("INSERT INTO history(at,payload) VALUES(?,?)", (self._timestamp(item.get("at")), _json(self._scrub_known_secrets(item))))
+                self._db.execute(
+                    "INSERT INTO history(at,payload) VALUES(?,?)",
+                    (self._timestamp(item.get("at")), _json(self._scrub_known_secrets(item))),
+                )
 
     @staticmethod
     def _timestamp(value: Any) -> float:
@@ -276,7 +378,10 @@ class Storage:
             raise StorageError("数据库已关闭")
 
     def _write_document(self, name: str, value: dict[str, Any]) -> None:
-        self._db.execute("INSERT INTO documents(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", (name, _json(value)))
+        self._db.execute(
+            "INSERT INTO documents(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
+            (name, _json(value)),
+        )
 
     def _read_document(self, name: str) -> dict[str, Any]:
         row = self._db.execute("SELECT payload FROM documents WHERE name=?", (name,)).fetchone()
@@ -326,7 +431,19 @@ class Storage:
 
     @staticmethod
     def _validate_settings(value: dict[str, Any]) -> None:
-        for key in ("providers", "llm", "integration", "dialogue", "reply_images", "moderation", "active", "good_morning", "generation", "state_lifetimes", "proactive_budget"):
+        for key in (
+            "providers",
+            "llm",
+            "integration",
+            "dialogue",
+            "reply_images",
+            "moderation",
+            "active",
+            "good_morning",
+            "generation",
+            "state_lifetimes",
+            "proactive_budget",
+        ):
             if not isinstance(value.get(key), dict):
                 raise StorageError(f"设置中的 {key} 格式无效；原数据已保留")
         if any(not isinstance(provider, dict) for provider in value["providers"].values()):
@@ -348,7 +465,10 @@ class Storage:
             # Serialise all records first; an invalid record cannot save a subset.
             values = [(name, _json(getattr(self, name))) for name in ("personas", "settings", "targets", "runtime")]
             with self._db:
-                self._db.executemany("INSERT INTO documents(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload", values)
+                self._db.executemany(
+                    "INSERT INTO documents(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
+                    values,
+                )
 
     def _save_facade(self, name: str) -> None:
         with self._lock:
@@ -392,11 +512,17 @@ class Storage:
             if item.get("reference_asset"):
                 self.asset(str(item["reference_asset"]))
             references = item.get("reference_assets", [])
-            if not isinstance(references, list) or len(references) > 8 or any(not isinstance(name, str) for name in references):
+            if (
+                not isinstance(references, list)
+                or len(references) > 8
+                or any(not isinstance(name, str) for name in references)
+            ):
                 raise StorageError("参考图列表最多包含 8 张图片")
             for name in references:
                 self.asset(name)
-            item["reference_assets"] = list(dict.fromkeys(([item["reference_asset"]] if item.get("reference_asset") else []) + references))
+            item["reference_assets"] = list(
+                dict.fromkeys(([item["reference_asset"]] if item.get("reference_asset") else []) + references)
+            )
             if len(item["reference_assets"]) > 8:
                 raise StorageError("参考图库包含主图在内最多 8 张")
             updated = copy.deepcopy(self.personas)
@@ -436,10 +562,22 @@ class Storage:
             return True
 
     def _new_session(self, umo: str, persona_id: str) -> dict[str, Any]:
-        return {"umo": umo, "persona_id": persona_id, "state": copy.deepcopy(self.persona(persona_id).get("state") or DEFAULT_PERSONA["state"]), "last_image": "", "pending": None, "last_context": [], "revision": 0, "updated_at": time.time()}
+        return {
+            "umo": umo,
+            "persona_id": persona_id,
+            "state": copy.deepcopy(self.persona(persona_id).get("state") or DEFAULT_PERSONA["state"]),
+            "last_image": "",
+            "pending": None,
+            "last_context": [],
+            "revision": 0,
+            "updated_at": time.time(),
+        }
 
     def _write_session(self, value: dict[str, Any]) -> None:
-        self._db.execute("INSERT INTO sessions(umo,updated_at,payload) VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET updated_at=excluded.updated_at,payload=excluded.payload", (value["umo"], value["updated_at"], _json(value)))
+        self._db.execute(
+            "INSERT INTO sessions(umo,updated_at,payload) VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET updated_at=excluded.updated_at,payload=excluded.payload",
+            (value["umo"], value["updated_at"], _json(value)),
+        )
 
     def read_session(self, umo: str) -> dict[str, Any] | None:
         """Read the current snapshot without creating or switching a persona."""
@@ -482,7 +620,11 @@ class Storage:
             try:
                 self._db.execute("BEGIN IMMEDIATE")
                 row = self._db.execute("SELECT payload FROM sessions WHERE umo=?", (umo,)).fetchone()
-                current = _decoded(row["payload"], "session") if row else self._new_session(umo, str(value.get("persona_id") or self.settings["current_persona"]))
+                current = (
+                    _decoded(row["payload"], "session")
+                    if row
+                    else self._new_session(umo, str(value.get("persona_id") or self.settings["current_persona"]))
+                )
                 if "revision" in value and int(value["revision"]) != int(current["revision"]):
                     raise StorageConflictError("会话状态已更新，请重新读取后再试")
                 # Pending requests and context are replaced, while a partial
@@ -507,19 +649,26 @@ class Storage:
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
             self._check_open()
-            return [_decoded(row["payload"], "session") for row in self._db.execute("SELECT payload FROM sessions ORDER BY updated_at DESC")]
+            return [
+                _decoded(row["payload"], "session")
+                for row in self._db.execute("SELECT payload FROM sessions ORDER BY updated_at DESC")
+            ]
 
     def claim_photo_request(self, session_key: str, persona_id: str, request_id: str, job_id: str) -> dict[str, Any]:
         """Claim an agreed request once; failures retain the original job claim."""
         return self._claim_photo_request(session_key, persona_id, request_id, job_id)
 
-    def rebind_photo_request(self, session_key: str, persona_id: str, request_id: str, old_job_id: str, new_job_id: str) -> dict[str, Any]:
+    def rebind_photo_request(
+        self, session_key: str, persona_id: str, request_id: str, old_job_id: str, new_job_id: str
+    ) -> dict[str, Any]:
         """Explicitly retry an existing failure without reopening normal consent."""
         if not old_job_id or old_job_id == new_job_id:
             raise StorageConflictError("重试任务必须对应原来的失败拍摄")
         return self._claim_photo_request(session_key, persona_id, request_id, new_job_id, old_job_id=old_job_id)
 
-    def _claim_photo_request(self, session_key: str, persona_id: str, request_id: str, job_id: str, *, old_job_id: str = "") -> dict[str, Any]:
+    def _claim_photo_request(
+        self, session_key: str, persona_id: str, request_id: str, job_id: str, *, old_job_id: str = ""
+    ) -> dict[str, Any]:
         if not all(isinstance(item, str) and item for item in (session_key, persona_id, request_id, job_id)):
             raise StorageConflictError("拍摄确认标识不能为空")
         with self._lock:
@@ -528,7 +677,15 @@ class Storage:
                 self._db.execute("BEGIN IMMEDIATE")
                 session = self.read_session(session_key)
                 pending = (session or {}).get("pending") or {}
-                if not session or session.get("persona_id") != persona_id or not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo":
+                if (
+                    not session
+                    or session.get("persona_id") != persona_id
+                    or not isinstance(pending, dict)
+                    or pending.get("session_key") != session_key
+                    or pending.get("persona_id") != persona_id
+                    or pending.get("request_id") != request_id
+                    or pending.get("request_kind") != "photo"
+                ):
                     raise StorageConflictError("拍摄条件已经更新，请重新确认当前条件")
                 if not old_job_id and self._timestamp(pending.get("expires_at")) <= time.time():
                     raise StorageConflictError("拍摄条件已经过期，请重新确认")
@@ -538,13 +695,23 @@ class Storage:
                         self._db.commit()
                         return {"claimed": False, "job_id": job_id, "session": session}
                     old = self.job(old_job_id)
-                    if execution_job_id != old_job_id or not old or old.get("status") not in {"failed", "cancelled"} or old.get("cancel_requested"):
+                    if (
+                        execution_job_id != old_job_id
+                        or not old
+                        or old.get("status") not in {"failed", "cancelled"}
+                        or old.get("cancel_requested")
+                    ):
                         raise StorageConflictError("原拍摄不能重试；撤回或条件变化后需要重新判断")
                 elif execution_job_id:
                     self._db.commit()
                     return {"claimed": False, "job_id": execution_job_id, "session": session}
                 job = self.job(job_id)
-                if not job or job.get("status") != "queued" or job.get("session_key") != session_key or job.get("persona_id") != persona_id:
+                if (
+                    not job
+                    or job.get("status") != "queued"
+                    or job.get("session_key") != session_key
+                    or job.get("persona_id") != persona_id
+                ):
                     raise StorageConflictError("拍摄任务与当前确认条件不一致")
                 pending["execution_job_id"] = job_id
                 session["pending"] = pending
@@ -578,7 +745,12 @@ class Storage:
                 session = self.read_session(session_key) if session_key else None
                 if not session or session.get("persona_id") != persona_id:
                     raise StorageConflictError("会话角色已经更新，请重新判断拍摄请求")
-                if not candidate or candidate.get("status") != "queued" or candidate.get("session_key") != session_key or candidate.get("persona_id") != persona_id:
+                if (
+                    not candidate
+                    or candidate.get("status") != "queued"
+                    or candidate.get("session_key") != session_key
+                    or candidate.get("persona_id") != persona_id
+                ):
                     raise StorageConflictError("重试任务与原来的拍摄不一致")
                 pending, request_id = session.get("pending"), str(old.get("confirmed_request_id") or "")
                 selected = self.job(str(old.get("retry_job_id") or ""))
@@ -588,14 +760,34 @@ class Storage:
                     if selected.get("session_key") != session_key or selected.get("persona_id") != persona_id:
                         raise StorageConflictError("已有重试任务与当前会话不一致")
                     if pending:
-                        if not request_id or not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo" or pending.get("execution_job_id") != selected["id"]:
+                        if (
+                            not request_id
+                            or not isinstance(pending, dict)
+                            or pending.get("session_key") != session_key
+                            or pending.get("persona_id") != persona_id
+                            or pending.get("request_id") != request_id
+                            or pending.get("request_kind") != "photo"
+                            or pending.get("execution_job_id") != selected["id"]
+                        ):
                             raise StorageConflictError("拍摄条件已经更新，请重新确认当前条件")
-                    elif request_id and selected.get("status") not in {"succeeded", "sending", "sent", "uncertain", "delivery_failed"}:
+                    elif request_id and selected.get("status") not in {
+                        "succeeded",
+                        "sending",
+                        "sent",
+                        "uncertain",
+                        "delivery_failed",
+                    }:
                         raise StorageConflictError("拍摄条件已经撤回，请重新确认当前条件")
                     self._db.commit()
                     return {"claimed": False, "job_id": selected["id"], "job": selected, "session": session}
                 if request_id:
-                    if not isinstance(pending, dict) or pending.get("session_key") != session_key or pending.get("persona_id") != persona_id or pending.get("request_id") != request_id or pending.get("request_kind") != "photo":
+                    if (
+                        not isinstance(pending, dict)
+                        or pending.get("session_key") != session_key
+                        or pending.get("persona_id") != persona_id
+                        or pending.get("request_id") != request_id
+                        or pending.get("request_kind") != "photo"
+                    ):
                         raise StorageConflictError("拍摄条件已经更新或撤回，请重新确认当前条件")
                 elif pending:
                     raise StorageConflictError("当前有新的拍摄条件，请先处理当前请求")
@@ -605,14 +797,21 @@ class Storage:
                 old.update(retry_job_id=new_job_id, updated_at=now)
                 candidate.update(retry_of=old_job_id, confirmed_request_id=request_id, updated_at=now)
                 for item in (old, candidate):
-                    self._db.execute("UPDATE jobs SET updated_at=?,payload=? WHERE id=?", (now, _json(item), item["id"]))
+                    self._db.execute(
+                        "UPDATE jobs SET updated_at=?,payload=? WHERE id=?", (now, _json(item), item["id"])
+                    )
                 if request_id:
                     pending["execution_job_id"] = new_job_id
                     session["revision"] = int(session.get("revision", 0)) + 1
                     session["updated_at"] = now
                     self._write_session(session)
                 self._db.commit()
-                return {"claimed": True, "job_id": new_job_id, "job": copy.deepcopy(candidate), "session": copy.deepcopy(session)}
+                return {
+                    "claimed": True,
+                    "job_id": new_job_id,
+                    "job": copy.deepcopy(candidate),
+                    "session": copy.deepcopy(session),
+                }
             except Exception:
                 self._db.rollback()
                 raise
@@ -630,7 +829,10 @@ class Storage:
         with self._lock, self._db:
             self._check_open()
             try:
-                self._db.execute("INSERT INTO jobs(id,status,at,updated_at,payload) VALUES(?,?,?,?,?)", (item["id"], item["status"], self._timestamp(item["at"]), item["updated_at"], _json(item)))
+                self._db.execute(
+                    "INSERT INTO jobs(id,status,at,updated_at,payload) VALUES(?,?,?,?,?)",
+                    (item["id"], item["status"], self._timestamp(item["at"]), item["updated_at"], _json(item)),
+                )
             except sqlite3.IntegrityError as exc:
                 raise StorageError("任务 ID 已存在") from exc
         return copy.deepcopy(item)
@@ -649,13 +851,21 @@ class Storage:
             item = {**item, **copy.deepcopy(patch), "id": job_id, "at": item["at"], "updated_at": time.time()}
             self._validate_status(item, JOB_STATUSES)
             item = self._scrub_known_secrets(item)
-            self._db.execute("UPDATE jobs SET status=?,updated_at=?,payload=? WHERE id=?", (item["status"], item["updated_at"], _json(item), job_id))
+            self._db.execute(
+                "UPDATE jobs SET status=?,updated_at=?,payload=? WHERE id=?",
+                (item["status"], item["updated_at"], _json(item), job_id),
+            )
             return copy.deepcopy(item)
 
     def recent_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             self._check_open()
-            return [_decoded(row["payload"], "job") for row in self._db.execute("SELECT payload FROM jobs ORDER BY at DESC,rowid DESC LIMIT ?", (max(0, min(10000, int(limit))),))]
+            return [
+                _decoded(row["payload"], "job")
+                for row in self._db.execute(
+                    "SELECT payload FROM jobs ORDER BY at DESC,rowid DESC LIMIT ?", (max(0, min(10000, int(limit))),)
+                )
+            ]
 
     def reserve_delivery(self, key: str) -> bool:
         key = _safe_text(key, 2000)
@@ -665,7 +875,10 @@ class Storage:
         item = {"key": key, "status": "claimed", "at": now, "updated_at": now}
         with self._lock, self._db:
             self._check_open()
-            cursor = self._db.execute("INSERT OR IGNORE INTO deliveries(key,status,at,updated_at,payload) VALUES(?,?,?,?,?)", (key, "claimed", now, now, _json(item)))
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO deliveries(key,status,at,updated_at,payload) VALUES(?,?,?,?,?)",
+                (key, "claimed", now, now, _json(item)),
+            )
             return cursor.rowcount == 1
 
     def delivery(self, key: str) -> dict[str, Any] | None:
@@ -674,7 +887,9 @@ class Storage:
             row = self._db.execute("SELECT payload FROM deliveries WHERE key=?", (key,)).fetchone()
             return _decoded(row["payload"], "delivery") if row else None
 
-    def claim_delivery_retry(self, key: str, *, now: float, max_attempts: int, allow_role_skip: bool = False) -> dict[str, Any] | None:
+    def claim_delivery_retry(
+        self, key: str, *, now: float, max_attempts: int, allow_role_skip: bool = False
+    ) -> dict[str, Any] | None:
         """Atomically reclaim a due failure or explicitly retryable role skip.
 
         Sent, ambiguous, and definite delivery failures stay terminal. A role
@@ -693,19 +908,34 @@ class Storage:
                 self._db.execute("BEGIN IMMEDIATE")
                 row = self._db.execute("SELECT payload FROM deliveries WHERE key=?", (key,)).fetchone()
                 item = _decoded(row["payload"], "delivery") if row else None
-                eligible = item and (item.get("status") == "failed" or (
-                    item.get("status") == "skipped" and allow_role_skip
-                    and item.get("retryable") is True and item.get("skip_reason") == "role_skip"
-                ))
+                eligible = item and (
+                    item.get("status") == "failed"
+                    or (
+                        item.get("status") == "skipped"
+                        and allow_role_skip
+                        and item.get("retryable") is True
+                        and item.get("skip_reason") == "role_skip"
+                    )
+                )
                 attempts = item.get("attempts", 1) if item else None
                 retry_at = item.get("retry_at") if item else None
-                valid_counter = isinstance(attempts, int) and not isinstance(attempts, bool) and 0 <= attempts < max_attempts
-                due = isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and math.isfinite(retry_at) and now >= retry_at
+                valid_counter = (
+                    isinstance(attempts, int) and not isinstance(attempts, bool) and 0 <= attempts < max_attempts
+                )
+                due = (
+                    isinstance(retry_at, (int, float))
+                    and not isinstance(retry_at, bool)
+                    and math.isfinite(retry_at)
+                    and now >= retry_at
+                )
                 if not eligible or not valid_counter or not due:
                     self._db.commit()
                     return None
                 item.update(status="claimed", attempts=attempts + 1, retryable=False, updated_at=now)
-                self._db.execute("UPDATE deliveries SET status=?,updated_at=?,payload=? WHERE key=?", (item["status"], now, _json(item), key))
+                self._db.execute(
+                    "UPDATE deliveries SET status=?,updated_at=?,payload=? WHERE key=?",
+                    (item["status"], now, _json(item), key),
+                )
                 self._db.commit()
                 return copy.deepcopy(item)
             except Exception:
@@ -720,7 +950,10 @@ class Storage:
             item = {**item, **copy.deepcopy(patch), "key": key, "at": item["at"], "updated_at": time.time()}
             self._validate_status(item, DELIVERY_STATUSES)
             item = self._scrub_known_secrets(item)
-            self._db.execute("UPDATE deliveries SET status=?,updated_at=?,payload=? WHERE key=?", (item["status"], item["updated_at"], _json(item), key))
+            self._db.execute(
+                "UPDATE deliveries SET status=?,updated_at=?,payload=? WHERE key=?",
+                (item["status"], item["updated_at"], _json(item), key),
+            )
             return copy.deepcopy(item)
 
     @staticmethod
@@ -729,7 +962,12 @@ class Storage:
             tz = ZoneInfo(tz_name)
         except ZoneInfoNotFoundError as exc:
             # Windows may not have IANA tzdata. Defaults need no extra package.
-            fallback = {"Asia/Shanghai": timezone(timedelta(hours=8)), "Asia/Hong_Kong": timezone(timedelta(hours=8)), "UTC": timezone.utc, "Etc/UTC": timezone.utc}
+            fallback = {
+                "Asia/Shanghai": timezone(timedelta(hours=8)),
+                "Asia/Hong_Kong": timezone(timedelta(hours=8)),
+                "UTC": timezone.utc,
+                "Etc/UTC": timezone.utc,
+            }
             if tz_name not in fallback:
                 raise StorageError("该时区在当前 Python 环境不可用") from exc
             tz = fallback[tz_name]
@@ -742,16 +980,26 @@ class Storage:
             row = self._db.execute("SELECT payload FROM actions WHERE id=?", (identity,)).fetchone()
             old = _decoded(row["payload"], "action") if row else {}
             now = time.time()
-            item = self._scrub_known_secrets({**old, **copy.deepcopy(value), "id": identity, "at": old.get("at", now), "updated_at": now})
-            self._db.execute("INSERT INTO actions(id,session_key,at,updated_at,payload) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET session_key=excluded.session_key,updated_at=excluded.updated_at,payload=excluded.payload", (identity, str(item.get("session_key") or ""), item["at"], now, _json(item)))
-            self._db.execute("DELETE FROM actions WHERE id IN (SELECT id FROM actions ORDER BY updated_at DESC LIMIT -1 OFFSET 1000)")
+            item = self._scrub_known_secrets(
+                {**old, **copy.deepcopy(value), "id": identity, "at": old.get("at", now), "updated_at": now}
+            )
+            self._db.execute(
+                "INSERT INTO actions(id,session_key,at,updated_at,payload) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET session_key=excluded.session_key,updated_at=excluded.updated_at,payload=excluded.payload",
+                (identity, str(item.get("session_key") or ""), item["at"], now, _json(item)),
+            )
+            self._db.execute(
+                "DELETE FROM actions WHERE id IN (SELECT id FROM actions ORDER BY updated_at DESC LIMIT -1 OFFSET 1000)"
+            )
             return copy.deepcopy(item)
 
     def recent_actions(self, session_key: str = "", limit: int = 50) -> list[dict]:
         with self._lock:
             self._check_open()
             condition, args = ("WHERE session_key=?", [session_key]) if session_key else ("", [])
-            rows = self._db.execute(f"SELECT payload FROM actions {condition} ORDER BY updated_at DESC LIMIT ?", (*args, max(1, min(200, int(limit)))))
+            rows = self._db.execute(
+                f"SELECT payload FROM actions {condition} ORDER BY updated_at DESC LIMIT ?",
+                (*args, max(1, min(200, int(limit)))),
+            )
             return [_decoded(row["payload"], "action") for row in rows]
 
     def reserve_budget(self, kind: str, limits: dict) -> str | None:
@@ -767,7 +1015,9 @@ class Storage:
                 self._db.execute("DELETE FROM budget_reservations WHERE expires_at<?", (now,))
                 row = self._db.execute("SELECT used FROM budget_usage WHERE kind=? AND day=?", (kind, day)).fetchone()
                 used = int(row[0]) if row else 0
-                reserved = self._db.execute("SELECT COUNT(*) FROM budget_reservations WHERE kind=? AND day=?", (kind, day)).fetchone()[0]
+                reserved = self._db.execute(
+                    "SELECT COUNT(*) FROM budget_reservations WHERE kind=? AND day=?", (kind, day)
+                ).fetchone()[0]
                 token = secrets.token_hex(12) if used + reserved < maximum else None
                 if token:
                     self._db.execute("INSERT INTO budget_reservations VALUES(?,?,?,?)", (token, kind, day, now + 900))
@@ -785,7 +1035,10 @@ class Storage:
             row = self._db.execute("SELECT kind,day FROM budget_reservations WHERE id=?", (token,)).fetchone()
             if row:
                 if used:
-                    self._db.execute("INSERT INTO budget_usage(kind,day,used) VALUES(?,?,1) ON CONFLICT(kind,day) DO UPDATE SET used=used+1", (row["kind"], row["day"]))
+                    self._db.execute(
+                        "INSERT INTO budget_usage(kind,day,used) VALUES(?,?,1) ON CONFLICT(kind,day) DO UPDATE SET used=used+1",
+                        (row["kind"], row["day"]),
+                    )
                 self._db.execute("DELETE FROM budget_reservations WHERE id=?", (token,))
 
     def budget_summary(self, limits: dict) -> dict:
@@ -797,9 +1050,16 @@ class Storage:
             for kind in ("messages", "photos", "llm"):
                 row = self._db.execute("SELECT used FROM budget_usage WHERE kind=? AND day=?", (kind, day)).fetchone()
                 used = int(row[0]) if row else 0
-                reserved = self._db.execute("SELECT COUNT(*) FROM budget_reservations WHERE kind=? AND day=? AND expires_at>?", (kind, day, now)).fetchone()[0]
+                reserved = self._db.execute(
+                    "SELECT COUNT(*) FROM budget_reservations WHERE kind=? AND day=? AND expires_at>?", (kind, day, now)
+                ).fetchone()[0]
                 limit = max(0, int(limits.get(kind, 0)))
-                result[kind] = {"used": used, "reserved": reserved, "limit": limit, "remaining": max(0, limit - used - reserved)}
+                result[kind] = {
+                    "used": used,
+                    "reserved": reserved,
+                    "limit": limit,
+                    "remaining": max(0, limit - used - reserved),
+                }
         return result
 
     def reserve_quota(self, user_key: str, limits: dict[str, Any], is_admin: bool = False) -> tuple[bool, str]:
@@ -807,7 +1067,9 @@ class Storage:
         allowed, reason, _token = self.reserve_quota_token(user_key, limits, is_admin=is_admin)
         return allowed, reason
 
-    def reserve_quota_token(self, user_key: str, limits: dict[str, Any], is_admin: bool = False) -> tuple[bool, str, str | None]:
+    def reserve_quota_token(
+        self, user_key: str, limits: dict[str, Any], is_admin: bool = False
+    ) -> tuple[bool, str, str | None]:
         user_key = _safe_text(user_key, 1000)
         if not user_key:
             raise StorageError("用户标识不能为空")
@@ -815,16 +1077,33 @@ class Storage:
         day = self._quota_day(now, str(limits.get("timezone") or "Asia/Shanghai"))
         limit, interval = max(0, int(limits.get("daily_limit", 5))), max(0, int(limits.get("min_interval_sec", 20)))
         concurrency, enforced = max(1, int(limits.get("max_concurrency", 1))), limits.get("enabled") is not False
-        lease = max(60, int(limits.get("reservation_timeout_sec", max(720, int(self.settings.get("generation", {}).get("timeout_sec", 180)) + 120))))
+        lease = max(
+            60,
+            int(
+                limits.get(
+                    "reservation_timeout_sec",
+                    max(720, int(self.settings.get("generation", {}).get("timeout_sec", 180)) + 120),
+                )
+            ),
+        )
         with self._lock:
             self._check_open()
             try:
                 self._db.execute("BEGIN IMMEDIATE")
                 self._db.execute("DELETE FROM quota_reservations WHERE expires_at<?", (now,))
-                row = self._db.execute("SELECT successes FROM quota_usage WHERE user_key=? AND day=?", (user_key, day)).fetchone()
+                row = self._db.execute(
+                    "SELECT successes FROM quota_usage WHERE user_key=? AND day=?", (user_key, day)
+                ).fetchone()
                 successes = int(row["successes"]) if row else 0
-                reservations = self._db.execute("SELECT day FROM quota_reservations WHERE user_key=? AND is_admin=0", (user_key,)).fetchall()
-                last = self._db.execute("SELECT MAX(last_attempt) FROM quota_usage WHERE user_key=?", (user_key,)).fetchone()[0] or 0
+                reservations = self._db.execute(
+                    "SELECT day FROM quota_reservations WHERE user_key=? AND is_admin=0", (user_key,)
+                ).fetchall()
+                last = (
+                    self._db.execute(
+                        "SELECT MAX(last_attempt) FROM quota_usage WHERE user_key=?", (user_key,)
+                    ).fetchone()[0]
+                    or 0
+                )
                 reason = ""
                 if enforced and not is_admin and len(reservations) >= concurrency:
                     reason = "上一张图片还在生成，请稍候。"
@@ -837,8 +1116,14 @@ class Storage:
                     self._db.commit()
                     return False, reason, None
                 if not is_admin:
-                    self._db.execute("INSERT INTO quota_usage(user_key,day,successes,last_attempt) VALUES(?,?,0,?) ON CONFLICT(user_key,day) DO UPDATE SET last_attempt=excluded.last_attempt", (user_key, day, now))
-                cursor = self._db.execute("INSERT INTO quota_reservations(user_key,day,at,expires_at,is_admin) VALUES(?,?,?,?,?)", (user_key, day, now, now + lease, int(is_admin)))
+                    self._db.execute(
+                        "INSERT INTO quota_usage(user_key,day,successes,last_attempt) VALUES(?,?,0,?) ON CONFLICT(user_key,day) DO UPDATE SET last_attempt=excluded.last_attempt",
+                        (user_key, day, now),
+                    )
+                cursor = self._db.execute(
+                    "INSERT INTO quota_reservations(user_key,day,at,expires_at,is_admin) VALUES(?,?,?,?,?)",
+                    (user_key, day, now, now + lease, int(is_admin)),
+                )
                 self._db.commit()
                 return True, "", str(cursor.lastrowid)
             except Exception:
@@ -858,11 +1143,20 @@ class Storage:
             self._check_open()
             try:
                 self._db.execute("BEGIN IMMEDIATE")
-                row = self._db.execute("SELECT * FROM quota_reservations WHERE id=?", (token,)).fetchone() if token is not None else self._db.execute("SELECT * FROM quota_reservations WHERE user_key=? ORDER BY id LIMIT 1", (user_key,)).fetchone()
+                row = (
+                    self._db.execute("SELECT * FROM quota_reservations WHERE id=?", (token,)).fetchone()
+                    if token is not None
+                    else self._db.execute(
+                        "SELECT * FROM quota_reservations WHERE user_key=? ORDER BY id LIMIT 1", (user_key,)
+                    ).fetchone()
+                )
                 if row:
                     self._db.execute("DELETE FROM quota_reservations WHERE id=?", (row["id"],))
                     if success and not row["is_admin"]:
-                        self._db.execute("UPDATE quota_usage SET successes=successes+1 WHERE user_key=? AND day=?", (row["user_key"], row["day"]))
+                        self._db.execute(
+                            "UPDATE quota_usage SET successes=successes+1 WHERE user_key=? AND day=?",
+                            (row["user_key"], row["day"]),
+                        )
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -870,6 +1164,7 @@ class Storage:
 
     def _scrub_known_secrets(self, value: Any) -> Any:
         known: set[str] = set()
+
         def collect(item: Any) -> None:
             if isinstance(item, dict):
                 for key, nested in item.items():
@@ -880,7 +1175,9 @@ class Storage:
             elif isinstance(item, list):
                 for nested in item:
                     collect(nested)
+
         collect(getattr(self, "settings", {}))
+
         def scrub(item: Any) -> Any:
             if isinstance(item, dict):
                 return {key: scrub(nested) for key, nested in item.items() if not _secret_key(key)}
@@ -890,6 +1187,7 @@ class Storage:
                 for secret in sorted(known, key=len, reverse=True):
                     item = item.replace(secret, "[REDACTED]")
             return item
+
         return scrub(copy.deepcopy(value))
 
     def safe_settings(self) -> dict[str, Any]:
@@ -900,12 +1198,16 @@ class Storage:
         value = self._scrub_known_secrets({"at": time.time(), **item})
         with self._lock, self._db:
             self._check_open()
-            self._db.execute("INSERT INTO history(at,payload) VALUES(?,?)", (self._timestamp(value["at"]), _json(value)))
+            self._db.execute(
+                "INSERT INTO history(at,payload) VALUES(?,?)", (self._timestamp(value["at"]), _json(value))
+            )
 
     def recent_history(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             self._check_open()
-            rows = self._db.execute("SELECT payload FROM history ORDER BY id DESC LIMIT ?", (max(0, min(10000, int(limit))),)).fetchall()
+            rows = self._db.execute(
+                "SELECT payload FROM history ORDER BY id DESC LIMIT ?", (max(0, min(10000, int(limit))),)
+            ).fetchall()
             return [_decoded(row["payload"], "history") for row in reversed(rows)]
 
     def history_page(self, limit: int = 20, before_id: int | None = None) -> dict[str, Any]:
@@ -918,7 +1220,9 @@ class Storage:
         condition, args = ("WHERE id<?", [int(before_id)]) if before_id is not None else ("", [])
         with self._lock:
             self._check_open()
-            rows = self._db.execute(f"SELECT id,payload FROM history {condition} ORDER BY id DESC LIMIT ?", (*args, size + 1)).fetchall()
+            rows = self._db.execute(
+                f"SELECT id,payload FROM history {condition} ORDER BY id DESC LIMIT ?", (*args, size + 1)
+            ).fetchall()
             selected = rows[:size]
             items = [{**_decoded(row["payload"], "history"), "history_id": row["id"]} for row in selected]
             more = len(rows) > size
@@ -935,8 +1239,14 @@ class Storage:
         cutoff = datetime.fromtimestamp(time.time(), timezone.utc).date() - timedelta(days=30)
         with self._lock, self._db:
             self._check_open()
-            quota = self._db.execute("DELETE FROM quota_usage WHERE rowid IN (SELECT u.rowid FROM quota_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM quota_reservations r WHERE r.user_key=u.user_key AND r.day=u.day) ORDER BY u.day LIMIT ?)", (cutoff.isoformat(), size)).rowcount
-            budget = self._db.execute("DELETE FROM budget_usage WHERE rowid IN (SELECT u.rowid FROM budget_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM budget_reservations r WHERE r.kind=u.kind AND r.day=u.day) ORDER BY u.day LIMIT ?)", (cutoff.isoformat(), size)).rowcount
+            quota = self._db.execute(
+                "DELETE FROM quota_usage WHERE rowid IN (SELECT u.rowid FROM quota_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM quota_reservations r WHERE r.user_key=u.user_key AND r.day=u.day) ORDER BY u.day LIMIT ?)",
+                (cutoff.isoformat(), size),
+            ).rowcount
+            budget = self._db.execute(
+                "DELETE FROM budget_usage WHERE rowid IN (SELECT u.rowid FROM budget_usage u WHERE u.day<? AND NOT EXISTS (SELECT 1 FROM budget_reservations r WHERE r.kind=u.kind AND r.day=u.day) ORDER BY u.day LIMIT ?)",
+                (cutoff.isoformat(), size),
+            ).rowcount
         return {**result, "quota_days_deleted": quota, "budget_days_deleted": budget}
 
     def cleanup_history(self, limit: int, *, batch_size: int | None = None) -> dict[str, int]:
@@ -951,10 +1261,15 @@ class Storage:
             self._check_open()
             self._db.execute("BEGIN IMMEDIATE")
             batch = -1 if batch_size is None else max(1, min(1000, int(batch_size)))
-            rows = self._db.execute("SELECT id,payload FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (batch, limit)).fetchall()
+            rows = self._db.execute(
+                "SELECT id,payload FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (batch, limit)
+            ).fetchall()
             deleted = [_decoded(row["payload"], "history") for row in rows]
             now = time.time()
-            delivery_rows = self._db.execute("SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain','delivery_failed') ORDER BY updated_at LIMIT ?", (now - 30 * 86400, batch)).fetchall()
+            delivery_rows = self._db.execute(
+                "SELECT key,payload FROM deliveries WHERE updated_at<? AND status IN ('sent','skipped','failed','uncertain','delivery_failed') ORDER BY updated_at LIMIT ?",
+                (now - 30 * 86400, batch),
+            ).fetchall()
             expired_delivery_keys = {row["key"] for row in delivery_rows}
             protected_jobs = set()
             for row in self._db.execute("SELECT key,payload FROM deliveries"):
@@ -964,9 +1279,15 @@ class Storage:
                         protected_jobs.add(str(value["job_id"]))
             for row in self._db.execute("SELECT payload FROM sessions"):
                 pending = _decoded(row["payload"], "session").get("pending") or {}
-                if isinstance(pending, dict) and pending.get("execution_job_id") and self._timestamp(pending.get("expires_at")) > now:
+                if (
+                    isinstance(pending, dict)
+                    and pending.get("execution_job_id")
+                    and self._timestamp(pending.get("expires_at")) > now
+                ):
                     protected_jobs.add(str(pending["execution_job_id"]))
-            finished = self._db.execute("SELECT id,status,updated_at,payload FROM jobs WHERE status IN ('succeeded','failed','sent','uncertain','delivery_failed','cancelled') ORDER BY updated_at DESC,rowid DESC").fetchall()
+            finished = self._db.execute(
+                "SELECT id,status,updated_at,payload FROM jobs WHERE status IN ('succeeded','failed','sent','uncertain','delivery_failed','cancelled') ORDER BY updated_at DESC,rowid DESC"
+            ).fetchall()
             eligible_finished = []
             for row in finished:
                 value = _decoded(row["payload"], "job")
@@ -975,7 +1296,7 @@ class Storage:
                 if row["status"] == "succeeded" and value.get("source") != "webui" and row["updated_at"] > now - 300:
                     continue
                 eligible_finished.append(row)
-            pruned_jobs = eligible_finished[limit:] if batch < 0 else eligible_finished[limit:limit + batch]
+            pruned_jobs = eligible_finished[limit:] if batch < 0 else eligible_finished[limit : limit + batch]
             deleted.extend(_decoded(row["payload"], "job") for row in pruned_jobs)
             deleted.extend(_decoded(row["payload"], "delivery") for row in delivery_rows)
             self._db.executemany("DELETE FROM history WHERE id=?", [(row["id"],) for row in rows])
@@ -991,7 +1312,12 @@ class Storage:
                     removed += 1
                 except (StorageError, OSError):
                     continue
-            return {"history_deleted": len(rows), "jobs_deleted": len(pruned_jobs), "deliveries_deleted": len(delivery_rows), "assets_deleted": removed}
+            return {
+                "history_deleted": len(rows),
+                "jobs_deleted": len(pruned_jobs),
+                "deliveries_deleted": len(delivery_rows),
+                "assets_deleted": removed,
+            }
 
     @staticmethod
     def _gather_asset_names(value: Any, target: set[str]) -> None:
@@ -1023,7 +1349,9 @@ class Storage:
             self._db.execute("BEGIN IMMEDIATE")
             self.asset(name)
             token = secrets.token_hex(12)
-            self._db.execute("INSERT INTO asset_leases(id,name,expires_at) VALUES(?,?,?)", (token, name, time.time() + ttl))
+            self._db.execute(
+                "INSERT INTO asset_leases(id,name,expires_at) VALUES(?,?,?)", (token, name, time.time() + ttl)
+            )
             return token
 
     def release_asset(self, token: str | None) -> None:
@@ -1056,7 +1384,14 @@ class Storage:
             return {"assets_deleted": removed, "leases_expired": expired}
 
     def asset(self, name: str) -> Path:
-        if not isinstance(name, str) or not name or len(name) > 255 or name.startswith(".") or any(char in name for char in ("/", "\\", ":", "\x00")) or Path(name).name != name:
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 255
+            or name.startswith(".")
+            or any(char in name for char in ("/", "\\", ":", "\x00"))
+            or Path(name).name != name
+        ):
             raise StorageError("图片资源名称无效")
         candidate = self.assets / name
         if candidate.suffix.lower().lstrip(".") not in _ASSET_SUFFIXES:
@@ -1118,9 +1453,34 @@ class Storage:
         """Portable data export; credentials are excluded by default."""
         with self._lock:
             self._check_open()
-            value = {"version": SCHEMA_VERSION, "exported_at": time.time(), "personas": copy.deepcopy(self.personas), "settings": copy.deepcopy(self.settings), "targets": copy.deepcopy(self.targets), "runtime": copy.deepcopy(self.runtime), "sessions": self.list_sessions(), "jobs": [_decoded(row["payload"], "job") for row in self._db.execute("SELECT payload FROM jobs ORDER BY at DESC")], "history": [_decoded(row["payload"], "history") for row in self._db.execute("SELECT payload FROM history ORDER BY id")], "deliveries": [_decoded(row["payload"], "delivery") for row in self._db.execute("SELECT payload FROM deliveries ORDER BY at")], "assets": [path.name for path in self.assets.iterdir() if path.is_file() and not path.name.startswith(".")]}
+            value = {
+                "version": SCHEMA_VERSION,
+                "exported_at": time.time(),
+                "personas": copy.deepcopy(self.personas),
+                "settings": copy.deepcopy(self.settings),
+                "targets": copy.deepcopy(self.targets),
+                "runtime": copy.deepcopy(self.runtime),
+                "sessions": self.list_sessions(),
+                "jobs": [
+                    _decoded(row["payload"], "job")
+                    for row in self._db.execute("SELECT payload FROM jobs ORDER BY at DESC")
+                ],
+                "history": [
+                    _decoded(row["payload"], "history")
+                    for row in self._db.execute("SELECT payload FROM history ORDER BY id")
+                ],
+                "deliveries": [
+                    _decoded(row["payload"], "delivery")
+                    for row in self._db.execute("SELECT payload FROM deliveries ORDER BY at")
+                ],
+                "assets": [
+                    path.name for path in self.assets.iterdir() if path.is_file() and not path.name.startswith(".")
+                ],
+            }
             value["actions"] = self.recent_actions(limit=200)
-            value["proactive_budget_usage"] = [dict(row) for row in self._db.execute("SELECT kind,day,used FROM budget_usage ORDER BY day DESC")]
+            value["proactive_budget_usage"] = [
+                dict(row) for row in self._db.execute("SELECT kind,day,used FROM budget_usage ORDER BY day DESC")
+            ]
             return value if include_secrets else self._scrub_known_secrets(_redacted(value))
 
     def close(self) -> None:

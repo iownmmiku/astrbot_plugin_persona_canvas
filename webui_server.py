@@ -22,6 +22,7 @@ class ApiError(Exception):
 
 class WebUI:
     """Opt-in legacy transport; serves exactly the same UI as Plugin Pages."""
+
     ASSETS = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/app.css": ("app.css", "text/css; charset=utf-8"),
@@ -62,7 +63,10 @@ class WebUI:
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
-                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+                )
                 self.end_headers()
                 try:
                     self.wfile.write(body)
@@ -103,7 +107,9 @@ class WebUI:
                     if path.startswith("/assets/") or path.startswith("/api/page/assets/"):
                         name = unquote(path.rsplit("/", 1)[-1])
                         asset = asset_path(owner.plugin, name)
-                        self.reply(200, asset.read_bytes(), mimetypes.guess_type(asset.name)[0] or "application/octet-stream")
+                        self.reply(
+                            200, asset.read_bytes(), mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+                        )
                         return
                     if not path.startswith("/api/"):
                         raise ApiError(404, "页面不存在")
@@ -141,7 +147,11 @@ class WebUI:
                         data = base64.b64decode(str(body.get("data") or ""), validate=True)
                         if len(data) > MAX_UPLOAD_BYTES:
                             raise ApiError(413, "参考图不能超过 16 MB")
-                        result = self.dispatch(owner.plugin.web_upload_reference(data, str(body.get("name") or "reference.png"), str(body.get("persona_id") or "")))
+                        result = self.dispatch(
+                            owner.plugin.web_upload_reference(
+                                data, str(body.get("name") or "reference.png"), str(body.get("persona_id") or "")
+                            )
+                        )
                     else:
                         result = self.dispatch(dispatch_api(owner.plugin, "POST", suffix, body))
                     self.reply(200, result)
@@ -158,7 +168,9 @@ class WebUI:
 
         self.server = Server((self.host, self.port), Handler)
         self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, name="persona-canvas-webui", daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, name="persona-canvas-webui", daemon=True
+        )
         self.thread.start()
 
     async def close(self):

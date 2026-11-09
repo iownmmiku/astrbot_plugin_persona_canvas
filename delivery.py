@@ -1,4 +1,5 @@
 """Shared, read-only checks before committing or delivering a role action."""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,9 @@ async def delivery_guard(plugin, *, env=None, job=None):
     umo = str(snapshot.get("umo") or (env or {}).get("umo") or "")
     key = str(snapshot.get("session_key") or (env or {}).get("key") or "")
     persona_id = snapshot.get("persona_id") or (env or {}).get("persona", {}).get("id")
-    identity = snapshot.get("identity") or ({name: env.get(name, "") for name in ("astro_id", "cid")} if env and "astro_id" in env else None)
+    identity = snapshot.get("identity") or (
+        {name: env.get(name, "") for name in ("astro_id", "cid")} if env and "astro_id" in env else None
+    )
     source = snapshot.get("source") or (env or {}).get("delivery_source")
     if identity is not None and umo and not umo.startswith("webui:"):
         try:
@@ -32,7 +35,9 @@ def local_delivery_guard(plugin, *, env=None, job=None):
     umo = str(snapshot.get("umo") or (env or {}).get("umo") or "")
     key = str(snapshot.get("session_key") or (env or {}).get("key") or "")
     persona_id = snapshot.get("persona_id") or (env or {}).get("persona", {}).get("id")
-    identity = snapshot.get("identity") or ({name: env.get(name, "") for name in ("astro_id", "cid")} if env and "astro_id" in env else None)
+    identity = snapshot.get("identity") or (
+        {name: env.get(name, "") for name in ("astro_id", "cid")} if env and "astro_id" in env else None
+    )
     source = snapshot.get("source") or (env or {}).get("delivery_source")
     # All mutable local checks follow the final asynchronous identity lookup.
     if plugin._closing:
@@ -47,8 +52,19 @@ def local_delivery_guard(plugin, *, env=None, job=None):
         return "取回的历史工作流结果仅供查看，不自动发送"
     target = next((item for item in plugin.storage.targets["items"] if item.get("umo") == umo), None)
     if identity is not None and source != "webui" and not umo.startswith("webui:"):
-        bound = next((item for item in plugin.storage.personas["items"] if item.get("astrbot_persona_id") == identity.get("astro_id")), None)
-        selected = (target or {}).get("persona_id") or (bound or {}).get("id") or plugin.storage.settings.get("current_persona", "default")
+        bound = next(
+            (
+                item
+                for item in plugin.storage.personas["items"]
+                if item.get("astrbot_persona_id") == identity.get("astro_id")
+            ),
+            None,
+        )
+        selected = (
+            (target or {}).get("persona_id")
+            or (bound or {}).get("id")
+            or plugin.storage.settings.get("current_persona", "default")
+        )
         if selected != persona_id:
             return "当前绑定的视觉角色已改变，旧内容不再发送"
     session = plugin.storage.read_session(key) if key else None
@@ -58,7 +74,11 @@ def local_delivery_guard(plugin, *, env=None, job=None):
     if session and expected_revision is not None and session.get("revision", 0) != expected_revision:
         return "视觉状态或拍摄条件已改变，旧内容不再发送"
     pending = (session or {}).get("pending") or {}
-    expected_pending = current_job.get("delivery_pending_id") if job else ((env or {}).get("session", {}).get("pending") or {}).get("request_id", "")
+    expected_pending = (
+        current_job.get("delivery_pending_id")
+        if job
+        else ((env or {}).get("session", {}).get("pending") or {}).get("request_id", "")
+    )
     if expected_pending is not None and pending.get("request_id", "") != expected_pending:
         return "拍摄条件已替换或撤回，旧内容不再发送"
     if source in {"active", "morning", "reply_image"}:
@@ -73,10 +93,13 @@ def local_delivery_guard(plugin, *, env=None, job=None):
                 return "主动联系已停用"
             if source == "morning" and not target.get("morning_enabled", True):
                 return "此聊天的早安已停用"
-            if job and (not target.get("with_image", True) or (source == "morning" and config.get("image_mode") == "text_only")):
+            if job and (
+                not target.get("with_image", True) or (source == "morning" and config.get("image_mode") == "text_only")
+            ):
                 return "当前目标不允许主动图片"
             if job and current_job.get("delivery_key"):
                 from .active import ActiveScheduler
+
                 scheduler = plugin.active or ActiveScheduler(plugin)
                 delivery = plugin.storage.delivery(current_job["delivery_key"]) or {}
                 # Earlier phases have dedicated scheduler checks and diagnostics.
@@ -90,10 +113,16 @@ def local_delivery_guard(plugin, *, env=None, job=None):
                 initial = delivery.get("proactive_context", {}).get("time")
                 if initial:
                     clock = scheduler._time_context(target, source)
-                    elapsed = (datetime.fromisoformat(clock["now"]) - datetime.fromisoformat(initial["now"])).total_seconds()
-                    if not all(clock[name] == initial[name] for name in ("timezone", "date", "period")) or not 0 <= elapsed <= 900:
+                    elapsed = (
+                        datetime.fromisoformat(clock["now"]) - datetime.fromisoformat(initial["now"])
+                    ).total_seconds()
+                    if (
+                        not all(clock[name] == initial[name] for name in ("timezone", "date", "period"))
+                        or not 0 <= elapsed <= 900
+                    ):
                         return "主动内容的时间依据已过期，保留原图"
                     from .temporal import temporal_conflicts
+
                     if temporal_conflicts(current_job.get("caption", ""), clock, morning=source == "morning"):
                         return "主动图片的文字时间已过期，保留原图"
     return ""
