@@ -79,8 +79,9 @@ class CompanionFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(job["cancel_requested"])
         self.assertFalse(event.sent)
         self.assertFalse(self.store.recent_history())
-        self.assertTrue(self.plugin.moderation.allow("qq:123", "portrait")[0])
-        self.plugin.moderation.finish("qq:123")
+        allowed, _reason, token = self.plugin.moderation.reserve("qq:123", "portrait")
+        self.assertTrue(allowed)
+        self.plugin.moderation.finish("qq:123", token=token)
         with self.assertRaises(ValueError):
             await self.plugin.web_retry_job({"id": job["id"]})
 

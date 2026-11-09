@@ -187,17 +187,20 @@ class StorageTests(unittest.TestCase):
     def test_quota_counts_success_and_pending_refunds_failure_and_survives_restart(self):
         limits = {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 2}
         first = self.store()
-        self.assertTrue(first.reserve_quota("u", limits)[0])
-        self.assertFalse(first.reserve_quota("u", limits)[0])
-        first.finish_quota("u", success=False)
-        self.assertTrue(first.reserve_quota("u", limits)[0])
-        first.finish_quota("u", success=True)
+        allowed, _reason, token = first.reserve_quota_token("u", limits)
+        self.assertTrue(allowed)
+        self.assertFalse(first.reserve_quota_token("u", limits)[0])
+        first.finish_quota_token(token, success=False)
+        allowed, _reason, token = first.reserve_quota_token("u", limits)
+        self.assertTrue(allowed)
+        first.finish_quota_token(token, success=True)
         first.close()
         second = self.store()
-        self.assertFalse(second.reserve_quota("u", limits)[0])
-        self.assertTrue(second.reserve_quota("admin", limits, is_admin=True)[0])
-        second.finish_quota("admin", success=True)
-        self.assertTrue(second.reserve_quota("admin", limits)[0])
+        self.assertFalse(second.reserve_quota_token("u", limits)[0])
+        allowed, _reason, token = second.reserve_quota_token("admin", limits, is_admin=True)
+        self.assertTrue(allowed)
+        second.finish_quota_token(token, success=True)
+        self.assertTrue(second.reserve_quota_token("admin", limits)[0])
 
     def test_quota_daily_boundary_uses_configured_timezone(self):
         store = self.store()
@@ -205,36 +208,37 @@ class StorageTests(unittest.TestCase):
         before = datetime(2026, 10, 7, 15, 59, tzinfo=timezone.utc).timestamp()
         after = datetime(2026, 10, 7, 16, 1, tzinfo=timezone.utc).timestamp()
         with patch("storage.time.time", return_value=before):
-            self.assertTrue(store.reserve_quota("u", limits)[0])
-            store.finish_quota("u", success=True)
-            self.assertFalse(store.reserve_quota("u", limits)[0])
+            allowed, _reason, token = store.reserve_quota_token("u", limits)
+            self.assertTrue(allowed)
+            store.finish_quota_token(token, success=True)
+            self.assertFalse(store.reserve_quota_token("u", limits)[0])
         with patch("storage.time.time", return_value=after):
-            self.assertTrue(store.reserve_quota("u", limits)[0])
+            self.assertTrue(store.reserve_quota_token("u", limits)[0])
 
     def test_quota_reservation_is_atomic_across_connections(self):
         first, second = self.store(), self.store()
         limits = {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 2}
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda store: store.reserve_quota("u", limits)[0], (first, second)))
+            results = list(pool.map(lambda store: store.reserve_quota_token("u", limits)[0], (first, second)))
         self.assertEqual([False, True], sorted(results))
 
     def test_admin_bypasses_per_user_limits_but_reservations_can_be_finished(self):
         store = self.store()
         limits = {"daily_limit": 1, "min_interval_sec": 60, "max_concurrency": 1}
-        self.assertTrue(store.reserve_quota("admin", limits, is_admin=True)[0])
-        self.assertTrue(store.reserve_quota("admin", limits, is_admin=True)[0])
-        store.finish_quota("admin", success=True)
-        store.finish_quota("admin", success=True)
+        tokens = [store.reserve_quota_token("admin", limits, is_admin=True) for _ in range(2)]
+        self.assertTrue(all(allowed for allowed, _reason, _token in tokens))
+        for _allowed, _reason, token in tokens:
+            store.finish_quota_token(token, success=True)
         with patch("storage.time.time", return_value=10_000_000_000):
-            self.assertTrue(store.reserve_quota("admin", limits)[0])
+            self.assertTrue(store.reserve_quota_token("admin", limits)[0])
 
     def test_quota_stale_reservations_expire_but_do_not_count_as_success(self):
         store = self.store()
         limits = {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 1, "reservation_timeout_sec": 60}
         with patch("storage.time.time", return_value=1000):
-            self.assertTrue(store.reserve_quota("u", limits)[0])
+            self.assertTrue(store.reserve_quota_token("u", limits)[0])
         with patch("storage.time.time", return_value=1200):
-            self.assertTrue(store.reserve_quota("u", limits)[0])
+            self.assertTrue(store.reserve_quota_token("u", limits)[0])
 
     def test_secrets_are_recursively_redacted_and_errors_scrubbed(self):
         store = self.store()
@@ -403,28 +407,6 @@ class StorageTests(unittest.TestCase):
         for job in ("missing", self.photo_job(store, key="other")["id"]):
             with self.subTest(job=job), self.assertRaises(StorageConflictError):
                 store.claim_photo_request("conversation", "default", "conditions-1", job)
-
-    def test_explicit_retry_rebinds_failed_claim_but_cannot_reopen_withdrawal(self):
-        store = self.store()
-        self.pending_photo(store)
-        old = self.photo_job(store)
-        store.claim_photo_request("conversation", "default", "conditions-1", old["id"])
-        store.update_job(old["id"], {"status": "failed"})
-        session = store.read_session("conversation")
-        session["pending"]["expires_at"] = time.time() - 1
-        store.save_session("conversation", session)
-        retry = self.photo_job(store)
-        result = store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], retry["id"])
-        self.assertTrue(result["claimed"])
-        self.assertEqual(retry["id"], result["session"]["pending"]["execution_job_id"])
-        self.assertFalse(store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], retry["id"])["claimed"])
-        store.update_job(retry["id"], {"status": "cancelled", "cancel_requested": True})
-        another = self.photo_job(store)
-        with self.assertRaises(StorageConflictError):
-            store.rebind_photo_request("conversation", "default", "conditions-1", retry["id"], another["id"])
-        self.pending_photo(store, request_id="new-conditions")
-        with self.assertRaises(StorageConflictError):
-            store.rebind_photo_request("conversation", "default", "conditions-1", old["id"], another["id"])
 
     def test_asset_lease_protects_reference_while_history_owner_is_pruned(self):
         store = self.store()

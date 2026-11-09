@@ -15,7 +15,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    from .common import UnknownTimezoneError, secret_key, zone
+except ImportError:  # Imported as a top-level module by standalone tools/tests.
+    from common import UnknownTimezoneError, secret_key, zone
 
 
 SCHEMA_VERSION = 5
@@ -126,27 +130,11 @@ DELIVERY_STATUSES = frozenset(
     {"claimed", "decided", "skipped", "generating", "sending", "sent", "failed", "uncertain", "delivery_failed"}
 )
 _LEGACY_FILES = ("personas.json", "settings.json", "targets.json", "history.jsonl", "runtime.json", "webui_token.txt")
-_SECRET_KEYS = frozenset(
-    {
-        "api_key",
-        "apikey",
-        "api_token",
-        "authorization",
-        "auth",
-        "auth_key",
-        "auth_token",
-        "auth_value",
-        "access_token",
-        "refresh_token",
-        "bearer_token",
-        "token",
-        "secret",
-        "client_secret",
-        "password",
-        "x_api_key",
-    }
-)
 _ASSET_SUFFIXES = frozenset({"png", "jpg", "jpeg", "webp", "gif", "avif", "bin"})
+# Dotted runs between JSON string/path delimiters, starting at a delimiter.
+_PAYLOAD_NAME = re.compile(r'(?<![^"\\/])[^"\\/]*\.[^"\\/]*')
+# json.dumps escapes these, so such names cannot be matched in raw payloads.
+_UNSCANNABLE_NAME = re.compile(r'["\x00-\x1f]')
 
 
 class StorageError(RuntimeError):
@@ -208,15 +196,11 @@ def _decoded(raw: str, label: str) -> dict[str, Any]:
     return value
 
 
-def _secret_key(key: str) -> bool:
-    return str(key).lower().replace("-", "_") in _SECRET_KEYS
-
-
 def _redacted(value: Any) -> Any:
     if isinstance(value, dict):
-        result = {key: _redacted(item) for key, item in value.items() if not _secret_key(key)}
+        result = {key: _redacted(item) for key, item in value.items() if not secret_key(key)}
         for key, item in value.items():
-            if _secret_key(key):
+            if secret_key(key):
                 result[f"has_{str(key).lower().replace('-', '_')}"] = bool(item)
         return result
     return [_redacted(item) for item in value] if isinstance(value, list) else copy.deepcopy(value)
@@ -478,9 +462,6 @@ class Storage:
             with self._db:
                 self._write_document(name, getattr(self, name))
 
-    def save_personas(self) -> None:
-        self._save_facade("personas")
-
     def save_settings(self) -> None:
         self._save_facade("settings")
 
@@ -655,20 +636,10 @@ class Storage:
             ]
 
     def claim_photo_request(self, session_key: str, persona_id: str, request_id: str, job_id: str) -> dict[str, Any]:
-        """Claim an agreed request once; failures retain the original job claim."""
-        return self._claim_photo_request(session_key, persona_id, request_id, job_id)
+        """Claim an agreed request once; failures retain the original job claim.
 
-    def rebind_photo_request(
-        self, session_key: str, persona_id: str, request_id: str, old_job_id: str, new_job_id: str
-    ) -> dict[str, Any]:
-        """Explicitly retry an existing failure without reopening normal consent."""
-        if not old_job_id or old_job_id == new_job_id:
-            raise StorageConflictError("重试任务必须对应原来的失败拍摄")
-        return self._claim_photo_request(session_key, persona_id, request_id, new_job_id, old_job_id=old_job_id)
-
-    def _claim_photo_request(
-        self, session_key: str, persona_id: str, request_id: str, job_id: str, *, old_job_id: str = ""
-    ) -> dict[str, Any]:
+        Explicit retries of a failed claim go through claim_job_retry().
+        """
         if not all(isinstance(item, str) and item for item in (session_key, persona_id, request_id, job_id)):
             raise StorageConflictError("拍摄确认标识不能为空")
         with self._lock:
@@ -687,22 +658,10 @@ class Storage:
                     or pending.get("request_kind") != "photo"
                 ):
                     raise StorageConflictError("拍摄条件已经更新，请重新确认当前条件")
-                if not old_job_id and self._timestamp(pending.get("expires_at")) <= time.time():
+                if self._timestamp(pending.get("expires_at")) <= time.time():
                     raise StorageConflictError("拍摄条件已经过期，请重新确认")
                 execution_job_id = str(pending.get("execution_job_id") or "")
-                if old_job_id:
-                    if execution_job_id == job_id:
-                        self._db.commit()
-                        return {"claimed": False, "job_id": job_id, "session": session}
-                    old = self.job(old_job_id)
-                    if (
-                        execution_job_id != old_job_id
-                        or not old
-                        or old.get("status") not in {"failed", "cancelled"}
-                        or old.get("cancel_requested")
-                    ):
-                        raise StorageConflictError("原拍摄不能重试；撤回或条件变化后需要重新判断")
-                elif execution_job_id:
+                if execution_job_id:
                     self._db.commit()
                     return {"claimed": False, "job_id": execution_job_id, "session": session}
                 job = self.job(job_id)
@@ -867,6 +826,34 @@ class Storage:
                 )
             ]
 
+    def jobs_with_status(self, statuses: set[str] | frozenset[str]) -> list[dict[str, Any]]:
+        """Jobs in the given states, newest first, using the indexed column."""
+        wanted = sorted(set(statuses) & JOB_STATUSES)
+        if not wanted:
+            return []
+        with self._lock:
+            self._check_open()
+            marks = ",".join("?" * len(wanted))
+            return [
+                _decoded(row["payload"], "job")
+                for row in self._db.execute(
+                    f"SELECT payload FROM jobs WHERE status IN ({marks}) ORDER BY at DESC,rowid DESC", wanted
+                )
+            ]
+
+    def deliveries_for_recovery(self) -> list[dict[str, Any]]:
+        """Deliveries a restart may have interrupted, plus attached reply images.
+
+        Payloads are compact JSON, so the attached marker is matched as text
+        instead of decoding every finished delivery.
+        """
+        with self._lock:
+            self._check_open()
+            rows = self._db.execute(
+                "SELECT payload FROM deliveries WHERE status IN ('claimed','decided','generating','sending') OR instr(payload, '\"attached\":true') > 0 ORDER BY at"
+            )
+            return [_decoded(row["payload"], "delivery") for row in rows]
+
     def reserve_delivery(self, key: str) -> bool:
         key = _safe_text(key, 2000)
         if not key:
@@ -959,18 +946,9 @@ class Storage:
     @staticmethod
     def _quota_day(now: float, tz_name: str) -> str:
         try:
-            tz = ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError as exc:
-            # Windows may not have IANA tzdata. Defaults need no extra package.
-            fallback = {
-                "Asia/Shanghai": timezone(timedelta(hours=8)),
-                "Asia/Hong_Kong": timezone(timedelta(hours=8)),
-                "UTC": timezone.utc,
-                "Etc/UTC": timezone.utc,
-            }
-            if tz_name not in fallback:
-                raise StorageError("该时区在当前 Python 环境不可用") from exc
-            tz = fallback[tz_name]
+            tz = zone(tz_name)
+        except UnknownTimezoneError as exc:
+            raise StorageError("该时区在当前 Python 环境不可用") from exc
         return datetime.fromtimestamp(now, tz).strftime("%Y-%m-%d")
 
     def record_action(self, value: dict, record_id: str = "") -> dict:
@@ -1062,11 +1040,6 @@ class Storage:
                 }
         return result
 
-    def reserve_quota(self, user_key: str, limits: dict[str, Any], is_admin: bool = False) -> tuple[bool, str]:
-        """Compatibility API; new callers should retain the reservation token."""
-        allowed, reason, _token = self.reserve_quota_token(user_key, limits, is_admin=is_admin)
-        return allowed, reason
-
     def reserve_quota_token(
         self, user_key: str, limits: dict[str, Any], is_admin: bool = False
     ) -> tuple[bool, str, str | None]:
@@ -1130,26 +1103,14 @@ class Storage:
                 self._db.rollback()
                 raise
 
-    def finish_quota(self, user_key: str, success: bool = False) -> None:
-        """Compatibility FIFO settlement for callers without a token."""
-        self._finish_quota(user_key=user_key, success=success)
-
     def finish_quota_token(self, token: str | None, success: bool = False) -> None:
-        if token is not None:
-            self._finish_quota(token=str(token), success=success)
-
-    def _finish_quota(self, *, user_key: str = "", token: str | None = None, success: bool = False) -> None:
+        if token is None:
+            return
         with self._lock:
             self._check_open()
             try:
                 self._db.execute("BEGIN IMMEDIATE")
-                row = (
-                    self._db.execute("SELECT * FROM quota_reservations WHERE id=?", (token,)).fetchone()
-                    if token is not None
-                    else self._db.execute(
-                        "SELECT * FROM quota_reservations WHERE user_key=? ORDER BY id LIMIT 1", (user_key,)
-                    ).fetchone()
-                )
+                row = self._db.execute("SELECT * FROM quota_reservations WHERE id=?", (str(token),)).fetchone()
                 if row:
                     self._db.execute("DELETE FROM quota_reservations WHERE id=?", (row["id"],))
                     if success and not row["is_admin"]:
@@ -1168,7 +1129,7 @@ class Storage:
         def collect(item: Any) -> None:
             if isinstance(item, dict):
                 for key, nested in item.items():
-                    if _secret_key(key) and isinstance(nested, str) and len(nested) >= 6:
+                    if secret_key(key) and isinstance(nested, str) and len(nested) >= 6:
                         known.add(nested)
                     else:
                         collect(nested)
@@ -1180,7 +1141,7 @@ class Storage:
 
         def scrub(item: Any) -> Any:
             if isinstance(item, dict):
-                return {key: scrub(nested) for key, nested in item.items() if not _secret_key(key)}
+                return {key: scrub(nested) for key, nested in item.items() if not secret_key(key)}
             if isinstance(item, list):
                 return [scrub(nested) for nested in item]
             if isinstance(item, str):
@@ -1272,12 +1233,16 @@ class Storage:
             ).fetchall()
             expired_delivery_keys = {row["key"] for row in delivery_rows}
             protected_jobs = set()
-            for row in self._db.execute("SELECT key,payload FROM deliveries"):
+            # Only deliveries naming a job matter; compact JSON lets SQLite
+            # skip the rest (e.g. skipped reply-image turns) without decoding.
+            for row in self._db.execute("SELECT key,payload FROM deliveries WHERE instr(payload, '\"job_id\":') > 0"):
                 if row["key"] not in expired_delivery_keys:
                     value = _decoded(row["payload"], "delivery")
                     if value.get("job_id"):
                         protected_jobs.add(str(value["job_id"]))
-            for row in self._db.execute("SELECT payload FROM sessions"):
+            for row in self._db.execute(
+                "SELECT payload FROM sessions WHERE instr(payload, '\"execution_job_id\":') > 0"
+            ):
                 pending = _decoded(row["payload"], "session").get("pending") or {}
                 if (
                     isinstance(pending, dict)
@@ -1290,10 +1255,14 @@ class Storage:
             ).fetchall()
             eligible_finished = []
             for row in finished:
-                value = _decoded(row["payload"], "job")
                 if row["id"] in protected_jobs:
                     continue
-                if row["status"] == "succeeded" and value.get("source") != "webui" and row["updated_at"] > now - 300:
+                # Decode only for the grace-period rule; pruned rows are decoded below.
+                if (
+                    row["status"] == "succeeded"
+                    and row["updated_at"] > now - 300
+                    and _decoded(row["payload"], "job").get("source") != "webui"
+                ):
                     continue
                 eligible_finished.append(row)
             pruned_jobs = eligible_finished[limit:] if batch < 0 else eligible_finished[limit : limit + batch]
@@ -1307,6 +1276,8 @@ class Storage:
                 self._gather_asset_names(item, candidates)
             removed = 0
             for name in candidates - keep:
+                if _UNSCANNABLE_NAME.search(name):
+                    continue
                 try:
                     self.asset(name).unlink()
                     removed += 1
@@ -1333,11 +1304,18 @@ class Storage:
                 target.add(name)
 
     def _asset_references(self, now: float) -> set[str]:
+        """Every name that may refer to an asset, read from raw JSON payloads.
+
+        A referenced asset name is the last path segment of a JSON string, so
+        it is a dotted run between quote/slash/backslash delimiters. Collecting
+        those runs is a superset of the decoded scan without parsing each
+        record. Names with characters JSON escapes are never deleted.
+        """
         keep: set[str] = set()
         # Read committed documents, including updates from another connection.
         for table in ("documents", "history", "sessions", "jobs", "deliveries", "actions"):
             for row in self._db.execute(f"SELECT payload FROM {table}"):
-                self._gather_asset_names(_decoded(row["payload"], table), keep)
+                keep.update(_PAYLOAD_NAME.findall(row["payload"]))
         keep.update(row["name"] for row in self._db.execute("SELECT name FROM asset_leases WHERE expires_at>?", (now,)))
         return keep
 
@@ -1372,7 +1350,12 @@ class Storage:
             keep = self._asset_references(now)
             removed = 0
             for path in self.assets.iterdir():
-                if path.name in keep or path.name.startswith(".") or path.is_symlink():
+                if (
+                    path.name in keep
+                    or path.name.startswith(".")
+                    or path.is_symlink()
+                    or _UNSCANNABLE_NAME.search(path.name)
+                ):
                     continue
                 try:
                     if not path.is_file() or path.stat().st_mtime > now - grace_sec:
@@ -1411,25 +1394,32 @@ class Storage:
         if not isinstance(data, bytes) or not data or len(data) > 64 * 1024 * 1024:
             raise StorageError("图片内容为空或超过 64 MB")
         path = self.assets / f"{hashlib.sha256(data).hexdigest()[:24]}.{suffix}"
-        with self._lock:
-            self._check_open()
-            if path.exists():
+        self._check_open()
+        if path.exists():
+            with self._lock:
                 existing = self.asset(path.name)
                 # Reusing an old image is still a fresh upload draft.
                 os.utime(existing, None)
                 return existing
-            fd, temporary = tempfile.mkstemp(prefix=".asset-", dir=str(self.assets))
+        # Write and fsync outside the lock so database calls are not blocked by
+        # disk IO; only the final publish step is serialised.
+        fd, temporary = tempfile.mkstemp(prefix=".asset-", dir=str(self.assets))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            with self._lock:
+                self._check_open()
+                if path.exists():
+                    os.utime(path, None)
+                else:
+                    os.replace(temporary, path)
+        finally:
             try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, path)
-            finally:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
         return path
 
     def webui_token(self, configured: str = "") -> str:

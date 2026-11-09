@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import copy
+import hashlib
 import io
 import ipaddress
 import json
@@ -17,9 +19,11 @@ import math
 import re
 import secrets
 import socket
+import threading
 import time
 import warnings
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -27,10 +31,27 @@ from urllib.parse import quote, urlsplit
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 36_000_000
+# Verified images by content digest. The same reference is checked during
+# preflight, preparation and upload; decoding it once is enough.
+_IMAGE_INFO_CACHE: OrderedDict[bytes, tuple[str, str, tuple[int, int]]] = OrderedDict()
+_IMAGE_INFO_CACHE_SIZE = 64
+_IMAGE_INFO_LOCK = threading.Lock()
+
+try:
+    from ..common import secret_key as _secret_field
+except ImportError:  # providers imported as a top-level package by tools/tests.
+    from common import secret_key as _secret_field
 
 
 class ProviderError(RuntimeError):
-    pass
+    """User-facing failure. ``detail`` holds a redacted upstream excerpt.
+
+    The message may reach the chat; the detail is meant for the console only.
+    """
+
+    def __init__(self, message: Any = "", *, detail: str = ""):
+        super().__init__(message)
+        self.detail = detail
 
 
 @dataclass
@@ -109,9 +130,28 @@ def _validate_field_paths(fields: list[tuple[str, Any]]) -> None:
 
 
 def _image_info(data: bytes) -> tuple[str, str, tuple[int, int]]:
-    """Verify actual pixels instead of trusting a MIME header or file suffix."""
+    """Verify actual pixels instead of trusting a MIME header or file suffix.
+
+    Decoding is CPU-bound; async callers run it in a worker thread. Successful
+    results are cached by digest, failures are always re-checked.
+    """
     if not isinstance(data, bytes) or not data or len(data) > MAX_IMAGE_BYTES:
         raise ProviderError("图片为空或超过 32 MB")
+    key = hashlib.blake2b(data, digest_size=16).digest()
+    with _IMAGE_INFO_LOCK:
+        cached = _IMAGE_INFO_CACHE.get(key)
+        if cached is not None:
+            _IMAGE_INFO_CACHE.move_to_end(key)
+            return cached
+    result = _decode_image_info(data)
+    with _IMAGE_INFO_LOCK:
+        _IMAGE_INFO_CACHE[key] = result
+        while len(_IMAGE_INFO_CACHE) > _IMAGE_INFO_CACHE_SIZE:
+            _IMAGE_INFO_CACHE.popitem(last=False)
+    return result
+
+
+def _decode_image_info(data: bytes) -> tuple[str, str, tuple[int, int]]:
     try:
         from PIL import Image
     except ImportError as exc:
@@ -211,6 +251,7 @@ class ImageProvider:
         self.name = str(name)
         self.config = copy.deepcopy(config)
         self.last_request: dict[str, Any] = {}
+        self._session = None
         self.capabilities = ProviderCapabilities(image_to_image=bool(config.get("supports_image_edit", False)))
         kind = getattr(self, "provider_kind", str(config.get("kind") or "openai").lower().strip())
         mode = (
@@ -314,10 +355,27 @@ class ImageProvider:
         if details:
             self.last_request["notes"] = [safe(str(item)) for item in details]
 
+    def _config_secrets(self) -> list[str]:
+        """Credentials in this config, including nested workflow/body fields."""
+        found = {str(self.config.get("api_key") or "")}
+
+        def collect(item: Any) -> None:
+            if isinstance(item, dict):
+                for key, nested in item.items():
+                    if _secret_field(key) and isinstance(nested, str) and len(nested) >= 6:
+                        found.add(nested)
+                    else:
+                        collect(nested)
+            elif isinstance(item, list):
+                for nested in item:
+                    collect(nested)
+
+        collect(self.config)
+        return sorted((secret for secret in found if secret), key=len, reverse=True)
+
     def _safe_error(self, message: Any) -> str:
         value = str(message)
-        key = str(self.config.get("api_key") or "")
-        if key:
+        for key in self._config_secrets():
             value = value.replace(key, "[REDACTED]").replace(quote(key, safe=""), "[REDACTED]")
         value = re.sub(r"(?i)(bearer\s+)[^\s\"'<>]+", r"\1[REDACTED]", value)
         value = re.sub(r"(?i)(api[_-]?key|token|authorization)([\"'\s:=]+)[^\s,}\"']+", r"\1\2[REDACTED]", value)
@@ -344,6 +402,49 @@ class ImageProvider:
                 raise ProviderError("接口响应超过大小限制")
             chunks.append(chunk)
         return b"".join(chunks)
+
+    def _error_detail(self, raw: bytes, content_type: str) -> str:
+        """Short redacted reason from an upstream error body, for diagnostics."""
+        text = ""
+        kind = content_type.split(";", 1)[0].strip().lower()
+        try:
+            payload = json.loads(raw[:65536].decode("utf-8", "replace"))
+        except ValueError:
+            payload = None
+            if kind == "text/plain":
+                text = raw[:400].decode("utf-8", "replace")
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            for candidate in (
+                error.get("message") if isinstance(error, dict) else error,
+                payload.get("message"),
+                payload.get("detail"),
+                error.get("code") if isinstance(error, dict) else None,
+            ):
+                if (
+                    isinstance(candidate, (str, int, float))
+                    and not isinstance(candidate, bool)
+                    and str(candidate).strip()
+                ):
+                    text = str(candidate)
+                    break
+        text = re.sub(r"\s+", " ", text).strip()
+        return self._safe_error(text)[:200] if text else ""
+
+    @contextlib.asynccontextmanager
+    async def _shared_session(self):
+        """Reuse one connection pool for a burst of requests, such as polling."""
+        if self._session is not None:
+            yield
+            return
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            self._session = session
+            try:
+                yield
+            finally:
+                self._session = None
 
     async def _http(
         self,
@@ -377,23 +478,31 @@ class ImageProvider:
                     request_body.add_field(key, data, filename=f"reference-{index}.{extension}", content_type=mime)
         elif body is not None:
             request_body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        async def send(session, **extra):
+            async with session.request(
+                method, url, headers=headers, data=request_body, allow_redirects=False, **extra
+            ) as response:
+                raw = await self._read_response(response, limit)
+                content_type = response.headers.get("Content-Type", "")
+                if not 200 <= response.status < 300:
+                    hint = (
+                        "检查 Key、权限和模型"
+                        if response.status in {401, 403}
+                        else "接口限流，请稍后再试"
+                        if response.status == 429
+                        else "检查接口地址及参数"
+                    )
+                    # Error bodies can echo private request JSON or credentials:
+                    # the message stays generic, a redacted excerpt goes to detail.
+                    raise ProviderError(f"HTTP {response.status}：{hint}", detail=self._error_detail(raw, content_type))
+                return raw, content_type, response.status
+
         try:
+            if self._session is not None:
+                return await send(self._session, timeout=timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.request(
-                    method, url, headers=headers, data=request_body, allow_redirects=False
-                ) as response:
-                    raw = await self._read_response(response, limit)
-                    if not 200 <= response.status < 300:
-                        hint = (
-                            "检查 Key、权限和模型"
-                            if response.status in {401, 403}
-                            else "接口限流，请稍后再试"
-                            if response.status == 429
-                            else "检查接口地址及参数"
-                        )
-                        # Error bodies can echo private request JSON or credentials.
-                        raise ProviderError(f"HTTP {response.status}：{hint}")
-                    return raw, response.headers.get("Content-Type", ""), response.status
+                return await send(session)
         except ProviderError:
             raise
         except Exception as exc:
@@ -529,6 +638,12 @@ class ImageProvider:
     ) -> _PreparedGeneration:
         raise ProviderError("此接口没有实现生图，请使用具体绘画适配器")
 
+    async def _prepare_async(self, prompt: str, negative_prompt: str, *, reference=None, options=None):
+        """Prepare a submission off the event loop; reference checks decode images."""
+        return await asyncio.to_thread(
+            self._prepare_generation, prompt, negative_prompt, reference=reference, options=options, randomize=True
+        )
+
     async def _submit_prepared(self, request: _PreparedGeneration) -> tuple[bytes, str]:
         self._record_request(
             request.prompt,
@@ -557,7 +672,9 @@ class ImageProvider:
         except (ValueError, UnicodeDecodeError) as exc:
             raise ProviderError("接口没有返回有效 JSON 或图片") from exc
         if isinstance(payload, dict) and payload.get("error"):
-            raise ProviderError("接口返回错误响应，请检查服务端配置和额度")
+            raise ProviderError(
+                "接口返回错误响应，请检查服务端配置和额度", detail=self._error_detail(raw, "application/json")
+            )
         return payload
 
     def _result(self, data: bytes, model: str) -> GeneratedImage:
@@ -616,8 +733,10 @@ class ImageProvider:
         if raw.lstrip().startswith((b"{", b"[")) and not content_type.lower().startswith("image/"):
             value = self._response_value(self._json(raw))
             if isinstance(value, str) and value.startswith(("http://", "https://")):
-                return self._result(await self._download_image(value), model)
-        return self._decode(raw, content_type, model)
+                data = await self._download_image(value)
+                return await asyncio.to_thread(self._result, data, model)
+        # Base64 decoding and pixel verification are CPU-bound.
+        return await asyncio.to_thread(self._decode, raw, content_type, model)
 
     async def _resolve_host(self, host: str, port: int) -> list[str]:
         try:
@@ -725,15 +844,6 @@ class ImageProvider:
             result["message"] = self._safe_error(exc)
         result["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         return result
-
-    async def test_generation(
-        self, prompt: str = "simple blue flower on white background"
-    ) -> tuple[GeneratedImage, int]:
-        started = time.monotonic()
-        result = await self.generate(
-            prompt, "", options={"width": 512, "height": 512, "steps": 4, "scale": 3.0, "seed": -1}
-        )
-        return result, int((time.monotonic() - started) * 1000)
 
 
 class OpenAIProvider(ImageProvider):
@@ -891,9 +1001,7 @@ class OpenAIProvider(ImageProvider):
         self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None
     ) -> GeneratedImage:
         self.last_request = {}
-        request = self._prepare_generation(
-            prompt, negative_prompt, reference=reference, options=options, randomize=True
-        )
+        request = await self._prepare_async(prompt, negative_prompt, reference=reference, options=options)
         raw, mime = await self._submit_prepared(request)
         return await self._decode_response(raw, mime, request.model)
 
@@ -988,9 +1096,7 @@ class GeminiProvider(ImageProvider):
         self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None
     ) -> GeneratedImage:
         self.last_request = {}
-        request = self._prepare_generation(
-            prompt, negative_prompt, reference=reference, options=options, randomize=True
-        )
+        request = await self._prepare_async(prompt, negative_prompt, reference=reference, options=options)
         raw, _ = await self._submit_prepared(request)
         model = request.model
         payload = self._json(raw)
@@ -1006,7 +1112,7 @@ class GeminiProvider(ImageProvider):
                     continue
                 inline = part.get("inlineData", part.get("inline_data"))
                 if isinstance(inline, dict) and inline.get("data"):
-                    data, extension = _image_bytes(inline["data"])
+                    data, extension = await asyncio.to_thread(_image_bytes, inline["data"])
                     declared = str(inline.get("mimeType", inline.get("mime_type", ""))).replace(
                         "image/jpg", "image/jpeg"
                     )
@@ -1142,9 +1248,7 @@ class NovelAIProvider(ImageProvider):
         self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None
     ) -> GeneratedImage:
         self.last_request = {}
-        request = self._prepare_generation(
-            prompt, negative_prompt, reference=reference, options=options, randomize=True
-        )
+        request = await self._prepare_async(prompt, negative_prompt, reference=reference, options=options)
         raw, mime = await self._submit_prepared(request)
         return await self._decode_response(raw, mime, request.model)
 
@@ -1334,9 +1438,7 @@ class CustomProvider(ImageProvider):
         self, prompt: str, negative_prompt: str, *, reference: bytes | None = None, options: dict | None = None
     ) -> GeneratedImage:
         self.last_request = {}
-        request = self._prepare_generation(
-            prompt, negative_prompt, reference=reference, options=options, randomize=True
-        )
+        request = await self._prepare_async(prompt, negative_prompt, reference=reference, options=options)
         raw, mime = await self._submit_prepared(request)
         return await self._decode_response(raw, mime, request.model)
 

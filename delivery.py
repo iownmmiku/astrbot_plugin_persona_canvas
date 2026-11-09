@@ -10,12 +10,9 @@ from datetime import datetime
 async def delivery_guard(plugin, *, env=None, job=None):
     snapshot = job or {}
     umo = str(snapshot.get("umo") or (env or {}).get("umo") or "")
-    key = str(snapshot.get("session_key") or (env or {}).get("key") or "")
-    persona_id = snapshot.get("persona_id") or (env or {}).get("persona", {}).get("id")
     identity = snapshot.get("identity") or (
         {name: env.get(name, "") for name in ("astro_id", "cid")} if env and "astro_id" in env else None
     )
-    source = snapshot.get("source") or (env or {}).get("delivery_source")
     if identity is not None and umo and not umo.startswith("webui:"):
         try:
             current_identity = await asyncio.wait_for(plugin.dialogue.current_identity(umo), 15)
@@ -42,7 +39,7 @@ def local_delivery_guard(plugin, *, env=None, job=None):
     # All mutable local checks follow the final asynchronous identity lookup.
     if plugin._closing:
         return "插件正在停止"
-    if not umo.startswith("webui:") and not plugin.storage.settings["integration"].get("enabled", True):
+    if not umo.startswith("webui:") and not plugin._integration_enabled():
         return "聊天接入已停用，旧内容不再发送"
     current_job = plugin.storage.job(snapshot["id"]) if snapshot.get("id") else snapshot
     current_job = current_job or {}

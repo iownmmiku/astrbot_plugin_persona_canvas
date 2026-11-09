@@ -65,7 +65,7 @@ sys.modules["canvas_test"] = package
 spec.loader.exec_module(package)
 from canvas_test import main
 from canvas_test.active import ActiveScheduler
-from canvas_test.intent import photo_request, heuristic_intent
+from canvas_test.intent import photo_request
 from canvas_test.providers.base import GeneratedImage, ProviderCapabilities
 from canvas_test.storage import Storage
 
@@ -180,7 +180,6 @@ class RequestTests(unittest.TestCase):
                 self.assertFalse(photo_request(text))
         for text in ("给我拍一张你的自拍", "给我画一只猫", "给我画一片大海", "把刚才的图片背景换成夜景"):
             self.assertTrue(photo_request(text), text)
-        self.assertEqual(heuristic_intent("给我画一只猫").mode, "scene")
 
     def test_confirmation_expires_and_requires_context(self):
         self.assertFalse(photo_request("好"))
@@ -315,8 +314,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.session(before["key"])["state"], before["session"]["state"])
         self.assertEqual(self.store.recent_jobs()[0]["status"], "failed")
         self.assertFalse(any(kind == "image" for chain in event.sent for kind, _value in chain.chain))
-        self.assertTrue(self.store.reserve_quota("qq:123", {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 1})[0])
-        self.store.finish_quota("qq:123")
+        allowed, _reason, token = self.store.reserve_quota_token("qq:123", {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 1})
+        self.assertTrue(allowed)
+        self.store.finish_quota_token(token)
 
     async def test_state_updates_do_not_generate_and_sessions_are_isolated(self):
         event = Event("换成白色连衣裙")

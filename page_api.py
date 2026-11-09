@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import io
@@ -9,6 +10,11 @@ import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
+
+try:
+    from .common import redact_text
+except ImportError:  # Loaded as a top-level module by standalone tools/tests.
+    from common import redact_text
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
 PAGE_PREFIX = f"/{PLUGIN_NAME}/page"
@@ -23,9 +29,7 @@ GET_ROUTES = {
     "personas": "web_personas",
     "providers": "web_providers",
     "targets": "web_targets",
-    "history": "web_history",
     "sessions": "web_sessions",
-    "jobs": "web_jobs",
     "llm/providers": "_llm_providers",
     "export": "web_export",
 }
@@ -52,20 +56,10 @@ POST_ROUTES = {
 
 
 def public_error(plugin, exc: Exception) -> str:
-    """Do not expose configured keys or credentials in provider errors."""
+    """Console error text: credentials hidden, upstream detail kept for diagnosis."""
     message = str(exc) or "操作失败，请查看 AstrBot 日志"
-    scrub = getattr(plugin.storage, "_scrub_known_secrets", None)
-    if callable(scrub):
-        message = str(scrub(message))
-    for item in getattr(plugin.storage, "settings", {}).get("providers", {}).values():
-        if isinstance(item, dict):
-            for key in ("api_key", "auth_value"):
-                secret = str(item.get(key) or "")
-                if secret:
-                    message = message.replace(secret, "[已隐藏]")
-    message = re.sub(r"(?i)(bearer\s+)[^\s,\"']+", r"\1[已隐藏]", message)
-    message = re.sub(r"(?i)([?&](?:key|api_key|token|access_token)=)[^&\s]+", r"\1[已隐藏]", message)
-    return message[:500]
+    detail = str(getattr(exc, "detail", "") or "")
+    return redact_text(plugin.storage, message + (f"（上游详情：{detail}）" if detail else ""))
 
 
 def asset_path(plugin, name: str) -> Path:
@@ -98,42 +92,93 @@ def preview_descriptor(plugin, name: str) -> dict[str, str] | None:
         return None
 
 
+def _render_thumbnail(path: Path) -> str:
+    """CPU-bound: decode, orient and re-encode a small JPEG preview."""
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as source:
+        picture = ImageOps.exif_transpose(source).convert("RGB")
+        picture.thumbnail((384, 384))
+        buffer = io.BytesIO()
+        picture.save(buffer, "JPEG", quality=75, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _full_data_url(path: Path) -> str:
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _thumbnail_cache(plugin) -> OrderedDict:
+    cache = getattr(plugin, "_canvas_thumbnail_cache", None)
+    if cache is None:
+        cache = plugin._canvas_thumbnail_cache = OrderedDict()
+    return cache
+
+
+def _cached_thumbnail(plugin, name: str, version: str) -> str:
+    cache = _thumbnail_cache(plugin)
+    cached = cache.get(name)
+    if cached and cached[0] == version:
+        cache.move_to_end(name)
+        return cached[1]
+    return ""
+
+
+def _store_thumbnail(plugin, name: str, version: str, value: str) -> None:
+    cache = _thumbnail_cache(plugin)
+    cache[name] = (version, value)
+    cache.move_to_end(name)
+    plugin._canvas_thumbnail_bytes = sum(len(item[1]) for item in cache.values())
+    while cache and (len(cache) > THUMBNAIL_CACHE_ENTRIES or plugin._canvas_thumbnail_bytes > THUMBNAIL_CACHE_BYTES):
+        _old, (_version, dropped) = cache.popitem(last=False)
+        plugin._canvas_thumbnail_bytes -= len(dropped)
+
+
+def _drop_thumbnail(plugin, name: str) -> None:
+    cache = getattr(plugin, "_canvas_thumbnail_cache", None)
+    if cache is not None:
+        cache.pop(name, None)
+
+
 def image_data_url(plugin, name: str, thumbnail: bool = False) -> str:
+    """Synchronous variant for tools/tests; request handlers use the async one."""
     try:
         path = asset_path(plugin, name)
-        if thumbnail:
-            descriptor = preview_descriptor(plugin, name)
-            if descriptor is None:
-                return ""
-            cache = getattr(plugin, "_canvas_thumbnail_cache", None)
-            if cache is None:
-                cache = plugin._canvas_thumbnail_cache = OrderedDict()
-            cached = cache.get(name)
-            if cached and cached[0] == descriptor["version"]:
-                cache.move_to_end(name)
-                return cached[1]
-            from PIL import Image, ImageOps
-
-            with Image.open(path) as source:
-                picture = ImageOps.exif_transpose(source).convert("RGB")
-                picture.thumbnail((384, 384))
-                buffer = io.BytesIO()
-                picture.save(buffer, "JPEG", quality=75, optimize=True)
-                result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
-            cache[name] = (descriptor["version"], result)
-            cache.move_to_end(name)
-            while cache and (
-                len(cache) > THUMBNAIL_CACHE_ENTRIES
-                or sum(len(item[1]) for item in cache.values()) > THUMBNAIL_CACHE_BYTES
-            ):
-                cache.popitem(last=False)
-            return result
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        if not thumbnail:
+            return _full_data_url(path)
+        descriptor = preview_descriptor(plugin, name)
+        if descriptor is None:
+            return ""
+        result = _cached_thumbnail(plugin, name, descriptor["version"])
+        if not result:
+            result = _render_thumbnail(path)
+            _store_thumbnail(plugin, name, descriptor["version"], result)
+        return result
     except (ValueError, OSError, ImportError):
-        cache = getattr(plugin, "_canvas_thumbnail_cache", None)
-        if cache is not None:
-            cache.pop(name, None)
+        _drop_thumbnail(plugin, name)
+        return ""
+
+
+async def image_data_url_async(plugin, name: str, thumbnail: bool = False) -> str:
+    """Same result as image_data_url, with file IO and image work in a thread.
+
+    The cache is only touched on the event loop, never from the worker.
+    """
+    try:
+        path = asset_path(plugin, name)
+        if not thumbnail:
+            return await asyncio.to_thread(_full_data_url, path)
+        descriptor = preview_descriptor(plugin, name)
+        if descriptor is None:
+            return ""
+        result = _cached_thumbnail(plugin, name, descriptor["version"])
+        if not result:
+            result = await asyncio.to_thread(_render_thumbnail, path)
+            _store_thumbnail(plugin, name, descriptor["version"], result)
+        return result
+    except (ValueError, OSError, ImportError):
+        _drop_thumbnail(plugin, name)
         return ""
 
 
@@ -145,7 +190,7 @@ async def dispatch_api(plugin, method: str, path: str, body: dict | None = None)
         name = path.removeprefix("reference/preview/")
         return {
             "asset": name,
-            "image": image_data_url(plugin, name, thumbnail=True),
+            "image": await image_data_url_async(plugin, name, thumbnail=True),
             "thumbnail": preview_descriptor(plugin, name),
         }
     routes = GET_ROUTES if method == "GET" else POST_ROUTES
@@ -228,7 +273,7 @@ class CanvasPageApi:
             return jsonify(
                 {
                     "asset": name,
-                    "image": image_data_url(self.plugin, name, thumbnail=True),
+                    "image": await image_data_url_async(self.plugin, name, thumbnail=True),
                     "thumbnail": preview_descriptor(self.plugin, name),
                 }
             )

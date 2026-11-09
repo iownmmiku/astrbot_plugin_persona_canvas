@@ -56,20 +56,6 @@ def semantic_request_error(text):
     return ""
 
 
-def changed_conditions(text):
-    """Recognize obvious edits; the tool's model still judges all other wording."""
-    clean = request_text(text)
-    # Repeating an agreed outfit/pose ("按约定穿上白裙") is not a change.
-    return bool(
-        re.search(
-            r"(?:但是|不过|可是|但)[^。！？\n]{0,40}(?:换|改|穿|坐|站|近一点|远一点)"
-            r"|(?:^|[，,])\s*(?:那|那就|请|再)?\s*(?:换成|换上|换个姿势|改成|改为)"
-            r"|(?:镜头|构图)(?:再|改|改成|换成)(?:近|远)一?[点些]",
-            clean,
-        )
-    )
-
-
 def pending_request(env, text, reply, required=None, *, kind="photo", ttl=1800):
     return {
         "request_id": secrets.token_hex(10),

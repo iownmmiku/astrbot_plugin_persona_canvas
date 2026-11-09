@@ -36,14 +36,8 @@ class Intent:
     prompt_delta: str = ""
     scene_prompt: str = ""
     state_patch: dict[str, str] = field(default_factory=dict)
-    needs_reference: bool = False
-    provider: str = ""
     caption: str = ""
     raw: str = ""
-
-    @property
-    def is_generation(self) -> bool:
-        return self.mode in {"persona_selfie", "persona_edit", "scene", "image_edit"}
 
 
 def parse_json(text: str) -> dict:
@@ -140,42 +134,6 @@ def state_request(text: str, pending: dict | None = None) -> bool:
     if re.search(r"(?:不要|别|不想|不用).{0,12}(?:换|穿|摆|坐|站)", text):
         return False
     return bool(re.search(r"(?:换成|换上|穿上|换衣|换个姿势|摆个|坐在|站在|笑一个)", text))
-
-
-def validate_intent(value: dict | None, raw: str = "") -> Intent:
-    value = value or {}
-    mode = {"photo": "persona_selfie", "selfie": "persona_selfie", "edit": "image_edit", "normal": "scene"}.get(
-        str(value.get("mode")), str(value.get("mode", "none"))
-    )
-    if mode not in {"persona_selfie", "persona_edit", "scene", "image_edit", "none"}:
-        mode = "none"
-    return Intent(
-        mode=mode,
-        use_persona=mode.startswith("persona"),
-        prompt_delta=str(value.get("prompt_delta") or value.get("prompt") or "")[:5000],
-        scene_prompt=str(value.get("scene_prompt") or value.get("prompt") or "")[:5000],
-        state_patch=state_patch(value.get("state_patch")),
-        needs_reference=mode == "image_edit" or bool(value.get("needs_reference")),
-        provider=str(value.get("provider") or "")[:80],
-        caption=str(value.get("caption") or value.get("reply") or "")[:1000],
-        raw=raw,
-    )
-
-
-def heuristic_intent(text: str, has_reference: bool = False) -> Intent:
-    # Classification never grants role consent.
-    if not photo_request(text):
-        return Intent(raw=text)
-    if has_reference and re.search(r"改|换|编辑|重绘", text):
-        return Intent(mode="image_edit", needs_reference=True, scene_prompt=text, raw=text)
-    persona = bool(re.search(r"自拍|你的照片|拍.{0,10}你|你.{0,6}穿|人设", text))
-    return Intent(
-        mode="persona_selfie" if persona else "scene",
-        use_persona=persona,
-        prompt_delta=text if persona else "",
-        scene_prompt="" if persona else text,
-        raw=text,
-    )
 
 
 def prompt_bundle(persona: dict, intent: Intent, global_negative: str = "") -> tuple[str, str]:

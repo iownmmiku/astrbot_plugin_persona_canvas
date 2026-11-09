@@ -59,7 +59,9 @@ SHARED_SAMPLER_ALIASES = {
 
 class ComfyUIProvider(ImageProvider):
     provider_kind = "comfyui"
+    # History polling starts quickly and backs off while a long job runs.
     poll_interval = 0.5
+    max_poll_interval = 2.0
 
     def __init__(self, name: str, config: dict[str, Any]):
         derived = copy.deepcopy(config)
@@ -184,7 +186,10 @@ class ComfyUIProvider(ImageProvider):
             raise ProviderError(f"ComfyUI {operation}响应必须为对象")
         if value.get("error"):
             # Node errors often echo complete inputs and third-party credentials.
-            raise ProviderError(f"ComfyUI {operation}失败，请检查工作流节点、模型及映射配置")
+            raise ProviderError(
+                f"ComfyUI {operation}失败，请检查工作流节点、模型及映射配置",
+                detail=self._error_detail(raw, "application/json"),
+            )
         return value
 
     async def _json_request(
@@ -274,7 +279,7 @@ class ComfyUIProvider(ImageProvider):
         await self._progress("fetching", prompt_id)
         url = self._comfy_url("/view") + "?" + urlencode({"filename": name, "subfolder": folder, "type": kind})
         raw, mime, _ = await self._http("GET", url, limit=MAX_IMAGE_BYTES)
-        extension, actual_mime, _ = _image_info(raw)
+        extension, actual_mime, _ = await asyncio.to_thread(_image_info, raw)
         declared = mime.split(";", 1)[0].strip().lower().replace("image/jpg", "image/jpeg")
         if declared.startswith("image/") and declared != actual_mime:
             raise ProviderError("ComfyUI 图片 MIME 与实际内容不匹配")
@@ -438,9 +443,7 @@ class ComfyUIProvider(ImageProvider):
     ) -> GeneratedImage:
         self.last_request = {}
         self.last_recovery = {}
-        prepared = self._prepare_generation(
-            prompt, negative_prompt, reference=reference, options=options, randomize=True
-        )
+        prepared = await self._prepare_async(prompt, negative_prompt, reference=reference, options=options)
         workflow, fields, model = prepared["workflow"], prepared["fields"], prepared["model"]
         negative_field = prepared["negative_field"]
         self._record_request(
@@ -457,6 +460,10 @@ class ComfyUIProvider(ImageProvider):
         state = {"prompt_id": ""}
 
         async def run() -> GeneratedImage:
+            async with self._shared_session():
+                return await submit_and_wait()
+
+        async def submit_and_wait() -> GeneratedImage:
             if reference is not None:
                 data = reference[0] if isinstance(reference, list) else reference
                 uploaded = await self._json_request(
@@ -481,6 +488,7 @@ class ComfyUIProvider(ImageProvider):
             state["prompt_id"] = prompt_id
             await self._progress("accepted", prompt_id)
             checked_queue_at = 0.0
+            delay = self.poll_interval
             while True:
                 image = await self._history_image(prompt_id)
                 if image is not None:
@@ -493,7 +501,8 @@ class ComfyUIProvider(ImageProvider):
                         phase = "accepted"  # History polling remains authoritative.
                     if phase in {"running", "queued"} and self.last_recovery.get("phase") != phase:
                         await self._progress(phase, prompt_id)
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(delay)
+                delay = min(max(delay * 1.5, self.poll_interval), max(self.max_poll_interval, self.poll_interval))
 
         try:
             return await asyncio.wait_for(run(), timeout=_integer(self.config.get("timeout", 180), "超时", 5, 600))

@@ -68,7 +68,7 @@ class Release056Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("image", str(self.store.asset(job["asset"]))), chain.chain)
         self.assertEqual(len(self.image_provider.calls), 1)
         self.assertEqual(self.store.job(job["id"])["resend_count"], 1)
-        self.assertEqual((await self.plugin.web_history())["items"][0]["status"], "sent")
+        self.assertEqual((await self.plugin.web_history_query({}))["items"][0]["status"], "sent")
 
     async def test_unknown_ack_requires_explicit_check_and_retains_unknown_on_error(self):
         job = await self.saved_job("succeeded")

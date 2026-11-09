@@ -9,6 +9,7 @@ import json
 import math
 import re
 import time
+import weakref
 from contextlib import asynccontextmanager
 
 from astrbot.api import logger
@@ -16,6 +17,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .active import ActiveScheduler
+from .common import CANCELLABLE_JOB_STATUSES, DECISION_MODES, MODE_DECISIONS, redact_text, secret_key, zone
 from .dialogue import Dialogue, field, maybe_await
 from .delivery import delivery_guard, local_delivery_guard
 from .companion import (
@@ -31,14 +33,15 @@ from .companion import (
 )
 from .intent import Intent, message_text, photo_request, prompt_bundle, state_patch, state_request
 from .moderation import Moderation
-from .page_api import CanvasPageApi, image_data_url
+from .page_api import CanvasPageApi, image_data_url_async
 from .providers.base import ProviderCapabilities, ProviderError, provider_from_config
 from .reply_images import ReplyImages
-from .storage import Storage, _secret_key
+from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.16"
+VERSION = "0.5.17"
+INTENT_MODES = {"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}
 
 
 class DeliveryRejectedError(ValueError):
@@ -55,13 +58,179 @@ def _restore_workflow_secrets(value, previous):
     old = previous if isinstance(previous, dict) else {}
     restored = {key: _restore_workflow_secrets(item, old.get(key)) for key, item in value.items()}
     for key, secret in old.items():
-        if _secret_key(key):
+        if secret_key(key):
             marker = "has_" + str(key).lower().replace("-", "_")
             if marker in value and isinstance(value[marker], bool):
                 if key not in value:
                     restored[key] = copy.deepcopy(secret)
                 restored.pop(marker, None)
     return restored
+
+
+# Console settings accepted per group, as (kind, *arguments). Other keys are
+# ignored. Ranges are inclusive; "int" rejects fractional values.
+SETTINGS_RULES = {
+    "integration": {
+        "enabled": ("bool",),
+        "strict_trigger": ("bool",),
+        "mode": ("choice", {"native_tools", "compatibility"}, "聊天接入模式无效"),
+    },
+    "dialogue": {
+        "enabled": ("bool",),
+        "timeout_sec": ("int", 5, 300),
+        "context_turns": ("int", 1, 100),
+        "confirmation_ttl_sec": ("int", 30, 86400),
+    },
+    "reply_images": {
+        "enabled": ("bool",),
+        "default_probability": ("float", 0, 100),
+        "min_interval_sec": ("int", 0, 86400),
+        "max_wait_sec": ("int", 5, 600),
+        "provider": ("provider",),
+    },
+    "llm": {
+        "provider_id": ("text", 200),
+        "model": ("text", 200),
+        "fallback_to_current": ("bool",),
+        "timeout_sec": ("int", 5, 300),
+    },
+    "moderation": {
+        "enabled": ("bool",),
+        "daily_limit": ("int", 0, 10000),
+        "min_interval_sec": ("int", 0, 86400),
+        "max_concurrency": ("int", 1, 16),
+        "timezone": ("zone",),
+    },
+    "generation": {
+        "width": ("int", 64, 4096),
+        "height": ("int", 64, 4096),
+        "steps": ("int", 1, 150),
+        "scale": ("float", 0, 30),
+        "sampler": ("text", 100),
+        "seed": ("int", -1, 4294967295),
+        "max_history": ("int", 1, 5000),
+        "max_concurrency": ("int", 1, 16),
+        "timeout_sec": ("int", 5, 600),
+    },
+    "active": {
+        "enabled": ("bool",),
+        "check_interval_sec": ("int", 15, 3600),
+        "max_concurrent_targets": ("int", 1, 16),
+        "default_start": ("time",),
+        "default_end": ("time",),
+        "min_gap_sec": ("int", 60, 604800),
+        "min_idle_sec": ("int", 0, 604800),
+        "timezone": ("zone",),
+        "silence_after": ("int", 1, 100),
+        "silence_hours": ("int", 1, 720),
+        "jitter_percent": ("int", 0, 40),
+    },
+    "good_morning": {
+        "enabled": ("bool",),
+        "start": ("time",),
+        "end": ("time",),
+        "timezone": ("zone",),
+        "max_attempts": ("int", 1, 5),
+        "retry_interval_sec": ("int", 60, 3600),
+        "image_mode": ("choice", {"prefer_photo", "auto", "text_only"}, "早安配图模式无效"),
+    },
+    "state_lifetimes": {
+        "outfit_sec": ("int", 0, 2592000),
+        "pose_sec": ("int", 0, 604800),
+        "expression_sec": ("int", 0, 604800),
+        "scene_sec": ("int", 0, 2592000),
+    },
+    "proactive_budget": {
+        "messages": ("int", 0, 10000),
+        "photos": ("int", 0, 10000),
+        "llm": ("int", 0, 10000),
+        "timezone": ("zone",),
+    },
+}
+_CLOCK = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+
+
+def _checked_setting(key, value, rule, providers):
+    """Validate one console setting and return the value to store."""
+    kind = rule[0]
+    if kind in {"int", "float"}:
+        low, high = rule[1], rule[2]
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError(f"{key} 必须为数值")
+        try:
+            number = float(value)
+        except ValueError:
+            raise ValueError(f"{key} 必须为数值") from None
+        if not math.isfinite(number):
+            raise ValueError(f"{key} 应在 {low} 到 {high} 之间")
+        if kind == "int":
+            if not number.is_integer():
+                raise ValueError(f"{key} 必须为整数")
+            number = int(number)
+        if not low <= number <= high:
+            raise ValueError(f"{key} 应在 {low} 到 {high} 之间")
+        return number
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} 必须为开关值")
+        return value
+    if kind == "time":
+        if not isinstance(value, str) or not _CLOCK.fullmatch(value):
+            raise ValueError("时间格式应为 HH:MM")
+        return value
+    if kind == "zone":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("时区不能为空")
+        zone(value.strip())
+        return value.strip()
+    if kind == "choice":
+        if not isinstance(value, str) or value not in rule[1]:
+            raise ValueError(rule[2])
+        return value
+    if kind == "provider":
+        if not isinstance(value, str) or (value and value not in providers):
+            raise ValueError("配图接口不存在，请重新选择")
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{key} 必须为文本")
+    if len(value.strip()) > rule[1]:
+        raise ValueError(f"{key} 不能超过 {rule[1]} 个字符")
+    return value.strip()
+
+
+_TEMP_PART_WARNED = False
+
+
+def _temporary_text_part(text):
+    """A temporary user-content part, or None if this AstrBot lacks the API.
+
+    TextPart lives in astrbot.core (not astrbot.api), so it may move between
+    releases; the LLM hook must keep working when it does.
+    """
+    global _TEMP_PART_WARNED
+    try:
+        from astrbot.core.agent.message import TextPart
+
+        return TextPart(text=text).mark_as_temp()
+    except (ImportError, AttributeError, TypeError) as exc:
+        if not _TEMP_PART_WARNED:
+            _TEMP_PART_WARNED = True
+            logger.warning(
+                "[随想画卷] 当前 AstrBot 不支持临时消息内容（%s），视觉资料改为附加到本次请求的系统提示", exc
+            )
+        return None
+
+
+def _verify_reference_image(data):
+    """CPU-bound upload check; returns the stored file extension."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as image:
+        if image.format not in {"PNG", "JPEG", "WEBP"} or image.width * image.height > 32_000_000:
+            raise ValueError("请选择有效的 PNG、JPEG 或 WebP 图片，像素总量不超过 3200 万")
+        extension = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}[image.format]
+        image.verify()
+    return extension
 
 
 def _text(event):
@@ -98,7 +267,8 @@ class PersonaCanvasPlugin(Star):
         self._tasks = set()
         self._requests = set()
         self._job_tasks = {}
-        self._session_locks = {}
+        # Locks are keyed per session/job; unused ones are dropped automatically.
+        self._session_locks = weakref.WeakValueDictionary()
         self._slots = asyncio.Condition()
         self._running = 0
         self._generation_waiters = []
@@ -184,7 +354,10 @@ class PersonaCanvasPlugin(Star):
         error = self._error(exc)
         stage = stage or current.get("preparation_stage") or "request"
         self.storage.update_job(job_id, {"status": "failed", "phase": "failed", "error": error, "failure_stage": stage})
-        failed = self._trace_job(job_id, stage, "failed", error)
+        # The error may be sent to the chat; the upstream detail stays in the trace.
+        failed = self._trace_job(
+            job_id, stage, "failed", self._error_detail(exc) if getattr(exc, "detail", "") else error
+        )
         self._photo_note(failed)
         self.storage.append_history(
             {
@@ -315,7 +488,7 @@ class PersonaCanvasPlugin(Star):
         job = self.storage.job(job_id)
         if not job:
             raise ValueError("任务不存在")
-        if job["status"] not in {"queued", "deciding", "generating", "succeeded"}:
+        if job["status"] not in CANCELLABLE_JOB_STATUSES:
             raise ValueError("任务已结束或已经开始发送，无法撤回；发送结果不确定时请检查聊天记录")
         job = self.storage.update_job(
             job_id, {"status": "cancelled", "cancel_requested": True, "error": "用户已撤回本次拍摄，不再发送照片"}
@@ -338,9 +511,7 @@ class PersonaCanvasPlugin(Star):
         env["session"] = current
         active_jobs = [self.storage.job(j) for j in self._job_tasks]
         if not env["session"].get("pending") and not any(
-            j
-            and j.get("session_key") == env["key"]
-            and j.get("status") in {"queued", "deciding", "generating", "succeeded"}
+            j and j.get("session_key") == env["key"] and j.get("status") in CANCELLABLE_JOB_STATUSES
             for j in active_jobs
         ):
             return
@@ -350,11 +521,7 @@ class PersonaCanvasPlugin(Star):
         cancelled = 0
         for job_id in list(self._job_tasks):
             job = self.storage.job(job_id)
-            if (
-                job
-                and job.get("session_key") == env["key"]
-                and job.get("status") in {"queued", "deciding", "generating", "succeeded"}
-            ):
+            if job and job.get("session_key") == env["key"] and job.get("status") in CANCELLABLE_JOB_STATUSES:
                 await self._cancel_job(job_id)
                 cancelled += 1
         session = self.storage.read_session(env["key"])
@@ -384,7 +551,7 @@ class PersonaCanvasPlugin(Star):
         self.active = ActiveScheduler(self)
         self._spawn(self.active.run(), "persona-canvas-scheduler")
         self._spawn(self._asset_maintenance(), "persona-canvas-assets")
-        for job in self.storage.recent_jobs(10000):
+        for job in self.storage.jobs_with_status({"queued", "deciding", "generating", "sending"}):
             if job.get("status") in {"queued", "deciding", "generating"}:
                 self.storage.update_job(job["id"], {"status": "failed", "error": "任务被重启中断，可在任务历史中重试"})
                 self._photo_note(self.storage.job(job["id"]))
@@ -393,7 +560,7 @@ class PersonaCanvasPlugin(Star):
                     job["id"], {"status": "uncertain", "error": "重启前正在发送，结果不确定，请先检查聊天记录"}
                 )
                 self._photo_note(self.storage.job(job["id"]))
-        for delivery in self.storage.export().get("deliveries", []):
+        for delivery in self.storage.deliveries_for_recovery():
             if delivery.get("kind") == "reply_image":
                 if delivery.get("attached"):
                     self.storage.update_delivery(
@@ -427,10 +594,12 @@ class PersonaCanvasPlugin(Star):
                 )
 
     async def _asset_maintenance(self):
+        # Retention also covers new generations; it no longer runs after each one.
         while not self._closing:
             try:
-                self.storage.maintenance(int(self.storage.settings["generation"].get("max_history", 100)))
-                self.storage.cleanup_assets(grace_sec=3600)
+                limit = int(self.storage.settings["generation"].get("max_history", 100))
+                await asyncio.to_thread(self.storage.maintenance, limit)
+                await asyncio.to_thread(self.storage.cleanup_assets, grace_sec=3600)
             except Exception as exc:
                 logger.warning("随想画卷资源清理失败：%s", self._error(exc))
             await asyncio.sleep(300)
@@ -444,6 +613,8 @@ class PersonaCanvasPlugin(Star):
         await asyncio.gather(*list(tasks), return_exceptions=True)
         if self.webui:
             await self.webui.close()
+        if self.active:
+            self.active.flush()
         self.storage.close()
 
     def _track_current(self):
@@ -455,13 +626,16 @@ class PersonaCanvasPlugin(Star):
             task.add_done_callback(self._requests.discard)
 
     def _error(self, exc):
-        text = str(self.storage._scrub_known_secrets(str(exc)))
-        for config in self.storage.settings.get("providers", {}).values():
-            for key in ("api_key", "auth_value"):
-                secret = str(config.get(key) or "")
-                if secret:
-                    text = text.replace(secret, "[已隐藏]")
-        return re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [已隐藏]", text)[:500]
+        """Chat-safe error text: credentials hidden, truncated."""
+        return redact_text(self.storage, exc)
+
+    def _error_detail(self, exc):
+        """Console-only: the error plus a redacted upstream excerpt, if any."""
+        detail = str(getattr(exc, "detail", "") or "")
+        return self._error(str(exc) + (f"（上游详情：{detail}）" if detail else ""))
+
+    def _integration_enabled(self):
+        return bool(self.storage.settings["integration"].get("enabled", True))
 
     def _provider(self, name=None):
         key = str(name or self.storage.settings.get("default_provider") or "default")
@@ -533,7 +707,10 @@ class PersonaCanvasPlugin(Star):
         return await delivery_guard(self, env=env, job=job)
 
     def _lock(self, key):
-        return self._session_locks.setdefault(key, asyncio.Lock())
+        lock = self._session_locks.get(key)
+        if lock is None:
+            lock = self._session_locks[key] = asyncio.Lock()
+        return lock
 
     async def _env(self, event):
         cached = _extra(event, "environment")
@@ -552,7 +729,7 @@ class PersonaCanvasPlugin(Star):
         env["session"] = current
         env["persona"]["state"] = copy.deepcopy(current["state"])
         self._prepare_request(env, _text(event))
-        if not self.storage.settings["integration"].get("enabled", True):
+        if not self._integration_enabled():
             return "聊天接入已停用", "request"
         if not _addressed(event):
             return "群聊没有明确唤醒机器人", "request"
@@ -618,6 +795,60 @@ class PersonaCanvasPlugin(Star):
             _extra(event, "delivery_key", key, set_value=True)
         return True
 
+    def _admit_job(self, env, prepared, fields, *, event=None, previous=None):
+        """Record a locally preflighted job before background dispatch."""
+        provider = prepared["provider"]
+        summary = self._request_summary(
+            provider,
+            prepared["positive"],
+            prepared["negative"],
+            prepared["options"],
+            len(prepared["reference_names"]),
+            fields.get("reference_source", ""),
+        )
+        job = self.storage.create_job(
+            {
+                "status": "queued",
+                "phase": "local_queued",
+                "preflight_checked": True,
+                "provider": provider.name,
+                "request_summary": summary,
+                "umo": env["umo"],
+                "session_key": env["key"],
+                "persona_id": env["persona"]["id"],
+                **fields,
+            }
+        )
+        if self._is_webchat(env["umo"], event=event, job=previous):
+            job = self.storage.update_job(job["id"], {"delivery_platform": "webchat"})
+        return job
+
+    def _bind_pending(self, env, job_id, pending):
+        """Attach a job to agreed conditions once; return the existing job ID if taken."""
+        claim = self.storage.claim_photo_request(env["key"], env["persona"]["id"], pending["request_id"], job_id)
+        if not claim["claimed"]:
+            self.storage.update_job(
+                job_id, {"status": "cancelled", "error": "相同条件已有生成任务", "duplicate_of": claim["job_id"]}
+            )
+            return claim["job_id"]
+        env["session"] = claim["session"]
+        self.storage.update_job(job_id, {"confirmed_request_id": pending["request_id"]})
+        return ""
+
+    async def _run_job(self, job_id, work, *, event=None):
+        """Shared background body: record failures and notify the chat once."""
+        try:
+            await work()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            current = self.storage.job(job_id) or {}
+            self._fail_job(job_id, exc)
+            if current.get("delivery_key") and current.get("status") not in {"uncertain", "delivery_failed"}:
+                self.storage.update_delivery(current["delivery_key"], {"status": "failed", "error": self._error(exc)})
+            if event is not None:
+                await self._notify_photo_failure(self.storage.job(job_id), event=event)
+
     async def _capture_reference(self, event):
         # Prefer platform image conversion API rather than arbitrary remote URL IO.
         from astrbot.api.message_components import Image
@@ -644,8 +875,12 @@ class PersonaCanvasPlugin(Star):
             if isinstance(parts, list):
                 parts[:] = [part for part in parts if part is not previous]
             req._persona_canvas_visual_part = None
+        previous_text = getattr(req, "_persona_canvas_visual_text", None)
+        if previous_text:
+            req.system_prompt = str(getattr(req, "system_prompt", "") or "").replace(previous_text, "")
+            req._persona_canvas_visual_text = None
         self.reply_images.observe(event)
-        if not self.storage.settings["integration"].get("enabled", True):
+        if not self._integration_enabled():
             return
         env = await self.dialogue.environment(event.unified_msg_origin, conversation=getattr(req, "conversation", None))
         self._prepare_request(env, _text(event))
@@ -667,9 +902,14 @@ class PersonaCanvasPlugin(Star):
             and self._eligible(_text(event), env)
         ):
             visual_context += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"
-        from astrbot.core.agent.message import TextPart
-
-        part = TextPart(text=visual_context).mark_as_temp()
+        part = _temporary_text_part(visual_context)
+        if part is None:
+            # SDK without temporary content parts: add the block to this
+            # request's system prompt only, replacing any earlier copy.
+            block = "\n\n" + visual_context
+            req.system_prompt = str(getattr(req, "system_prompt", "") or "") + block
+            req._persona_canvas_visual_text = block
+            return
         if getattr(req, "extra_user_content_parts", None) is None:
             req.extra_user_content_parts = []
         req.extra_user_content_parts.append(part)
@@ -678,7 +918,7 @@ class PersonaCanvasPlugin(Star):
     @filter.on_llm_response()
     async def remember_conditions(self, event: AstrMessageEvent, response):
         if (
-            not self.storage.settings["integration"].get("enabled", True)
+            not self._integration_enabled()
             or _extra(event, "photo_attempted")
             or _extra(event, "conditions_recorded")
             or _extra(event, "native_tool_seen")
@@ -802,7 +1042,7 @@ class PersonaCanvasPlugin(Star):
         self._prepare_request(env, _text(event))
         semantic = bool(str(request_summary or "").strip())
         if (
-            not self.storage.settings["integration"].get("enabled", True)
+            not self._integration_enabled()
             or not _addressed(event)
             or request_kind not in {"photo", "state"}
             or (
@@ -823,7 +1063,7 @@ class PersonaCanvasPlugin(Star):
             if (
                 previous_job.get("session_key") == env["key"]
                 and previous_job.get("persona_id") == env["persona"]["id"]
-                and previous_job.get("status") in {"queued", "deciding", "generating", "succeeded"}
+                and previous_job.get("status") in CANCELLABLE_JOB_STATUSES
             ):
                 # Replacing an agreement also withdraws its unfinished photo.
                 # Keeping the newer state alone would still send the old image.
@@ -897,7 +1137,7 @@ class PersonaCanvasPlugin(Star):
         _extra(event, "native_tool_seen", True, set_value=True)
         env = await self._env(event)
         try:
-            if not self.storage.settings["integration"].get("enabled", True) or not _addressed(event):
+            if not self._integration_enabled() or not _addressed(event):
                 raise ValueError("聊天接入停用或群聊未唤醒机器人")
             if not str(request_summary or "").strip():
                 raise ValueError("请说明本轮用户意图与上下文依据")
@@ -960,7 +1200,7 @@ class PersonaCanvasPlugin(Star):
                     raise ValueError("修改条件需要向用户提出新的确认问题")
                 if pending.get("execution_job_id"):
                     old = self.storage.job(pending["execution_job_id"]) or {}
-                    if old.get("status") in {"queued", "deciding", "generating", "succeeded"}:
+                    if old.get("status") in CANCELLABLE_JOB_STATUSES:
                         await self._cancel_job(old["id"])
                 env["changed_request"], env["previous_conditions"] = True, pending
                 revised = {k: v for k, v in {**original, **normalized}.items() if k not in removed}
@@ -997,7 +1237,7 @@ class PersonaCanvasPlugin(Star):
                 cancelled = []
                 for identifier in ids:
                     job = self.storage.job(identifier) or {}
-                    if job.get("status") in {"queued", "deciding", "generating", "succeeded"}:
+                    if job.get("status") in CANCELLABLE_JOB_STATUSES:
                         await self._cancel_job(identifier)
                         cancelled.append(identifier)
                     elif job_id and job.get("status") in {"sent", "sending", "uncertain"}:
@@ -1192,7 +1432,6 @@ class PersonaCanvasPlugin(Star):
             reason, stage = self._native_request(event, env, "photo", request_summary, confirmed_request_id)
             if reason:
                 return rejected(reason, stage)
-            pending = env["session"].get("pending") or {}
             reference_assets = (
                 [reference]
                 if reference
@@ -1205,7 +1444,7 @@ class PersonaCanvasPlugin(Star):
                 if mode == "persona" and env["persona"].get("reference_enabled")
                 else []
             )
-            prepared = self._prepare_generation(
+            prepared = await self._prepare_generation(
                 env,
                 prompt,
                 mode,
@@ -1216,21 +1455,17 @@ class PersonaCanvasPlugin(Star):
                 source="chat",
                 reference_source=reference_source,
             )
+            if prepared["awaited"]:
+                # Reading references yielded to other turns; re-check before admission.
+                reason, stage = self._native_request(event, env, "photo", request_summary, confirmed_request_id)
+                if reason:
+                    return rejected(reason, stage)
+            pending = env["session"].get("pending") or {}
             selected_provider = prepared["provider"].name
-            job = self.storage.create_job(
+            job = self._admit_job(
+                env,
+                prepared,
                 {
-                    "status": "queued",
-                    "phase": "local_queued",
-                    "preflight_checked": True,
-                    "provider": selected_provider,
-                    "request_summary": self._request_summary(
-                        prepared["provider"],
-                        prepared["positive"],
-                        prepared["negative"],
-                        prepared["options"],
-                        len(prepared["reference_names"]),
-                        reference_source,
-                    ),
                     "source": "chat",
                     "caption": caption,
                     "raw": _text(event),
@@ -1240,58 +1475,34 @@ class PersonaCanvasPlugin(Star):
                     "reference_source": reference_source,
                     "request_basis": copy.deepcopy(env.get("request_basis", {})),
                     "delivery_key": _extra(event, "delivery_key", ""),
-                    "umo": env["umo"],
-                    "session_key": env["key"],
-                    "persona_id": env["persona"]["id"],
-                }
+                },
+                event=event,
             )
-            if self._is_webchat(env["umo"], event=event):
-                self.storage.update_job(job["id"], {"delivery_platform": "webchat"})
             if pending and env.get("approved_requirements") is not None:
-                claim = self.storage.claim_photo_request(
-                    env["key"], env["persona"]["id"], pending["request_id"], job["id"]
-                )
-                if not claim["claimed"]:
-                    self.storage.update_job(
-                        job["id"],
-                        {"status": "cancelled", "error": "相同条件已有生成任务", "duplicate_of": claim["job_id"]},
-                    )
-                    return existing_result(claim["job_id"])
-                env["session"] = claim["session"]
-                self.storage.update_job(job["id"], {"confirmed_request_id": pending["request_id"]})
+                duplicate = self._bind_pending(env, job["id"], pending)
+                if duplicate:
+                    return existing_result(duplicate)
             self._photo_note(job)
 
-            async def run():
-                try:
-                    generated = await self._generate_job(
-                        env,
-                        prompt,
-                        mode,
-                        patch,
-                        caption,
-                        _text(event),
-                        user_key=f"{event.get_platform_id()}:{event.get_sender_id()}",
-                        is_admin=_admin(event),
-                        reference_asset=reference,
-                        provider_name=selected_provider,
-                        source="chat",
-                        job_id=job["id"],
-                        reference_source=reference_source,
-                    )
-                    await self._send_job(generated, umo=generated["umo"])
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    current = self.storage.job(job["id"]) or {}
-                    self._fail_job(job["id"], exc)
-                    self._photo_note(self.storage.job(job["id"]))
-                    if current.get("delivery_key") and current.get("status") not in {"uncertain", "delivery_failed"}:
-                        self.storage.update_delivery(
-                            current["delivery_key"], {"status": "failed", "error": self._error(exc)}
-                        )
-                    await self._notify_photo_failure(self.storage.job(job["id"]), event=event)
+            async def work():
+                generated = await self._generate_job(
+                    env,
+                    prompt,
+                    mode,
+                    patch,
+                    caption,
+                    _text(event),
+                    user_key=f"{event.get_platform_id()}:{event.get_sender_id()}",
+                    is_admin=_admin(event),
+                    reference_asset=reference,
+                    provider_name=selected_provider,
+                    source="chat",
+                    job_id=job["id"],
+                    reference_source=reference_source,
+                )
+                await self._send_job(generated, umo=generated["umo"])
 
-            self._spawn(run(), "persona-canvas-chat-photo", job["id"])
+            self._spawn(self._run_job(job["id"], work, event=event), "persona-canvas-chat-photo", job["id"])
             return json.dumps(
                 {
                     "ok": True,
@@ -1383,15 +1594,10 @@ class PersonaCanvasPlugin(Star):
         # Summaries intentionally exclude bodies, headers, credentials and image bytes.
         for name, value in list(summary.items()):
             if isinstance(value, str):
-                for config in self.storage.settings.get("providers", {}).values():
-                    for key in ("api_key", "auth_value"):
-                        secret = str(config.get(key) or "")
-                        if secret:
-                            value = value.replace(secret, "[已隐藏]")
-                summary[name] = value
+                summary[name] = redact_text(self.storage, value, limit=None, patterns=False)
         return summary
 
-    def _prepare_generation(
+    async def _prepare_generation(
         self,
         env,
         prompt,
@@ -1408,7 +1614,12 @@ class PersonaCanvasPlugin(Star):
         reference_source="",
         explicit_retry=False,
     ):
-        """Local-only preparation, shared by admission and background dispatch."""
+        """Local-only preparation, shared by admission and background dispatch.
+
+        Without reference images this never yields. With references, reading
+        and verifying them runs in worker threads, so the result has
+        ``awaited=True`` and callers must re-check mutable conditions.
+        """
         if job_id and (self.storage.job(job_id) or {}).get("cancel_requested"):
             raise asyncio.CancelledError()
         if mode not in {"persona", "scene", "edit"} or not str(prompt).strip():
@@ -1425,7 +1636,7 @@ class PersonaCanvasPlugin(Star):
         patch = {**state_patch(patch), **state_patch(agreed)}
         persona = copy.deepcopy(env["persona"])
         intent = Intent(
-            mode={"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}[mode],
+            mode=INTENT_MODES[mode],
             use_persona=mode == "persona",
             prompt_delta=prompt if mode == "persona" else "",
             scene_prompt=prompt if mode != "persona" else "",
@@ -1515,20 +1726,27 @@ class PersonaCanvasPlugin(Star):
             raise ValueError("图片编辑需要上传参考图或选择上一张照片")
         if reference_names and not provider.capabilities.image_to_image:
             raise ValueError("当前接口不支持参考图，请选择支持图像输入的接口")
-        leases = []
-        try:
-            for name in reference_names:
-                leases.append(self.storage.lease_asset(name))
-            reference_data = [self.storage.asset(name).read_bytes() for name in reference_names]
-        finally:
-            for token in leases:
-                self.storage.release_asset(token)
+        reference_data = []
+        if reference_names:
+            leases = []
+            try:
+                for name in reference_names:
+                    leases.append(self.storage.lease_asset(name))
+                paths = [self.storage.asset(name) for name in reference_names]
+                reference_data = await asyncio.to_thread(lambda: [path.read_bytes() for path in paths])
+            finally:
+                for token in leases:
+                    self.storage.release_asset(token)
         reference = reference_data if len(reference_data) > 1 else reference_data[0] if reference_data else None
         if job_id:
             self.storage.update_job(job_id, {"preparation_stage": "provider"})
         preflight = getattr(provider, "preflight", None)
         if callable(preflight):
-            preflight(positive, negative, reference=reference, options=options)
+            if reference is None:
+                preflight(positive, negative, reference=None, options=options)
+            else:
+                # Verifying references decodes every image; keep it off the loop.
+                await asyncio.to_thread(preflight, positive, negative, reference=reference, options=options)
         return {
             "persona": persona,
             "patch": patch,
@@ -1542,6 +1760,7 @@ class PersonaCanvasPlugin(Star):
             "reference": reference,
             "reference_source": reference_source,
             "reference_warning": reference_warning,
+            "awaited": bool(reference_names),
         }
 
     async def _generate_job(
@@ -1564,7 +1783,7 @@ class PersonaCanvasPlugin(Star):
     ):
         self._track_current()
         try:
-            prepared = self._prepare_generation(
+            prepared = await self._prepare_generation(
                 env,
                 prompt,
                 mode,
@@ -1712,7 +1931,7 @@ class PersonaCanvasPlugin(Star):
                 if self.storage.job(job["id"]).get("cancel_requested"):
                     raise asyncio.CancelledError()
                 failure_stage = "generation"
-                asset = self.storage.save_asset(result.data, result.extension)
+                asset = await asyncio.to_thread(self.storage.save_asset, result.data, result.extension)
                 success = True
                 guard_reason = await self._delivery_guard(env=env, job=job)
                 async with self._lock(env["key"]):
@@ -1786,7 +2005,6 @@ class PersonaCanvasPlugin(Star):
                         "mode": mode,
                     }
                 )
-                self.storage.cleanup_history(int(options.get("max_history", 100)))
                 return job
         except asyncio.CancelledError:
             cancelled = self.storage.update_job(
@@ -2009,7 +2227,7 @@ class PersonaCanvasPlugin(Star):
                     "blocked": "没有明确的拍摄请求",
                     "reply": "你是在想看照片，还是想聊聊这个？",
                 }
-            mode = {"photo": "persona", "scene": "scene", "edit": "edit"}[action]
+            mode = DECISION_MODES[action]
             agreed = (env["session"].get("pending") or {}).get("requirements", {}) if is_confirmation(text) else {}
             env["approved_requirements"] = {**requirements(decision.get("requirements")), **requirements(agreed)}
             if body is not None:
@@ -2036,17 +2254,9 @@ class PersonaCanvasPlugin(Star):
             try:
                 pending = env["session"].get("pending") or {}
                 if pending and is_confirmation(text) and pending.get("request_kind") == "photo":
-                    claim = self.storage.claim_photo_request(
-                        env["key"], env["persona"]["id"], pending["request_id"], candidate["id"]
-                    )
-                    if not claim["claimed"]:
-                        self.storage.update_job(
-                            candidate["id"],
-                            {"status": "cancelled", "error": "相同条件已有生成任务", "duplicate_of": claim["job_id"]},
-                        )
-                        return {**decision, "sent": False, "job_id": claim["job_id"], "reused": True}
-                    env["session"] = claim["session"]
-                    self.storage.update_job(candidate["id"], {"confirmed_request_id": pending["request_id"]})
+                    duplicate = self._bind_pending(env, candidate["id"], pending)
+                    if duplicate:
+                        return {**decision, "sent": False, "job_id": duplicate, "reused": True}
                 job = await self._generate_job(
                     env,
                     decision["prompt"],
@@ -2117,7 +2327,7 @@ class PersonaCanvasPlugin(Star):
         self._track_current()
         event.should_call_llm(False)
         prompt = text.strip() or re.sub(r"^/?(?:生图|拍照)\s*", "", _text(event))
-        if not self.storage.settings["integration"].get("enabled", True):
+        if not self._integration_enabled():
             yield event.plain_result("随想画卷已停用，请在插件界面开启。")
             return
         if not prompt:
@@ -2242,7 +2452,7 @@ class PersonaCanvasPlugin(Star):
             reason = (
                 f"测试生图超时（有效上限 {effective} 秒）"
                 if isinstance(exc, asyncio.TimeoutError)
-                else self._error(exc)
+                else self._error_detail(exc)
             )
             return {
                 "ok": False,
@@ -2251,22 +2461,15 @@ class PersonaCanvasPlugin(Star):
                 "request_summary": self._request_summary(provider, prompt, "", options, 0, "none"),
             }
         elapsed = int((time.monotonic() - started) * 1000)
-        asset = self.storage.save_asset(result.data, result.extension)
+        asset = await asyncio.to_thread(self.storage.save_asset, result.data, result.extension)
         return {
             "ok": True,
             "provider": provider.name,
             "model": result.model,
             "elapsed_ms": elapsed,
-            "image": image_data_url(self, asset.name),
+            "image": await image_data_url_async(self, asset.name),
             "request_summary": self._request_summary(provider, prompt, "", options, 0, "none"),
         }
-
-    def _jobs(self, limit=50):
-        jobs = self.storage.recent_jobs(limit)
-        for job in jobs:
-            if job.get("asset"):
-                job["image"] = image_data_url(self, job["asset"], thumbnail=True)
-        return jobs
 
     async def web_state(self):
         capabilities, error = self._provider_status()
@@ -2327,9 +2530,6 @@ class PersonaCanvasPlugin(Star):
     async def web_sessions(self):
         return {"items": self.storage.list_sessions()}
 
-    async def web_jobs(self):
-        return {"items": self._jobs()}
-
     async def web_jobs_query(self, body):
         from .page_api import preview_descriptor
 
@@ -2369,17 +2569,8 @@ class PersonaCanvasPlugin(Star):
         if not job:
             raise ValueError("任务不存在")
         if job.get("asset"):
-            job["image"] = image_data_url(self, job["asset"])
+            job["image"] = await image_data_url_async(self, job["asset"])
         return job
-
-    async def web_history(self):
-        items = self.storage.recent_history(20)
-        for item in items:
-            job = self.storage.job(item.get("job_id", "")) or {}
-            item.update({k: job[k] for k in ("status", "umo", "cancel_requested", "asset") if k in job})
-            if item.get("image", "").startswith("/assets/"):
-                item["image"] = image_data_url(self, item["image"].rsplit("/", 1)[-1], thumbnail=True)
-        return {"items": items}
 
     async def web_save_persona(self, body):
         allowed = {
@@ -2460,9 +2651,9 @@ class PersonaCanvasPlugin(Star):
         if "extra_body" in patch and not isinstance(patch["extra_body"], dict):
             raise ValueError("额外参数必须为 JSON 对象")
         old = self.storage.settings["providers"].get(name, {})
-        for field in ("workflow", "extra_body"):
-            if field in patch and isinstance(patch[field], dict):
-                patch[field] = _restore_workflow_secrets(patch[field], old.get(field))
+        for nested in ("workflow", "extra_body"):
+            if nested in patch and isinstance(patch[nested], dict):
+                patch[nested] = _restore_workflow_secrets(patch[nested], old.get(nested))
         candidate = {**old, **patch, "name": name}
         if "reset_option_fields" in body and not isinstance(body["reset_option_fields"], bool):
             raise ValueError("reset_option_fields 必须为开关值")
@@ -2493,94 +2684,14 @@ class PersonaCanvasPlugin(Star):
         return await self.web_providers()
 
     async def web_save_settings(self, body):
-        ranges = {
-            "daily_limit": (0, 10000),
-            "min_interval_sec": (0, 86400),
-            "max_concurrency": (1, 16),
-            "width": (64, 4096),
-            "height": (64, 4096),
-            "steps": (1, 150),
-            "scale": (0, 30),
-            "seed": (-1, 4294967295),
-            "max_history": (1, 5000),
-            "timeout_sec": (5, 300),
-            "context_turns": (1, 100),
-            "confirmation_ttl_sec": (30, 86400),
-            "check_interval_sec": (15, 3600),
-            "min_gap_sec": (60, 604800),
-            "min_idle_sec": (0, 604800),
-            "silence_after": (1, 100),
-            "silence_hours": (1, 720),
-        }
-        ranges.update(
-            {
-                "outfit_sec": (0, 2592000),
-                "pose_sec": (0, 604800),
-                "expression_sec": (0, 604800),
-                "scene_sec": (0, 2592000),
-                "messages": (0, 10000),
-                "photos": (0, 10000),
-                "llm": (0, 10000),
-                "jitter_percent": (0, 40),
-            }
-        )
-        ranges["max_concurrent_targets"] = (1, 16)
-        ranges["min_interval_sec"] = (0, 86400)
-        ranges["default_probability"] = (0, 100)
-        ranges["max_attempts"] = (1, 5)
-        ranges["retry_interval_sec"] = (60, 3600)
-        ranges["max_wait_sec"] = (5, 600)
-        allowed_groups = {
-            "integration",
-            "dialogue",
-            "reply_images",
-            "llm",
-            "moderation",
-            "generation",
-            "active",
-            "good_morning",
-            "state_lifetimes",
-            "proactive_budget",
-        }
         candidate = copy.deepcopy(self.storage.settings)
         for group, patch in body.items():
-            if group not in allowed_groups or not isinstance(patch, dict):
+            rules = SETTINGS_RULES.get(group)
+            if rules is None or not isinstance(patch, dict):
                 continue
             for key, value in patch.items():
-                if key not in candidate[group]:
-                    continue
-                if key in ranges:
-                    low, high = ranges[key]
-                    if key == "timeout_sec" and group == "generation":
-                        high = 600
-                    if isinstance(value, bool):
-                        raise ValueError(f"{key} 必须为数值")
-                    if key in {"max_attempts", "retry_interval_sec"}:
-                        number = float(value)
-                        if not math.isfinite(number) or not number.is_integer():
-                            raise ValueError(f"{key} 必须为整数")
-                    value = float(value) if key in {"scale", "default_probability"} else int(value)
-                    if not math.isfinite(value) or not low <= value <= high:
-                        raise ValueError(f"{key} 应在 {low} 到 {high} 之间")
-                elif isinstance(candidate[group][key], bool):
-                    if not isinstance(value, bool):
-                        raise ValueError(f"{key} 必须为开关值")
-                elif key == "timezone":
-                    from zoneinfo import ZoneInfo
-
-                    ZoneInfo(str(value))
-                elif key in {"start", "end", "default_start", "default_end"}:
-                    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(value)):
-                        raise ValueError("时间格式应为 HH:MM")
-                elif key == "mode" and value not in {"native_tools", "compatibility"}:
-                    raise ValueError("聊天接入模式无效")
-                elif group == "good_morning" and key == "image_mode":
-                    if not isinstance(value, str) or value not in {"prefer_photo", "auto", "text_only"}:
-                        raise ValueError("早安配图模式无效")
-                elif group == "reply_images" and key == "provider":
-                    if not isinstance(value, str) or (value and value not in candidate["providers"]):
-                        raise ValueError("配图接口不存在，请重新选择")
-                candidate[group][key] = value
+                if key in rules:
+                    candidate[group][key] = _checked_setting(key, value, rules[key], candidate["providers"])
         candidate["integration"]["strict_trigger"] = True
         for key, section in (
             ("current_persona", self.storage.personas["items"]),
@@ -2615,7 +2726,7 @@ class PersonaCanvasPlugin(Star):
         return decision
 
     async def _queue_job(self, env, decision, text, body, *, event=None, retry_old=None):
-        mode = {"photo": "persona", "scene": "scene", "edit": "edit"}[decision["decision"]]
+        mode = DECISION_MODES[decision["decision"]]
         requested_mode = str(body.get("mode") or "persona")
         if requested_mode == "scene" and mode == "persona":
             raise ValueError("角色决策与场景模式不一致，请明确要求普通场景绘图")
@@ -2645,7 +2756,7 @@ class PersonaCanvasPlugin(Star):
             body.get("reference_source")
             or ("explicit_reference" if reference else "persona" if mode == "persona" else "none")
         )
-        prepared = self._prepare_generation(
+        prepared = await self._prepare_generation(
             env,
             decision["prompt"],
             mode,
@@ -2660,35 +2771,22 @@ class PersonaCanvasPlugin(Star):
             explicit_retry=bool(retry_old),
         )
         selected_provider = prepared["provider"].name
-        job = self.storage.create_job(
+        job = self._admit_job(
+            env,
+            prepared,
             {
-                "status": "queued",
-                "phase": "local_queued",
-                "preflight_checked": True,
-                "provider": selected_provider,
-                "request_summary": self._request_summary(
-                    prepared["provider"],
-                    prepared["positive"],
-                    prepared["negative"],
-                    prepared["options"],
-                    len(prepared["reference_names"]),
-                    reference_source,
-                ),
                 "source": source,
                 "raw": text,
                 "caption": decision["reply"],
                 "mode": mode,
-                "umo": env["umo"],
-                "session_key": env["key"],
-                "persona_id": env["persona"]["id"],
                 "reference_asset": reference,
                 "reference_assets": env.get("approved_reference_assets", []),
                 "reference_source": reference_source,
                 "request_basis": env.get("request_basis", {}),
-            }
+            },
+            event=event,
+            previous=retry_old,
         )
-        if self._is_webchat(env["umo"], event=event, job=retry_old):
-            self.storage.update_job(job["id"], {"delivery_platform": "webchat"})
         if retry_old:
             self.storage.update_job(
                 job["id"],
@@ -2709,52 +2807,39 @@ class PersonaCanvasPlugin(Star):
             pending = env["session"].get("pending") or {}
             if pending and pending.get("request_kind") == "photo" and is_confirmation(text):
                 try:
-                    result = self.storage.claim_photo_request(
-                        env["key"], env["persona"]["id"], pending["request_id"], job["id"]
-                    )
+                    duplicate = self._bind_pending(env, job["id"], pending)
                 except Exception:
                     self.storage.update_job(job["id"], {"status": "cancelled", "error": "拍摄条件已改变，未提交接口"})
                     raise
-                if not result["claimed"]:
-                    self.storage.update_job(
-                        job["id"],
-                        {"status": "cancelled", "error": "相同条件已有生成任务", "duplicate_of": result["job_id"]},
-                    )
+                if duplicate:
                     return {
-                        "job_id": result["job_id"],
-                        "status": (self.storage.job(result["job_id"]) or {}).get("status"),
+                        "job_id": duplicate,
+                        "status": (self.storage.job(duplicate) or {}).get("status"),
                         "reused": True,
                     }
-                env["session"] = result["session"]
-                self.storage.update_job(job["id"], {"confirmed_request_id": pending["request_id"]})
         self._photo_note(job)
 
-        async def run():
-            try:
-                generated = await self._generate_job(
-                    env,
-                    decision["prompt"],
-                    mode,
-                    decision["state_patch"],
-                    decision["reply"],
-                    text,
-                    reference_asset=reference,
-                    provider_name=selected_provider,
-                    options=options,
-                    source=source,
-                    is_admin=_admin(event) if event else True,
-                    user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui",
-                    job_id=job["id"],
-                    reference_source=reference_source,
-                )
-                if event:
-                    await self._send_job(generated, umo=generated["umo"])
-            except Exception as exc:
-                self._fail_job(job["id"], exc)
-                if event:
-                    await self._notify_photo_failure(self.storage.job(job["id"]), event=event)
+        async def work():
+            generated = await self._generate_job(
+                env,
+                decision["prompt"],
+                mode,
+                decision["state_patch"],
+                decision["reply"],
+                text,
+                reference_asset=reference,
+                provider_name=selected_provider,
+                options=options,
+                source=source,
+                is_admin=_admin(event) if event else True,
+                user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui",
+                job_id=job["id"],
+                reference_source=reference_source,
+            )
+            if event:
+                await self._send_job(generated, umo=generated["umo"])
 
-        self._spawn(run(), "persona-canvas-web-job", job["id"])
+        self._spawn(self._run_job(job["id"], work, event=event), "persona-canvas-web-job", job["id"])
         return {
             "job_id": job["id"],
             "status": "queued",
@@ -2836,7 +2921,7 @@ class PersonaCanvasPlugin(Star):
                     "image_saved": False,
                     "note": note,
                 }
-            asset = self.storage.save_asset(result.data, result.extension)
+            asset = await asyncio.to_thread(self.storage.save_asset, result.data, result.extension)
             current = self.storage.job(identifier)
             updates = {
                 "asset": asset.name,
@@ -2996,7 +3081,7 @@ class PersonaCanvasPlugin(Star):
         }
         env.update(old.get("identity") or await self.dialogue.current_identity(old["umo"]))
         decision = {
-            "decision": {"persona": "photo", "scene": "scene", "edit": "edit"}[old["mode"]],
+            "decision": MODE_DECISIONS[old["mode"]],
             "prompt": old["request_prompt"],
             "reply": old["caption"],
             "state_patch": old["state_patch"],
@@ -3072,15 +3157,9 @@ class PersonaCanvasPlugin(Star):
     async def web_upload_reference(self, data, name="reference", persona_id=""):
         if not isinstance(data, bytes) or len(data) > 16 * 1024 * 1024 or not data:
             raise ValueError("参考图大小应在 1 字节到 16 MB 之间")
-        from PIL import Image
-
-        with Image.open(io.BytesIO(data)) as image:
-            if image.format not in {"PNG", "JPEG", "WEBP"} or image.width * image.height > 32_000_000:
-                raise ValueError("请选择有效的 PNG、JPEG 或 WebP 图片，像素总量不超过 3200 万")
-            extension = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}[image.format]
-            image.verify()
-        asset = self.storage.save_asset(data, extension)
-        result = {"asset": asset.name, "image": image_data_url(self, asset.name)}
+        extension = await asyncio.to_thread(_verify_reference_image, data)
+        asset = await asyncio.to_thread(self.storage.save_asset, data, extension)
+        result = {"asset": asset.name, "image": await image_data_url_async(self, asset.name)}
         if persona_id:
             persona = copy.deepcopy(self.storage.persona(persona_id))
             if persona["id"] != persona_id:
@@ -3148,9 +3227,7 @@ class PersonaCanvasPlugin(Star):
                     ):
                         raise ValueError("目标开关必须为布尔值")
                     elif key == "timezone" and value:
-                        from zoneinfo import ZoneInfo
-
-                        ZoneInfo(str(value))
+                        zone(str(value))
                     elif (
                         key == "persona_id"
                         and value

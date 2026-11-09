@@ -8,19 +8,24 @@ import math
 import random
 import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from .common import zone
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from .dialogue import field, maybe_await
-from .temporal import temporal_conflicts, time_brief
+from .temporal import temporal_conflicts
 
 
 class ActiveScheduler:
+    # Only the inbound timestamp changes on every message. It is kept in memory
+    # at once and persisted at most this often; other changes save immediately.
+    INBOUND_FLUSH_DELAY = 30.0
+
     def __init__(self, plugin):
         self.plugin = plugin
         self._tick_lock = asyncio.Lock()
         self._target_tasks = {}
         self._cursor = 0
+        self._flush_handle = None
 
     def observe(self, event):
         umo = str(event.unified_msg_origin or "")
@@ -30,7 +35,8 @@ class ActiveScheduler:
         scope = "private" if private else "group"
         targets = self.plugin.storage.targets["items"]
         target = next((t for t in targets if t.get("umo") == umo), None)
-        if target is None:
+        created = target is None
+        if created:
             target = {
                 "umo": umo,
                 "scope": scope,
@@ -47,16 +53,18 @@ class ActiveScheduler:
                 "reply_image_probability": self.plugin.storage.settings["reply_images"].get("default_probability", 20),
             }
             targets.append(target)
+        before = {key: value for key, value in target.items() if key != "last_inbound"}
         target["scope"] = scope
-        platform_name = getattr(event, "get_platform_name", None)
-        if callable(platform_name):
+        getter, platform_name = getattr(event, "get_platform_name", None), None
+        if callable(getter):
             try:
-                target["platform_type"] = str(platform_name() or "")[:100]
+                platform_name = str(getter() or "")[:100]
             except Exception:
                 pass
-        platform_name = getattr(event, "get_platform_name", lambda: "")()
-        if platform_name:
-            target["platform_name"] = str(platform_name)[:100]
+        if platform_name is not None:
+            target["platform_type"] = platform_name
+            if platform_name:
+                target["platform_name"] = platform_name
         group_id = getattr(event, "get_group_id", lambda: "")() if not private else ""
         display_name = getattr(event, "get_sender_name", lambda: "")() if private else ""
         target["name"] = str(
@@ -71,7 +79,30 @@ class ActiveScheduler:
         if not private:
             target["enabled"], target["morning_enabled"] = False, False
         target.update(last_inbound=time.time(), unanswered=0, silent_until=0, next_opportunity=0)
-        self.plugin.storage.save_targets()
+        if created or before != {key: value for key, value in target.items() if key != "last_inbound"}:
+            self.flush()
+        else:
+            self._schedule_flush()
+
+    def _schedule_flush(self):
+        if self._flush_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.flush()
+            return
+        self._flush_handle = loop.call_later(self.INBOUND_FLUSH_DELAY, self.flush)
+
+    def flush(self):
+        """Persist targets now, including deferred inbound timestamps."""
+        if self._flush_handle is not None:
+            self._flush_handle.cancel()
+            self._flush_handle = None
+        try:
+            self.plugin.storage.save_targets()
+        except Exception as exc:
+            logger.warning("[随想画卷] 保存聊天目标失败：%s", self.plugin._error(exc))
 
     async def run(self):
         while True:
@@ -85,7 +116,7 @@ class ActiveScheduler:
 
     @staticmethod
     def _in_window(start, end, timezone="Asia/Shanghai"):
-        now = datetime.now(ZoneInfo(timezone))
+        now = datetime.now(zone(timezone))
         left = datetime.strptime(start, "%H:%M").time()
         right = datetime.strptime(end, "%H:%M").time()
         current = now.time().replace(tzinfo=None)
@@ -106,7 +137,7 @@ class ActiveScheduler:
             block("target_missing", "目标已移除")
         if target.get("scope") == "group":
             block("group", "群聊仅支持回复配图，不主动联系")
-        if not self.plugin.storage.settings["integration"].get("enabled", True):
+        if not self.plugin._integration_enabled():
             block("integration_disabled", "插件聊天接入已关闭")
         if not target.get("enabled"):
             block("target_disabled", "此聊天的主动联系未开启")
@@ -166,7 +197,7 @@ class ActiveScheduler:
             blockers.append({"code": "morning_disabled", "message": "此聊天的每日早安未开启"})
         window = self._window_settings(target, kind)
         if not self._in_window(window["start"], window["end"], window["timezone"]):
-            local = datetime.now(ZoneInfo(window["timezone"]))
+            local = datetime.now(zone(window["timezone"]))
             hour, minute = map(int, window["start"].split(":"))
             opening = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if opening <= local:
@@ -303,7 +334,7 @@ class ActiveScheduler:
     def _time_context(self, target, kind):
         config = self.plugin.storage.settings["good_morning" if kind == "morning" else "active"]
         timezone = str(target.get("timezone") or config.get("timezone", "Asia/Shanghai"))
-        now = datetime.now(ZoneInfo(timezone))
+        now = datetime.now(zone(timezone))
         period = (
             "凌晨"
             if now.hour < 5
@@ -330,7 +361,7 @@ class ActiveScheduler:
         try:
             inbound = float(target.get("last_inbound", 0))
             if math.isfinite(inbound) and 0 < inbound <= now.timestamp():
-                previous = datetime.fromtimestamp(inbound, ZoneInfo(timezone))
+                previous = datetime.fromtimestamp(inbound, zone(timezone))
                 result.update(
                     last_inbound_at=previous.isoformat(timespec="seconds"),
                     elapsed_seconds=int(now.timestamp() - inbound),
@@ -637,7 +668,7 @@ class ActiveScheduler:
             return True
         config = self.plugin.storage.settings["good_morning"]
         timezone = str(target.get("timezone") or config.get("timezone", "Asia/Shanghai"))
-        return datetime.now(ZoneInfo(timezone)).date().isoformat() == date
+        return datetime.now(zone(timezone)).date().isoformat() == date
 
     def _retry_rules(self, target, kind, existing, now):
         """Pure counterpart of the durable retry claim eligibility checks."""
@@ -770,7 +801,7 @@ class ActiveScheduler:
                             timezone,
                         )
                     ):
-                        date = datetime.now(ZoneInfo(timezone)).date().isoformat()
+                        date = datetime.now(zone(timezone)).date().isoformat()
                         key = f"morning:{target['umo']}:{date}"
                         if target.get("morning_date") != date and self._retry_ready(target, "morning", key, now):
                             started.append(self._start_attempt(target, "morning", key, now, date))

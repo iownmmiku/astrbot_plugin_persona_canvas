@@ -23,6 +23,7 @@ SOURCE_FILES = (
     "webui_server.py",
     "reply_images.py",
     "temporal.py",
+    "common.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",

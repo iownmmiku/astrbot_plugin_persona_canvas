@@ -212,16 +212,6 @@ class RetryAndQuota056Tests(unittest.TestCase):
         self.assertEqual(1, self.storage._db.execute("SELECT successes FROM quota_usage WHERE user_key='u'").fetchone()[0])
         self.assertFalse(self.storage._db.execute("SELECT 1 FROM quota_reservations").fetchone())
 
-    def test_standalone_moderation_keeps_admin_and_normal_tokens_separate(self):
-        moderation = Moderation({"moderation": {"daily_limit": 1, "min_interval_sec": 0, "max_concurrency": 1}})
-        admin = moderation.reserve("u", "portrait", is_admin=True)[2]
-        allowed, _reason, normal = moderation.reserve("u", "portrait")
-        self.assertTrue(allowed)
-        moderation.finish("u", success=True, token=admin)
-        self.assertFalse(moderation.reserve("u", "portrait")[0])
-        moderation.finish("u", success=False, token=normal)
-        self.assertTrue(moderation.reserve("u", "portrait")[0])
-
     def test_default_target_concurrency_is_bounded(self):
         self.assertEqual(3, DEFAULT_SETTINGS["active"]["max_concurrent_targets"])
 
