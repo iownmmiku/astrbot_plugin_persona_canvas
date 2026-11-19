@@ -29,6 +29,9 @@ class ScheduleLinkTests(unittest.IsolatedAsyncioTestCase):
     def setup_link(self):
         scheduler = ActiveScheduler(self.plugin)
         scheduler._in_window = lambda *_args: True
+        # The final pre-send guard uses plugin.active; without this it builds a
+        # fresh scheduler with the real clock and fails outside 09:00-22:00.
+        self.plugin.active = scheduler
         self.store.settings["active"].update(enabled=True, min_idle_sec=0, min_gap_sec=60)
         self.store.settings["good_morning"]["enabled"] = False
         scheduler.observe(Event())

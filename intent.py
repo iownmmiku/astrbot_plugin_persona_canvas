@@ -184,6 +184,7 @@ def validated_decision(text: str, *, allow_silent_refusal: bool = False) -> dict
         raise ValueError("角色同意拍摄但没有给出完整描述")
     if action != "skip" and not (action == "refuse" and allow_silent_refusal) and not reply:
         raise ValueError("角色决策缺少回复")
+    from .common import aspect_ratio
     from .companion import requirements
 
     return {
@@ -193,4 +194,6 @@ def validated_decision(text: str, *, allow_silent_refusal: bool = False) -> dict
         "state_patch": state_patch(value.get("state_patch")),
         "requirements": requirements(value.get("requirements")),
         "needs_reference": action == "edit" or bool(value.get("needs_reference")),
+        # Empty when missing or unusable; generation then uses the default 2:3.
+        "aspect_ratio": aspect_ratio(value.get("aspect_ratio")) if action in {"photo", "scene", "edit"} else "",
     }

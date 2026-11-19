@@ -101,8 +101,8 @@ DEFAULT_SETTINGS = {
         "image_mode": "prefer_photo",
     },
     "generation": {
-        "width": 832,
-        "height": 1216,
+        # Tier only; the role picks the aspect ratio for each photo.
+        "resolution": "1K",
         "steps": 28,
         "scale": 5,
         "sampler": "k_euler_ancestral",
@@ -440,7 +440,21 @@ class Storage:
         self._validate_settings(self.settings)
         if self.settings.get("current_persona") not in {item["id"] for item in self.personas["items"]}:
             self.settings["current_persona"] = "default"
+        self._migrate_generation_size()
         self.save_all()
+
+    def _migrate_generation_size(self) -> None:
+        """Turn the old fixed width/height defaults into the closest tier."""
+        generation = self.settings["generation"]
+        if "width" not in generation and "height" not in generation:
+            return
+        width, height = generation.pop("width", 832), generation.pop("height", 1216)
+        try:
+            area = float(width) * float(height)
+        except (TypeError, ValueError):
+            area = 0.0
+        # Boundaries sit between tiers on a pixel-count scale (~1448², ~2896²).
+        generation["resolution"] = "4K" if area > 2896**2 else "2K" if area > 1448**2 else "1K"
 
     def save_all(self) -> None:
         with self._lock:

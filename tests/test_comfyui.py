@@ -13,6 +13,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from providers.base import ImageProvider, MAX_IMAGE_BYTES, ProviderError, provider_from_config
 from providers.comfyui import ComfyUIProvider
+from common import apply_canvas
 from storage import DEFAULT_SETTINGS
 
 
@@ -156,7 +157,9 @@ class ComfyUIContracts(unittest.IsolatedAsyncioTestCase):
     async def test_actual_shared_generation_defaults_use_comfy_sampler_name(self):
         item = provider()
         calls = working_http(item)
-        options = copy.deepcopy(DEFAULT_SETTINGS["generation"])
+        # The plugin derives pixel sizes from the tier and default 2:3 ratio.
+        options = apply_canvas(copy.deepcopy(DEFAULT_SETTINGS["generation"]))
+        before = copy.deepcopy(options)
         with patch("providers.comfyui.secrets.randbits", return_value=123456):
             await item.generate("a seated girl", "watermark", options=options)
         actual = next(call.args[2]["prompt"] for call in calls.call_args_list if call.args[1].endswith("/prompt"))
@@ -164,11 +167,11 @@ class ComfyUIContracts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual["3"]["inputs"]["steps"], DEFAULT_SETTINGS["generation"]["steps"])
         self.assertEqual(actual["3"]["inputs"]["cfg"], DEFAULT_SETTINGS["generation"]["scale"])
         self.assertEqual(actual["3"]["inputs"]["seed"], 123456)
-        self.assertEqual(actual["5"]["inputs"]["width"], DEFAULT_SETTINGS["generation"]["width"])
-        self.assertEqual(actual["5"]["inputs"]["height"], DEFAULT_SETTINGS["generation"]["height"])
+        self.assertEqual(actual["5"]["inputs"]["width"], 832)
+        self.assertEqual(actual["5"]["inputs"]["height"], 1216)
         self.assertEqual(item.last_request["options"]["sampler"], "euler_ancestral")
         self.assertTrue(any("适配" in note for note in item.last_request["notes"]))
-        self.assertEqual(options, DEFAULT_SETTINGS["generation"])
+        self.assertEqual(options, before)
         self.assertEqual(item.config["workflow"], WORKFLOW)
 
     async def test_only_known_nonexplicit_sampler_aliases_are_adapted(self):

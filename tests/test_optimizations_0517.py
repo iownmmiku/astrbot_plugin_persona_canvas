@@ -185,7 +185,7 @@ class Runtime0517Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("delivery:job-1", self.plugin._session_locks)
 
     async def test_settings_reject_wrong_types_and_fractional_integers(self):
-        for patch_body in ({"llm": {"model": {"name": "x"}}}, {"generation": {"sampler": 3}}, {"generation": {"steps": 20.5}}, {"generation": {"width": None}}, {"active": {"timezone": ""}}, {"active": {"default_start": 900}}):
+        for patch_body in ({"llm": {"model": {"name": "x"}}}, {"generation": {"sampler": 3}}, {"generation": {"steps": 20.5}}, {"generation": {"steps": None}}, {"generation": {"resolution": "8K"}}, {"active": {"timezone": ""}}, {"active": {"default_start": 900}}):
             with self.subTest(body=patch_body), self.assertRaises(ValueError):
                 await self.plugin.web_save_settings(patch_body)
         saved = await self.plugin.web_save_settings({"generation": {"steps": "30", "sampler": "  euler  "}, "llm": {"model": "m"}, "unknown": {"x": 1}})

@@ -29,13 +29,13 @@ let bridge = null,
   polling = false,
   connected = false;
 const pageNames = {
-  overview: ["总览", "让对话、人设状态与画面保持一致。"],
-  persona: ["人设工作台", "维护角色外观、判断规则与参考图。"],
-  providers: ["模型接口", "管理绘画接口与动作判断模型。"],
-  studio: ["生图工作台", "构图、预演与生成任务，集中在这里。"],
-  active: ["聊天与主动消息", "按聊天设置回复配图，安排私聊主动联系与早安。"],
-  history: ["生成历史", "回看画面与每次请求的执行结果。"],
-  settings: ["运行设置", "控制对话集成、配额与默认生成参数。"],
+  overview: ["总览", "当前角色、配置检查与最近动态"],
+  studio: ["生图", "构图、生成任务与角色判断预演"],
+  history: ["历史", "生成记录与每一步的动作诊断"],
+  persona: ["角色", "外观、判断规则与参考图"],
+  providers: ["接口", "绘画接口与动作判断模型"],
+  active: ["聊天", "聊天目标、对话配图与主动消息"],
+  settings: ["设置", "对话集成、生成默认值与配额"],
 };
 const statusNames = {
   queued: "本地排队",
@@ -178,7 +178,7 @@ const conditionNames = {
   avoid: "避免",
   notes: "约定",
 };
-const negativeModes = { disabled: "不自动发送人设负面词", natural_language: "自然语言约束", field: "独立负面字段" };
+const negativeModes = { disabled: "不自动发送角色负面词", natural_language: "自然语言约束", field: "独立负面字段" };
 const referenceSources = {
   persona: "角色参考图库",
   persona_gallery: "角色参考图库",
@@ -245,15 +245,17 @@ function markDirty(form, enabled = true) {
 async function run(el, action) {
   if (el.disabled) return;
   el.disabled = true;
-  const label = el.textContent;
-  el.textContent = "处理中…";
+  // Restore the original nodes, not just text, so icon buttons keep their SVG.
+  const content = Array.from(el.childNodes),
+    iconOnly = el.classList.contains("icon");
+  if (!iconOnly) el.textContent = "处理中…";
   try {
     return await action();
   } catch (error) {
     notice(error.message || "操作失败", true);
   } finally {
     el.disabled = el.dataset.unavailable === "true";
-    el.textContent = label;
+    if (!iconOnly) el.replaceChildren(...content);
   }
 }
 function unwrap(result) {
@@ -325,8 +327,42 @@ async function canReplace(form) {
     (await confirmAction("放弃未保存的修改？", "切换后，这个表单尚未保存的内容会被已保存的数据替换。"))
   );
 }
-function setPage(page, updateHash = true) {
+function openTab(group, tab) {
+  const buttons = Array.from(document.querySelectorAll(`[data-tabs="${group}"] [data-tab]`));
+  if (!buttons.length) return;
+  if (!buttons.some((el) => el.dataset.tab === tab)) tab = buttons[0].dataset.tab;
+  for (const el of buttons) {
+    const selected = el.dataset.tab === tab;
+    el.classList.toggle("active", selected);
+    el.setAttribute("aria-selected", String(selected));
+  }
+  document.querySelectorAll(`[data-tab-group="${group}"]`).forEach((el) => {
+    el.hidden = el.dataset.tabPanel !== tab;
+  });
+  try {
+    localStorage.setItem(`persona-canvas-tab:${group}`, tab);
+  } catch {
+    // Storage may be unavailable in embedded or private views.
+  }
+}
+function setupTabs() {
+  document.querySelectorAll("[data-tabs]").forEach((list) => {
+    list.addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-tab]");
+      if (tab) openTab(list.dataset.tabs, tab.dataset.tab);
+    });
+    let saved = "";
+    try {
+      saved = localStorage.getItem(`persona-canvas-tab:${list.dataset.tabs}`) || "";
+    } catch {
+      saved = "";
+    }
+    openTab(list.dataset.tabs, saved);
+  });
+}
+function setPage(page, updateHash = true, tab = "") {
   if (!Object.hasOwn(pageNames, page)) page = "overview";
+  if (tab) openTab(page, tab);
   document.querySelectorAll("[data-panel]").forEach((el) => {
     el.hidden = el.dataset.panel !== page;
   });
@@ -334,6 +370,11 @@ function setPage(page, updateHash = true) {
     el.classList.toggle("active", el.dataset.page === page);
     el.setAttribute("aria-current", el.dataset.page === page ? "page" : "false");
   });
+  // On narrow screens the nav scrolls sideways; keep the current page visible.
+  const activeNav = document.querySelector(`.nav[data-page="${page}"]`),
+    navList = activeNav?.parentElement;
+  if (navList && navList.scrollWidth > navList.clientWidth)
+    navList.scrollTo({ left: activeNav.offsetLeft - (navList.clientWidth - activeNav.offsetWidth) / 2 });
   setText("page-title", pageNames[page][0]);
   setText("page-subtitle", pageNames[page][1]);
   if (updateHash && location.hash !== `#${page}`) history.replaceState(null, "", `#${page}`);
@@ -358,7 +399,7 @@ function fillSelect(id, items, selected, emptyLabel = "") {
 function renderSelectors() {
   const personas = model.personas.map((p) => ({ value: p.id, label: p.name || p.id }));
   for (const id of ["g-persona", "s-persona", "t-persona"])
-    fillSelect(id, personas, null, id === "t-persona" ? "默认视觉人设" : "");
+    fillSelect(id, personas, null, id === "t-persona" ? "默认视觉角色" : "");
   fillSelect(
     "g-provider",
     model.providers.map((p) => ({ value: p.name, label: `${p.name} · ${p.model || "未设模型"}` })),
@@ -373,7 +414,7 @@ function renderSelectors() {
     value: p.persona_id || p.id,
     label: p.name || p.persona_id || p.id,
   }));
-  fillSelect("p-astrbot", astrbot, null, "不绑定，使用默认视觉人设");
+  fillSelect("p-astrbot", astrbot, null, "不绑定，作为默认视觉角色");
   $("session-options").replaceChildren(
     ...model.sessions.map((s) => {
       const el = node("option");
@@ -385,7 +426,7 @@ function renderSelectors() {
 function renderPersonas() {
   const container = $("persona-list");
   container.replaceChildren();
-  if (!model.personas.length) return empty(container, "尚无人设，点击新建开始。");
+  if (!model.personas.length) return empty(container, "还没有角色，点击新建开始。");
   for (const p of model.personas) {
     const el = button(
       "",
@@ -399,7 +440,7 @@ function renderPersonas() {
       node(
         "small",
         "",
-        `${p.id === model.state.settings?.current_persona ? "默认 · " : ""}${p.astrbot_persona_id ? `绑定 ${p.astrbot_persona_id}` : "独立视觉人设"}`,
+        `${p.id === model.state.settings?.current_persona ? "默认 · " : ""}${p.astrbot_persona_id ? `绑定 ${p.astrbot_persona_id}` : "独立视觉角色"}`,
       ),
     );
     container.append(el);
@@ -423,7 +464,7 @@ function fillPersona(p) {
     "p-astrbot",
     model.astrbotPersonas.map((x) => ({ value: x.persona_id || x.id, label: x.name || x.persona_id || x.id })),
     p.astrbot_persona_id,
-    "不绑定，使用默认视觉人设",
+    "不绑定，作为默认视觉角色",
   );
   if (p.astrbot_persona_id && !Array.from($("p-astrbot").options).some((x) => x.value === p.astrbot_persona_id)) {
     const el = node("option", "", p.astrbot_persona_id);
@@ -641,8 +682,8 @@ function requestDetail(item) {
         "p",
         "muted",
         request.negative_prompt_field
-          ? "插件未自动发送人设负面词；此请求的独立负面字段来自手动附加请求体。"
-          : "插件未自动发送人设负面词。可在模型接口设置自然语言约束，或确认接口支持后启用独立字段。",
+          ? "插件未自动发送角色负面词；此请求的独立负面字段来自手动附加请求体。"
+          : "插件未自动发送角色负面词。可在模型接口设置自然语言约束，或确认接口支持后启用独立字段。",
       ),
     );
   if (item.failure_stage || item.error_stage)
@@ -668,7 +709,7 @@ function renderDiagnostics() {
     );
     row.append(
       body,
-      button("前往设置", async () => setPage(step.page)),
+      button("前往设置", async () => setPage(step.page, true, step.name === "聊天模型" ? "llm" : "")),
     );
     setup.append(row);
   }
@@ -796,7 +837,7 @@ function renderProviderFields(selectedMode = value("v-negative-mode")) {
     kind === "comfyui"
       ? workflowFields?.negative_prompt
         ? "按 negative_prompt 映射写入工作流的负面节点，不会追加到正面提示词。"
-        : "未配置 negative_prompt 映射：保留工作流原有负面内容，不自动发送人设负面词，也不会追加到正面提示词。"
+        : "未配置 negative_prompt 映射：保留工作流原有负面内容，不自动发送角色负面词，也不会追加到正面提示词。"
       : kind === "novelai"
         ? "NovelAI 固定使用原生独立负面通道；负面词不会拼入正面标签。"
         : value("v-negative-mode") === "field"
@@ -1153,7 +1194,7 @@ function fillTarget(t) {
     "t-persona",
     model.personas.map((p) => ({ value: p.id, label: p.name || p.id })),
     t.persona_id || "",
-    "默认视觉人设",
+    "默认视觉角色",
   );
   set("t-timezone", t.timezone || "");
   set("t-start", t.start || a.default_start || "09:00");
@@ -1349,9 +1390,8 @@ function fillSettings() {
   set("q-timezone", q.timezone || "Asia/Shanghai");
   set("d-concurrency", g.max_concurrency ?? 2);
   set("d-timeout", g.timeout_sec ?? 180);
+  set("d-resolution", g.resolution || "1K");
   for (const [id, key, fallback] of [
-    ["d-width", "width", 832],
-    ["d-height", "height", 1216],
     ["d-steps", "steps", 28],
     ["d-scale", "scale", 5],
     ["d-sampler", "sampler", "k_euler_ancestral"],
@@ -1369,12 +1409,27 @@ function fillSettings() {
     set(`s-${key}-life`, lifetimes[key + "_sec"] ?? fallback);
   markDirty("settings-form", false);
 }
+// Mirrors common.canvas_size: about edge² pixels, sides multiples of 64, ≤ 4096.
+function canvasSize(ratio, tier) {
+  const edge = { "1K": 1024, "2K": 2048, "4K": 4096 }[tier] || 1024;
+  const [w, h] = ratio.split(":").map(Number),
+    value = w / h;
+  let width = edge * Math.sqrt(value),
+    height = edge / Math.sqrt(value);
+  const scale = Math.min(1, 4096 / Math.max(width, height));
+  // Round first so 3072.0 computed as 3071.9999 does not drop a 64-step.
+  const side = (v) => Math.max(64, Math.floor(Math.floor(Math.round(v * scale * 1e6) / 1e6) / 64) * 64);
+  width = side(width);
+  height = side(height);
+  return [width, height];
+}
 function fillGenerationDefaults() {
   if (dirty.has("generate-form")) return;
   const g = model.state.settings?.generation || {};
+  const [width, height] = canvasSize("2:3", g.resolution);
+  set("g-width", width);
+  set("g-height", height);
   for (const [id, key, fallback] of [
-    ["g-width", "width", 832],
-    ["g-height", "height", 1216],
     ["g-steps", "steps", 28],
     ["g-scale", "scale", 5],
     ["g-seed", "seed", -1],
@@ -1446,7 +1501,8 @@ function renderOverview() {
     inflight = model.jobs.filter(activeJob),
     total = model.jobs.length;
   setText("overview-name", p.name || "默认人设");
-  setText("overview-description", p.description || "从人设工作台填写固定外观与参考图，再开始第一张画面。");
+  setText("overview-description", p.description || "先在“角色”页填写固定外观与参考图，再开始第一张画面。");
+  setText("app-version", state.integration?.version ? `v${state.integration.version}` : "");
   $("overview-chips").replaceChildren(
     ...[
       `绘画 ${s.default_provider || "未配置"}`,
@@ -1483,7 +1539,7 @@ function renderOverview() {
   );
   const tasks = $("overview-task-list");
   tasks.replaceChildren();
-  if (!model.jobs.length) empty(tasks, "暂无任务，去工作台提交一次生成。");
+  if (!model.jobs.length) empty(tasks, "暂无任务，去“生图”页提交一次生成。");
   for (const job of model.jobs.slice(0, 4)) {
     const row = node("div", "compact-row"),
       body = node("div");
@@ -1518,7 +1574,7 @@ function renderSessions() {
           .filter((x) => typeof x === "string" && x)
           .join(" · ") || "尚无动态状态",
       ),
-      button("工作台使用", async () => {
+      button("用于生图", async () => {
         set("g-umo", s.umo || s.unified_msg_origin);
         if (s.persona_id) set("g-persona", s.persona_id);
         setPage("studio");
@@ -2007,6 +2063,7 @@ async function savedProvider() {
 document.querySelectorAll("[data-page]").forEach((el) => el.addEventListener("click", () => setPage(el.dataset.page)));
 document.querySelectorAll("[data-goto]").forEach((el) => el.addEventListener("click", () => setPage(el.dataset.goto)));
 window.addEventListener("hashchange", () => setPage(location.hash.slice(1), false));
+setupTabs();
 setPage(location.hash.slice(1) || "overview", false);
 bind("refresh", async () => {
   await reload();
@@ -2014,7 +2071,7 @@ bind("refresh", async () => {
 });
 bind("new-persona", async () => {
   if (await canReplace("persona-form"))
-    fillPersona({ id: `persona-${Date.now()}`, name: "新的人设", state: {}, outfit_pool: [] });
+    fillPersona({ id: `persona-${Date.now()}`, name: "新的角色", state: {}, outfit_pool: [] });
 });
 bind("restore-persona", async () =>
   fillPersona(model.personas.find((p) => p.id === selection.persona?.id) || selection.persona || { state: {} }),
@@ -2038,17 +2095,17 @@ bindForm("persona-form", async () => {
   selection.persona = saved;
   markDirty("persona-form", false);
   await reload();
-  notice("人设已保存");
+  notice("角色已保存");
 });
 bind("delete-persona", async () => {
   if (
-    await confirmAction("删除这个人设？", "这会移除视觉档案；历史图片保留。正在使用这个人设的会话会回退到默认人设。")
+    await confirmAction("删除这个角色？", "这会移除视觉档案，历史图片保留。正在使用这个角色的会话会回退到默认角色。")
   ) {
     await api("personas/delete", "POST", { id: selection.persona.id });
     selection.persona = null;
     markDirty("persona-form", false);
     await reload();
-    notice("人设已删除");
+    notice("角色已删除");
   }
 });
 $("p-reference-file").addEventListener("change", async (event) => {
@@ -2072,7 +2129,7 @@ $("p-reference-file").addEventListener("change", async (event) => {
       const result = bridge?.upload
         ? unwrap(await bridge.upload("page/reference/upload", file))
         : await api("reference/upload", "POST", { data: preview.split(",")[1], name: file.name });
-      if (selection.persona?.id !== personaId) throw new Error("上传期间切换了人设，请在所需人设重新上传");
+      if (selection.persona?.id !== personaId) throw new Error("上传期间切换了角色，请在所需角色下重新上传");
       const name = result.asset || result.reference_asset;
       if (!name) throw new Error("上传成功但没有返回图片资产标识");
       referenceImages.set(name, preview);
@@ -2081,7 +2138,7 @@ $("p-reference-file").addEventListener("change", async (event) => {
       renderReference();
       markDirty("persona-form");
     }
-    notice("参考图已上传，请保存人设使其生效。");
+    notice("参考图已上传，请保存角色使其生效。");
   } catch (error) {
     notice(error.message || "上传失败", true);
   } finally {
@@ -2230,10 +2287,10 @@ bindForm("generate-form", async () => {
 });
 bind("use-persona-reference", async () => {
   const p = model.personas.find((x) => x.id === value("g-persona"));
-  if (!p?.reference_asset) throw new Error("所选人设没有保存参考图，请在人设工作台上传并保存");
+  if (!p?.reference_asset) throw new Error("所选角色没有保存参考图，请在“角色”页上传并保存");
   set("g-reference", "");
   markDirty("generate-form");
-  notice(`已使用人设参考图库，共 ${p.reference_assets?.length || 1} 张；实际使用数量取决于接口。`);
+  notice(`已使用角色参考图库，共 ${p.reference_assets?.length || 1} 张；实际使用数量取决于接口。`);
 });
 bind("refresh-jobs", refreshJobs);
 bindForm("simulate-form", async () => {
@@ -2377,8 +2434,7 @@ bindForm("settings-form", async () => {
       timezone: value("q-timezone"),
     },
     generation: {
-      width: num("d-width"),
-      height: num("d-height"),
+      resolution: value("d-resolution"),
       steps: num("d-steps"),
       scale: num("d-scale"),
       sampler: value("d-sampler"),
@@ -2407,11 +2463,16 @@ bind("export-data", async () => {
   notice("安全备份已导出，密钥不包含在其中。");
 });
 bind("theme-toggle", async () => {
-  const html = document.documentElement;
-  html.dataset.theme = html.dataset.theme === "dark" ? "light" : "dark";
+  // Without an explicit choice the page follows the system theme.
+  const html = document.documentElement,
+    dark = html.dataset.theme ? html.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  html.dataset.theme = dark ? "light" : "dark";
 });
 $("g-provider").addEventListener("change", renderGenerationCapabilities);
-$("g-override").addEventListener("change", renderGenerationCapabilities);
+$("g-override").addEventListener("change", () => {
+  if (check("g-override")) $("g-advanced").open = true;
+  renderGenerationCapabilities();
+});
 $("v-kind").addEventListener("change", changeProviderKind);
 bind("default-provider-auth", async () => defaultProviderAuth());
 $("v-negative-mode").addEventListener("change", () => renderProviderFields());

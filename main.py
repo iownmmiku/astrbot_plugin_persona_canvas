@@ -17,7 +17,15 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .active import ActiveScheduler
-from .common import CANCELLABLE_JOB_STATUSES, DECISION_MODES, MODE_DECISIONS, redact_text, secret_key, zone
+from .common import (
+    CANCELLABLE_JOB_STATUSES,
+    DECISION_MODES,
+    MODE_DECISIONS,
+    apply_canvas,
+    redact_text,
+    secret_key,
+    zone,
+)
 from .dialogue import Dialogue, field, maybe_await
 from .delivery import delivery_guard, local_delivery_guard
 from .companion import (
@@ -40,7 +48,7 @@ from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.17"
+VERSION = "0.5.18"
 INTENT_MODES = {"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}
 
 
@@ -102,8 +110,7 @@ SETTINGS_RULES = {
         "timezone": ("zone",),
     },
     "generation": {
-        "width": ("int", 64, 4096),
-        "height": ("int", 64, 4096),
+        "resolution": ("choice", {"1K", "2K", "4K"}, "分辨率档位应为 1K、2K 或 4K"),
         "steps": ("int", 1, 150),
         "scale": ("float", 0, 30),
         "sampler": ("text", 100),
@@ -282,8 +289,6 @@ class PersonaCanvasPlugin(Star):
         if "plugin_config_imported" in self.storage.runtime:
             return
         mapping = {
-            "generation_width": ("generation", "width", 832),
-            "generation_height": ("generation", "height", 1216),
             "generation_steps": ("generation", "steps", 28),
             "generation_scale": ("generation", "scale", 5),
             "generation_sampler": ("generation", "sampler", "k_euler_ancestral"),
@@ -1355,6 +1360,7 @@ class PersonaCanvasPlugin(Star):
         request_summary: str = "",
         confirmed_request_id: str = "",
         use_message_image: bool = False,
+        aspect_ratio: str = "",
     ):
         """根据上下文判断用户要照片/绘图且你愿意时，直接实际生图并发图，无需用户重复关键词。填写 request_summary；已有条件时还需 confirmed_request_id。普通聊天、否定、引用、拒绝、提条件时不得调用。一次请求一次图片。
 
@@ -1368,6 +1374,7 @@ class PersonaCanvasPlugin(Star):
             scene (string): 新场景，未改变留空。
             use_last_image (boolean): 编辑上一张图片时为 true。
             use_message_image (boolean): 明确需要用户附件作为参考时为 true；persona 自拍默认 false，只用角色参考图。edit 自动读取附件。
+            aspect_ratio (string): 按构图选择画面宽高比：1:1、2:3、3:2、3:4、4:3、4:5、5:4、9:16、16:9、21:9。自拍和全身多用竖图，风景和多人场景多用横图；留空为 2:3。分辨率由插件设置决定。
             request_summary (string): 简述本轮用户要图片或已确认原条件的语义及上下文依据，填写后不要求原话命中拍照关键词。
             confirmed_request_id (string): 已有拍摄条件且用户未修改要求地确认时，填写 pending_conditions.request_id；没有条件留空，修改要求先调用 persona_canvas_conditions。
         """
@@ -1454,6 +1461,7 @@ class PersonaCanvasPlugin(Star):
                 reference_asset=reference,
                 source="chat",
                 reference_source=reference_source,
+                aspect_ratio=aspect_ratio,
             )
             if prepared["awaited"]:
                 # Reading references yielded to other turns; re-check before admission.
@@ -1499,6 +1507,7 @@ class PersonaCanvasPlugin(Star):
                     source="chat",
                     job_id=job["id"],
                     reference_source=reference_source,
+                    aspect_ratio=aspect_ratio,
                 )
                 await self._send_job(generated, umo=generated["umo"])
 
@@ -1613,6 +1622,7 @@ class PersonaCanvasPlugin(Star):
         job_id="",
         reference_source="",
         explicit_retry=False,
+        aspect_ratio="",
     ):
         """Local-only preparation, shared by admission and background dispatch.
 
@@ -1663,6 +1673,9 @@ class PersonaCanvasPlugin(Star):
         if agreed.get("avoid"):
             negative = ", ".join(value for value in (negative, agreed["avoid"]) if value)
         options = {**copy.deepcopy(self.storage.settings["generation"]), **(options or {})}
+        # Retries reuse stored options; keep which values were set by hand.
+        options["_explicit"] = list(options.get("_explicit") or [])
+        apply_canvas(options, aspect_ratio)
         if job_id:
             self.storage.update_job(
                 job_id,
@@ -1780,6 +1793,7 @@ class PersonaCanvasPlugin(Star):
         source="webui",
         job_id="",
         reference_source="",
+        aspect_ratio="",
     ):
         self._track_current()
         try:
@@ -1796,6 +1810,7 @@ class PersonaCanvasPlugin(Star):
                 source=source,
                 job_id=job_id,
                 reference_source=reference_source,
+                aspect_ratio=aspect_ratio,
             )
         except Exception as exc:
             if job_id:
@@ -2270,6 +2285,7 @@ class PersonaCanvasPlugin(Star):
                     source="chat",
                     job_id=candidate["id"],
                     reference_source=reference_source,
+                    aspect_ratio=decision.get("aspect_ratio", ""),
                 )
             except Exception as exc:
                 if (self.storage.job(candidate["id"]) or {}).get("status") == "queued":
@@ -2764,6 +2780,7 @@ class PersonaCanvasPlugin(Star):
             decision["reply"],
             text,
             reference_asset=reference,
+            aspect_ratio=decision.get("aspect_ratio", ""),
             provider_name=str(body.get("provider") or ""),
             options=options,
             source=source,
@@ -2835,6 +2852,7 @@ class PersonaCanvasPlugin(Star):
                 user_key=f"{event.get_platform_id()}:{event.get_sender_id()}" if event else "webui",
                 job_id=job["id"],
                 reference_source=reference_source,
+                aspect_ratio=decision.get("aspect_ratio", ""),
             )
             if event:
                 await self._send_job(generated, umo=generated["umo"])
@@ -3085,6 +3103,8 @@ class PersonaCanvasPlugin(Star):
             "prompt": old["request_prompt"],
             "reply": old["caption"],
             "state_patch": old["state_patch"],
+            # A retry keeps the frame shape the role chose originally.
+            "aspect_ratio": (old.get("options") or {}).get("aspect_ratio", ""),
         }
         result = await self._queue_job(
             env,

@@ -1068,6 +1068,7 @@ class ActiveScheduler:
                     is_admin=True,
                     source=kind,
                     job_id=job["id"],
+                    aspect_ratio=decision.get("aspect_ratio", ""),
                 )
                 if not await self._check_schedule(target, kind, key, schedule, env, job):
                     return
