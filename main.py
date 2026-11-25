@@ -48,7 +48,7 @@ from .storage import Storage
 from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_persona_canvas"
-VERSION = "0.5.18"
+VERSION = "0.5.19"
 INTENT_MODES = {"persona": "persona_selfie", "scene": "scene", "edit": "image_edit"}
 
 
@@ -206,6 +206,21 @@ def _checked_setting(key, value, rule, providers):
 
 
 _TEMP_PART_WARNED = False
+# Words that may concern a picture or appearance; such turns get the full
+# photo rules. Broad on purpose: a false hit only costs a longer prompt.
+_IMAGE_TOPIC = re.compile(r"照|拍|图|画|穿|换|衣|裙|装|扮|发型|样子|看看|自拍|发我|长什么")
+# A follow-up within this window ("没收到"、"再来一张") still needs full rules.
+RECENT_PHOTO_SEC = 1800
+
+
+def _has_image(event):
+    """Whether the message carries an image (a possible edit request)."""
+    try:
+        from astrbot.api.message_components import Image
+
+        return any(isinstance(component, Image) for component in event.get_messages())
+    except Exception:
+        return False
 
 
 def _temporary_text_part(text):
@@ -870,6 +885,29 @@ class PersonaCanvasPlugin(Star):
                         return asset, self.storage.lease_asset(asset)
         return "", ""
 
+    def _visual_detail(self, event, env):
+        """How much photo context this chat turn needs.
+
+        Tools refuse turns that did not address the bot, so those get the
+        current state only. Ordinary chat gets the core rules; anything that
+        may concern images, outfits or a recent photo gets the full rules.
+        """
+        if not _addressed(event):
+            return "minimal"
+        text = _text(event)
+        pending = env["session"].get("pending") or {}
+        if (
+            valid_pending(pending, env)
+            or env.get("changed_request")
+            or self._eligible(text, env)
+            or state_request(text, pending)
+            or _IMAGE_TOPIC.search(text)
+            or _has_image(event)
+            or self.dialogue.recent_photo(env, RECENT_PHOTO_SEC)
+        ):
+            return "full"
+        return "brief"
+
     @filter.on_llm_request()
     async def inject_visual_state(self, event: AstrMessageEvent, req):
         # A request may pass this hook again. Replace only our own transient
@@ -898,12 +936,13 @@ class PersonaCanvasPlugin(Star):
             env["session"]["pending"] = {}
             env["session"] = self.storage.save_session(env["key"], env["session"])
         _extra(event, "environment", env, set_value=True)
-        visual_context = self.dialogue.visual_prompt(env)
-        if self.storage.settings["integration"].get("mode") == "native_tools" and _addressed(event):
+        detail = self._visual_detail(event, env)
+        visual_context = self.dialogue.visual_prompt(env, detail)
+        if detail == "full" and self.storage.settings["integration"].get("mode") == "native_tools":
             visual_context += "\n原生工具支持上下文语义判断：你已理解用户要图片/更新外观时，在 request_summary 简述本轮意图与上下文依据，直接调用，无需用户重复关键词。已有条件时用 persona_canvas_control(action=confirm, request_id=当前编号) 记录语义确认，再调用拍照/状态工具；也可在执行工具直接填写 confirmed_request_id。重复约定原衣服不算修改；用户确实修改条件时 control(revise) 记录更新并等待下一轮确认。撤回用 control(cancel)，生成失败需用户明确要求后 control(retry)；已保存照片发送失败用 control(resend, job_id=原任务编号) 补发原图，不重新生成。发送结果不确定时用户先检查聊天记录并明确要求补发，再设 confirm_uncertain=true。修改条件可用 remove_fields 移除约束，仍需重新询问。同意的文字本身不会生图。persona 自拍默认只用角色参考图；需要参考用户附件时显式 use_message_image=true，edit 模式自动读取附件。"
         if (
-            self.storage.settings["integration"].get("mode") == "native_tools"
-            and _addressed(event)
+            detail == "full"
+            and self.storage.settings["integration"].get("mode") == "native_tools"
             and self._eligible(_text(event), env)
         ):
             visual_context += "\n本轮用户消息已通过明确图片请求检查。这只表示请求有效，不代表你必须同意；你仍可拒绝或先提条件。若你愿意实际提供照片，必须调用 persona_canvas_photo；尚在询问或要求有变化时先记录条件并等待确认。不要只用文字假装已经发图。"

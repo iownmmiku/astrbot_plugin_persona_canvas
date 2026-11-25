@@ -6,7 +6,9 @@ const [base, token] = process.argv.slice(2);
 async function main() {
   const browser = await chromium.launch({ headless: true, channel: "chrome" });
   try {
-    const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
+    // The legacy WebUI sends script-src 'self'; Playwright's waitForFunction
+    // evaluates its predicate, so test pages bypass CSP (the plugin keeps it).
+    const page = await browser.newPage({ viewport: { width: 1366, height: 900 }, bypassCSP: true });
     const requests = [], errors = [];
     page.on("request", request => requests.push(request.url()));
     page.on("pageerror", error => errors.push(error.message));
@@ -73,7 +75,7 @@ async function main() {
     await page.waitForFunction(() => document.getElementById("notice").textContent.includes("补发"));
     const final = await call("qa/control", { action: "snapshot" });
     assert.equal(final.sent, 1); assert.equal(final.generations, 1, "resend reuses original image");
-    const embedded = await browser.newPage();
+    const embedded = await browser.newPage({ bypassCSP: true });
     await embedded.addInitScript(({ token }) => {
       const request = async (route, method, body) => {
         const response = await fetch(`/api/${route}`, { method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
@@ -83,6 +85,8 @@ async function main() {
     }, { token });
     await embedded.goto(base + "/#active");
     await embedded.waitForFunction(() => document.getElementById("status-label").textContent === "AstrBot 已连接");
+    // Reply-image settings live in their own tab on the chats page.
+    await embedded.locator("[data-tabs='active'] [data-tab='reply']").click();
     await embedded.locator("#r-max-wait").fill("45");
     await embedded.locator("#reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
     await embedded.waitForFunction(() => !document.querySelector("#reply-images-form button[type='submit']").disabled);

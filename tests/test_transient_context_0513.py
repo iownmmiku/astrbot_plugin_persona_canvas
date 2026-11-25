@@ -102,8 +102,12 @@ class TransientContext0513Tests(unittest.IsolatedAsyncioTestCase):
                 await self.plugin.inject_visual_state(event, req)
                 text = req.extra_user_content_parts[-1].text
                 self.assertEqual(req.system_prompt, system)
-                self.assertEqual("原生工具支持上下文语义判断" in text, mode == "native_tools" and addressed)
+                # Ordinary chat gets brief rules; unaddressed turns only the state.
+                self.assertEqual("原生工具支持上下文语义判断" in text, mode == "native_tools" and addressed and explicit)
                 self.assertEqual("本轮用户消息已通过明确图片请求检查" in text, mode == "native_tools" and addressed and explicit)
+                self.assertEqual("persona_canvas_photo" in text, addressed)
+                self.assertEqual("request_summary" in text, addressed)
+                self.assertEqual("本轮不能拍照或换装" in text, not addressed)
 
     async def test_disabling_integration_removes_only_our_existing_block(self):
         other = TextPart("other")

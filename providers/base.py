@@ -909,6 +909,11 @@ class OpenAIProvider(ImageProvider):
             ):
                 if explicit:
                     raise ProviderError("此模型尺寸需为 16 的倍数、宽高比 1:3–3:1，且不超过 3840×2160 的像素数")
+                if 1 / 3 <= width / height <= 3:
+                    # Derived sizes (e.g. the 4K tier) shrink to the largest
+                    # allowed size with the same shape, not to 1024-class sizes.
+                    scale = min(1.0, math.sqrt(3840 * 2160 / (width * height)), 3840 / max(width, height))
+                    return f"{max(16, int(width * scale) // 16 * 16)}x{max(16, int(height * scale) // 16 * 16)}"
                 return "1024x1536" if height > width else "1536x1024" if width > height else "1024x1024"
             return f"{width}x{height}"
         sizes = self.config.get("supported_sizes") or (

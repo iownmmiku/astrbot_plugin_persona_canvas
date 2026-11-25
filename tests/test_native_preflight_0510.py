@@ -179,12 +179,18 @@ class NativePreflight0510Tests(unittest.IsolatedAsyncioTestCase):
         self.adapters[0].preflight.assert_called_once()
 
     async def test_chat_model_receives_local_queue_rules_without_generation_claims(self):
+        # Asking about a photo gets the full rules, including what queued means.
         request = types.SimpleNamespace(system_prompt="existing persona")
-        await self.plugin.inject_visual_state(Event("随便聊聊"), request)
+        await self.plugin.inject_visual_state(Event("刚才的照片好了吗"), request)
         self.assertEqual(request.system_prompt, "existing persona")
         self.assertIn("queued 为本地等待", request.extra_user_content_parts[-1].text)
         self.assertIn("不证明上游已受理", request.extra_user_content_parts[-1].text)
         self.assertNotIn("queued/generating 仅为正在生成", request.extra_user_content_parts[-1].text)
+        # Plain chat carries no photo records, so no status rules are needed.
+        chat = types.SimpleNamespace(system_prompt="existing persona")
+        await self.plugin.inject_visual_state(Event("随便聊聊"), chat)
+        self.assertNotIn("photo_records", chat.extra_user_content_parts[-1].text)
+        self.assertIn("不要声称已经拍摄", chat.extra_user_content_parts[-1].text)
         self.assertFalse(self.store.recent_jobs())
 
     async def test_failed_local_preflight_preserves_conditions_and_allows_next_turn(self):

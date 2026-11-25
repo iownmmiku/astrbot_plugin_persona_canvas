@@ -1953,7 +1953,7 @@ async function reload() {
     model.personas = personas.items || [];
     model.providers = providers.items || [];
     model.targets = targets.items || [];
-    model.jobs = (jobs.items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0));
+    model.jobs = sortJobs(jobs.items);
     model.sessions = sessions.items || [];
     model.history = (historyResult.items || [])
       .slice()
@@ -1993,6 +1993,20 @@ async function reload() {
     loading = false;
   }
 }
+const sortJobs = (items) =>
+  (items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0));
+// Background polling reads only the job list. History, sessions and
+// diagnostics change when a job does, so those are fetched only then.
+async function pollJobs() {
+  const items = sortJobs((await api("jobs/query", "POST")).items);
+  const progress = (list) => JSON.stringify(list.map((job) => [jobId(job), job.status, job.asset || ""]));
+  if (progress(items) !== progress(model.jobs)) return refreshJobs();
+  if (JSON.stringify(items) !== JSON.stringify(model.jobs)) {
+    model.jobs = items;
+    renderOverview();
+    renderJobs();
+  }
+}
 async function refreshJobs() {
   const [jobs, historyResult, sessions, diagnostics] = await Promise.all([
     api("jobs/query", "POST"),
@@ -2001,7 +2015,7 @@ async function refreshJobs() {
     api("diagnostics"),
   ]);
   model.diagnostics = diagnostics;
-  model.jobs = (jobs.items || []).slice().sort((a, b) => (b.created_at || b.at || 0) - (a.created_at || a.at || 0));
+  model.jobs = sortJobs(jobs.items);
   model.sessions = sessions.items || [];
   const first = historyResult.items || [],
     lastId = first.at(-1)?.history_id;
@@ -2544,7 +2558,7 @@ setInterval(async () => {
   if (!connected || polling || loading || document.hidden || !model.jobs.some(activeJob)) return;
   polling = true;
   try {
-    await refreshJobs();
+    await pollJobs();
   } catch (error) {
     notice(`任务状态刷新失败：${error.message}`, true);
   } finally {

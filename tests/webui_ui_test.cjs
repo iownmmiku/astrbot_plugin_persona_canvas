@@ -23,7 +23,7 @@ const requestSummary = {
 };
 const capabilities = { text_to_image: true, image_to_image: true, sampler: false, seed: false, negative_mode: "disabled", negative_prompt_mode: "不发送负面词", max_reference_images: 1 };
 const fixtures = {
-  state: { settings: { current_persona: "default", default_provider: "default", generation: { width: 832, height: 1216, timeout_sec: 60 }, integration: { mode: "native_tools" } }, persona: { name: "离线测试角色", state: {} } },
+  state: { settings: { current_persona: "default", default_provider: "default", generation: { resolution: "1K", timeout_sec: 60 }, integration: { mode: "native_tools" } }, persona: { name: "离线测试角色", state: {} } },
   personas: { items: [{ id: "default", name: "离线测试角色", state: {}, reference_assets: [] }] },
   providers: { items: [
     { name: "default", kind: "openai", endpoint: "https://offline.invalid/v1", model: "offline-image", timeout: 300, capabilities },
@@ -111,6 +111,7 @@ async function main() {
     await page.goto(`http://127.0.0.1:${server.address().port}/#providers`);
     await page.waitForFunction(() => document.getElementById("status-label").textContent === "AstrBot 已连接");
     const get = id => page.locator(`#${id}`);
+    const openTab = (group, tab) => page.locator(`[data-tabs='${group}'] [data-tab='${tab}']`).click();
     const lastPost = async route => page.evaluate(route => window.__canvasCalls.filter(call => call.route === route).at(-1)?.body, route);
     const saveProvider = async () => {
       await get("provider-form").getByRole("button", { name: "保存接口", exact: true }).click();
@@ -158,13 +159,15 @@ async function main() {
     assert.equal(await get("v-negative-field-row").isVisible(), false, "NovelAI 原生字段不允许误改成中转路径");
 
     await page.locator("[data-page='studio']").click();
+    assert.equal(await get("g-advanced").evaluate(el => el.open), false, "生成参数默认收起");
+    await get("g-advanced").locator("summary").click();
     await get("g-provider").selectOption("custom-nested"); await get("g-override").check();
     assert.equal(await get("g-width").isDisabled(), false); assert.equal(await get("g-seed").isDisabled(), false);
     await get("g-provider").selectOption("gemini"); await get("g-override").check();
     assert.equal(await get("g-width").isDisabled(), true); assert.equal(await get("g-width").isVisible(), false);
     assert.equal(await get("g-aspect-ratio").isVisible(), true);
     await get("g-aspect-ratio").selectOption("9:16"); await get("g-image-size").selectOption("2K"); await get("g-prompt").fill("离线图像参数测试");
-    await get("generate-form").getByRole("button", { name: "提交生成任务", exact: true }).click();
+    await get("generate-form").getByRole("button", { name: "提交生成", exact: true }).click();
     await page.waitForFunction(() => window.__canvasCalls.some(call => call.route === "generate"));
     const generated = await lastPost("generate"); assert.equal(generated.aspect_ratio, "9:16"); assert.equal(generated.image_size, "2K");
     for (const key of ["width", "height", "steps", "scale", "seed"]) assert.equal(Object.hasOwn(generated, key), false, "Gemini 不应提交禁用参数");
@@ -211,10 +214,12 @@ async function main() {
     await page.evaluate(() => { window.__testTransportFailure = false; window.__testResponse = null; });
 
     await page.locator("[data-page='active']").click();
+    assert.equal(await get("target-form").isVisible(), true, "聊天页默认显示聊天目标");
+    await openTab("active", "proactive");
     assert.equal(await get("a-concurrency").inputValue(), "3"); assert.equal(await get("a-concurrency").getAttribute("max"), "16");
     assert.equal(await get("m-attempts").inputValue(), "3"); assert.equal(await get("m-attempts").getAttribute("max"), "5");
     assert.equal(await get("m-retry-interval").inputValue(), "900"); assert.equal(await get("m-retry-interval").getAttribute("min"), "60"); assert.equal(await get("m-retry-interval").getAttribute("max"), "3600");
-    assert.match(await get("active-form").innerText(), /每天每个目标最多实际发送一次早安/);
+    assert.match(await get("active-form").textContent(), /每个聊天每天最多实际发送一次早安/, "早安规则收在说明里");
     assert.equal(await get("m-image-mode").inputValue(), "prefer_photo");
     assert.deepEqual(await get("m-image-mode").locator("option").evaluateAll(items => items.map(i => i.value)), ["prefer_photo", "auto", "text_only"]);
     await get("m-image-mode").selectOption("text_only");
@@ -244,6 +249,7 @@ async function main() {
     assert.equal(await get("r-enabled").isChecked(), false, "缺省全局配图关闭");
     assert.equal(await get("r-probability").inputValue(), "20"); assert.equal(await get("r-interval").inputValue(), "300");
     assert.equal(await get("t-reply-enabled").isChecked(), false, "发现的聊天缺省配图关闭");
+    await openTab("active", "targets");
     await get("target-scope-filter").selectOption("group");
     assert.equal(await get("target-list").getByRole("button").count(), 1);
     await get("target-list").getByRole("button", { name: /群聊测试/ }).click();
@@ -276,6 +282,7 @@ async function main() {
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
     assert.equal((await lastPost("targets")).patch.reply_image_probability, 35);
     assert.equal(await get("r-max-wait").inputValue(), "30");
+    await openTab("active", "reply");
     await get("r-enabled").check(); await get("r-probability").fill("40"); await get("r-interval").fill("120"); await get("r-max-wait").fill("45"); await get("r-provider").selectOption("local-comfy");
     await get("reply-images-form").getByRole("button", { name: "保存配图设置", exact: true }).click();
     await page.waitForFunction(() => !document.getElementById("dirty-label").textContent);
@@ -286,6 +293,7 @@ async function main() {
     assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "settings").length), settingsCount, "HTML范围校验阻止超过100%的概率");
     await get("restore-reply-images").click();
     assert.equal(await get("r-max-wait").inputValue(), "45");
+    await openTab("active", "targets");
     await get("t-gap").fill("9999"); await get("refresh-target-diagnostics").click();
     assert.match(await get("target-diagnostics").innerText(), /空闲时间尚未满足/);
     assert.match(await get("target-diagnostics").innerText(), /照片预算已用完/);
@@ -376,7 +384,7 @@ async function main() {
     assert.equal(await page.evaluate(() => window.__canvasCalls.filter(call => call.route === "generate").length), 1, "补发不得调用绘图入口");
     await page.locator("[data-page='settings']").click();
     assert.equal(await get("d-timeout").getAttribute("max"), "600");
-    assert.match(await get("settings-form").innerText(), /persona_canvas_control/);
+    assert.match(await get("settings-form").textContent(), /persona_canvas_control/, "工具权限收在说明里");
 
     await page.locator("[data-page='studio']").click();
     const retainedDetail = get("job-list").locator(".request-detail").first();
@@ -406,11 +414,12 @@ async function main() {
       await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-providers-mobile.png"), fullPage: true });
     } else await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动页面不应横向溢出");
-    await page.locator("[data-page='active']").click();
+    await page.locator("[data-page='active']").click(); await openTab("active", "proactive");
     assert.equal(await get("a-concurrency").isVisible(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动主动策略页面不应横向溢出");
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-active-mobile.png"), fullPage: true });
     assert.equal(await get("r-enabled").isChecked(), true); assert.equal(await get("r-provider").inputValue(), "local-comfy");
+    await openTab("active", "targets");
     await get("target-scope-filter").selectOption("group"); await get("target-list").getByRole("button", { name: /群聊测试/ }).click();
     assert.equal(await get("t-reply-probability").inputValue(), "100"); assert.equal(await get("t-enabled").isDisabled(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "移动群聊配图页面不应横向溢出");
@@ -425,6 +434,14 @@ async function main() {
     assert.equal(await page.evaluate(() => { const box = document.getElementById("confirm-dialog").getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth; }), true, "移动补发确认框应完整显示");
     if (process.env.CANVAS_UI_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.CANVAS_UI_SCREENSHOT_DIR, "webui-resend-mobile.png"), fullPage: true });
     await get("confirm-cancel").click();
+    // Background polling reads only the job list until a job's status changes.
+    const countCalls = route => page.evaluate(route => window.__canvasCalls.filter(call => call.route === route).length, route);
+    const jobsBefore = await countCalls("jobs/query"), historyBefore = await countCalls("history/query");
+    await page.waitForTimeout(4600);
+    assert.ok(await countCalls("jobs/query") > jobsBefore, "有进行中的任务时应轮询任务列表");
+    assert.equal(await countCalls("history/query"), historyBefore, "任务状态未变时不重复拉取历史");
+    await page.evaluate(() => { window.__canvasFixtures.jobs.items.find(job => job.id === "job-local").status = "failed"; });
+    await page.waitForFunction(before => window.__canvasCalls.filter(call => call.route === "history/query").length > before, historyBefore, { timeout: 6000 });
     assert.deepEqual(browserErrors, [], "页面运行不应有未捕获的 JavaScript 异常");
     console.log("PASS: WebUI offline Chrome checks (ComfyUI workflow import and mapping, per-chat reply images and probability, private/group scopes, negative modes, mapping reset, Gemini options, failed test summaries, uncertain and historical sent resend confirmation, delivery evidence, target concurrency, escaping, mobile layout).");
   } finally {

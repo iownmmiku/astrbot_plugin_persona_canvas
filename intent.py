@@ -173,6 +173,17 @@ photo_records 是实际拍摄记录：queued 为本地等待，generating/dispat
 """
 
 
+# Ordinary addressed chat gets these core rules instead of DECISION_RULES; the
+# full block returns whenever the turn looks image related.
+BRIEF_RULES = """
+你仍然是原人格；随想画卷提供拍照工具：persona_canvas_photo 拍照或绘图，persona_canvas_state 换装或改姿势，persona_canvas_conditions 提出拍摄条件，persona_canvas_control 确认、修改、撤回、重试或补发。
+只有用户确实想要图片或换装、你也愿意时才调用；可以害羞、拒绝或先提条件。提及、讨论、假设、引用和否定都不是请求。意图按上下文判断，不要求固定关键词，调用时在 request_summary 写明依据。
+没有调用工具时，不要声称已经拍摄、发送图片或换装。
+"""
+# Turns where the tools refuse to act (e.g. the bot was not addressed).
+STATE_ONLY_NOTE = "本轮不能拍照或换装；不要声称已经拍摄、发送图片或换装。"
+
+
 def validated_decision(text: str, *, allow_silent_refusal: bool = False) -> dict:
     value = parse_json(text)
     action = str(value.get("decision") or value.get("action") or "")

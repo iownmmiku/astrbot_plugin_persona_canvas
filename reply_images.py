@@ -47,6 +47,8 @@ class ReplyImages:
         self.plugin = plugin
         self._latest = {}
         self._inflight = set()
+        # Per chat: (message token, whether the cooldown and probability passed).
+        self._draws = {}
 
     def observe(self, event):
         """Observe every incoming turn, including withdrawals and non-LLM turns."""
@@ -253,6 +255,19 @@ class ReplyImages:
         if self._latest.get(umo) != token:
             return
         _extra(event, "reply_image_checked", True, write=True)
+        # Most turns stop at the cooldown or the probability draw. Decide those
+        # in memory and persist a record only for a hit; one draw per message,
+        # so a replayed decorator call cannot raise the odds.
+        now = time.time()
+        drawn = self._draws.get(umo)
+        if drawn and drawn[0] == token:
+            hit = drawn[1]
+        else:
+            cooled = now - float(target.get("reply_image_last_attempt", 0)) >= rule[1]
+            hit = cooled and random.random() * 100 < rule[0]
+            self._draws[umo] = (token, hit)
+        if not hit:
+            return
         key = "reply_image:" + hashlib.sha256((umo + "\n" + token).encode()).hexdigest()
         if not self.plugin.storage.reserve_delivery(key):
             return
@@ -261,13 +276,6 @@ class ReplyImages:
         job = None
         self._inflight.add(umo)
         try:
-            now = time.time()
-            if now - float(target.get("reply_image_last_attempt", 0)) < rule[1]:
-                self.plugin.storage.update_delivery(key, {"status": "skipped", "reason": "聊天配图冷却中"})
-                return
-            if random.random() * 100 >= rule[0]:
-                self.plugin.storage.update_delivery(key, {"status": "skipped", "reason": "本轮未命中聊天配图概率"})
-                return
             # Persona/context resolution and the role model are asynchronous too.
             # Track this pipeline before either can yield so plugin shutdown
             # cancels and gathers it before closing the SQLite connection.
